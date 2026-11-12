@@ -2,8 +2,11 @@
 import hashlib
 import http.server
 import json
+import socket
 import ssl
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +21,8 @@ from tools.bootstrap import generate
 def device(tmp_path):
     directory = generate(tmp_path/"device")
     cfg = json.loads((directory/"mock.json").read_text())
-    state = {"requests": [], "mode": "ok", "pages": False}
+    state = {"requests": [], "mode": "ok", "pages": False,
+             "handler_errors": [], "unexpected_errors": []}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -79,7 +83,18 @@ def device(tmp_path):
             assert self.path == "/redfish/v1/SessionService/Sessions/1"
             self.reply(503 if state["mode"] == "cleanup_failure" else 204)
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(http.server.ThreadingHTTPServer):
+
+        def handle_error(self, request, client_address):
+            error = sys.exc_info()[1]
+            if isinstance(error, (ConnectionResetError, ConnectionAbortedError,
+                                  BrokenPipeError, ssl.SSLError, TimeoutError)):
+                state["handler_errors"].append(type(error).__name__)
+                return
+            state["unexpected_errors"].append(repr(error))
+            super().handle_error(request, client_address)
+
+    server = Server(("127.0.0.1", 0), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cfg["cert"], cfg["key"])
     server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -125,6 +140,27 @@ def test_pin_mismatch_sends_no_http_or_credentials(device):
     with pytest.raises(RedfishError, match="tls_identity_mismatch"):
         c.login("user", "password")
     assert device["requests"] == [] and c.session_state == "not_created"
+
+
+def test_aborted_peer_is_not_dumped_and_the_server_keeps_serving(device):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection(("127.0.0.1", device["port"]), timeout=5) as raw:
+        context.wrap_socket(raw).close()
+    deadline = time.monotonic() + 5
+    while not device["handler_errors"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert device["handler_errors"], "the aborted connection was never handled"
+    assert device["unexpected_errors"] == []
+    assert client(device).json("/redfish/v1/")["RedfishVersion"] == "test"
+
+
+def test_option_errors_name_the_probe_not_the_test_runner(capsys):
+    with pytest.raises(SystemExit) as error:
+        main(["--host", "127.0.0.1", "--max-requests", "2"])
+    assert error.value.code == 2
+    assert capsys.readouterr().err.startswith("usage: redfish_probe")
 
 
 def test_request_budget_preserves_logout(device, monkeypatch, capsys):

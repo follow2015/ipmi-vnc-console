@@ -10,6 +10,10 @@ from aiohttp import WSMsgType, WSMessage
 
 from .ast2100_protocol import (
     AUTH_RESPONSE_BYTES,
+    CLIENT_MSG_FBU_REQUEST,
+    CLIENT_MSG_KEY_EVENT,
+    CLIENT_MSG_POINTER_EVENT,
+    CLIENT_MSG_SET_ENCODINGS,
     RFB_VERSION,
     RFB_VERSION_BYTES,
     SECURITY_TYPE_INSYDE,
@@ -19,17 +23,87 @@ SECURITY_TYPES_FRAME = bytes([1, SECURITY_TYPE_INSYDE])
 SECURITY_RESULT_OK = b"\x00\x00\x00\x00"
 CHALLENGE_BYTES = 24
 MAX_TRAILING_BYTES = 64 * 1024
+MAX_BUFFERED_BYTES = 8 * 1024 * 1024
+
+CLIENT_MSG_SET_PIXEL_FORMAT = 0
+CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ = 25
+ALLOWED_CLIENT_MESSAGES = frozenset({
+    CLIENT_MSG_SET_PIXEL_FORMAT, CLIENT_MSG_SET_ENCODINGS, CLIENT_MSG_FBU_REQUEST,
+    CLIENT_MSG_KEY_EVENT, CLIENT_MSG_POINTER_EVENT,
+})
+_FIXED_CLIENT_MESSAGE_BYTES = {
+    CLIENT_MSG_SET_PIXEL_FORMAT: 20,
+    CLIENT_MSG_FBU_REQUEST: 10,
+    CLIENT_MSG_KEY_EVENT: 8,
+    CLIENT_MSG_POINTER_EVENT: 6,
+}
+
+INSYDE_MESSAGE_SIZES = {
+    CLIENT_MSG_SET_PIXEL_FORMAT: 20,
+    CLIENT_MSG_FBU_REQUEST: 10,
+    CLIENT_MSG_KEY_EVENT: 18,
+    CLIENT_MSG_POINTER_EVENT: 18,
+    CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ: 1,
+}
+INSYDE_CLIENT_MESSAGES = ALLOWED_CLIENT_MESSAGES | {CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ}
+MAX_SET_ENCODINGS = 32
 
 
 class BrowserHandshakeError(ValueError):
     pass
 
 
+class ClientMessageError(ValueError):
+    pass
+
+
+class ClientMessageFramer:
+
+    def __init__(self, allowed=ALLOWED_CLIENT_MESSAGES, *,
+                 sizes: dict[int, int] | None = None) -> None:
+        self._allowed = frozenset(allowed)
+        self._sizes = dict(_FIXED_CLIENT_MESSAGE_BYTES if sizes is None else sizes)
+        self._buf = bytearray()
+
+    def _next_size(self) -> int | None:
+        kind = self._buf[0]
+        if kind not in self._allowed:
+            raise ClientMessageError("client_message_denied")
+        if kind == CLIENT_MSG_SET_ENCODINGS:
+            if len(self._buf) < 4:
+                return None
+            count = int.from_bytes(self._buf[2:4], "big")
+            if not 1 <= count <= MAX_SET_ENCODINGS:
+                raise ClientMessageError("client_message_malformed")
+            return 4 + 4 * count
+        size = self._sizes.get(kind)
+        if size is None:
+            raise ClientMessageError("client_message_denied")
+        return size
+
+    def feed(self, data: bytes) -> bytes:
+        self._buf.extend(data)
+        ready = bytearray()
+        while self._buf:
+            size = self._next_size()
+            if size is None or len(self._buf) < size:
+                break
+            ready += self._buf[:size]
+            del self._buf[:size]
+        return bytes(ready)
+
+
 class BrowserHandshake:
 
-    def __init__(self, server_init: bytes, *, challenge: bytes | None = None) -> None:
+    def __init__(self, server_init: bytes, *, challenge: bytes | None = None,
+                 version: bytes = RFB_VERSION.encode("ascii")) -> None:
         if not isinstance(server_init, (bytes, bytearray)) or not server_init:
             raise ValueError("server_init is required")
+        if (not isinstance(version, (bytes, bytearray)) or len(version) != RFB_VERSION_BYTES
+                or version[:4] != b"RFB " or version[-1:] != b"\n"
+                or not all(byte in b"0123456789." for byte in version[4:-1])):
+            raise ValueError("invalid_browser_version")
+        self._version = bytes(version)
         self._server_init = bytes(server_init)
         self._challenge = bytes(challenge) if challenge is not None else secrets.token_bytes(CHALLENGE_BYTES)
         if len(self._challenge) != CHALLENGE_BYTES:
@@ -42,7 +116,7 @@ class BrowserHandshake:
     def start(self) -> bytes:
         if self.stage != "version":
             raise BrowserHandshakeError("handshake already started")
-        return RFB_VERSION.encode("ascii")
+        return self._version
 
     def feed(self, data: bytes) -> tuple[bytes, bytes]:
         if self.completed:
@@ -57,7 +131,7 @@ class BrowserHandshake:
                     break
                 raw = bytes(self._buf[:RFB_VERSION_BYTES])
                 del self._buf[:RFB_VERSION_BYTES]
-                if raw != RFB_VERSION.encode("ascii"):
+                if raw != self._version:
                     raise BrowserHandshakeError("unexpected_client_version")
                 out += SECURITY_TYPES_FRAME
                 self.stage = "security"
@@ -100,12 +174,21 @@ class RfbPassthroughSession:
 
     protocol = "binary"
 
-    def __init__(self, upstream, handshake: BrowserHandshake, *, queue_size: int = 64) -> None:
+    def __init__(self, upstream, handshake: BrowserHandshake, *, queue_size: int = 64,
+                 queue_bytes: int = MAX_BUFFERED_BYTES,
+                 allowed_client_messages=ALLOWED_CLIENT_MESSAGES,
+                 message_sizes: dict[int, int] | None = None) -> None:
         self.upstream = upstream
         self.handshake = handshake
+        self._framer = ClientMessageFramer(allowed_client_messages, sizes=message_sizes)
         self._out: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=queue_size)
         self._relay_task: asyncio.Task | None = None
         self._closed = False
+        self._buffer_limit = queue_bytes
+        self._buffered = 0
+        self.peak_buffered_bytes = 0
+        self._room = asyncio.Event()
+        self._room.set()
         self.started = False
         self.error: str | None = None
         self.client_bytes = 0
@@ -122,7 +205,7 @@ class RfbPassthroughSession:
             return
         self.client_bytes += len(data)
         if self.handshake.completed:
-            await self.upstream.send_raw(data)
+            await self._forward(data)
             return
         try:
             out, trailing = self.handshake.feed(data)
@@ -132,10 +215,21 @@ class RfbPassthroughSession:
             return
         if out:
             await self._emit(out)
-        if trailing:
-            await self.upstream.send_raw(trailing)
+        if trailing and not await self._forward(trailing):
+            return
         if self.handshake.completed:
             self._start_relay()
+
+    async def _forward(self, data: bytes) -> bool:
+        try:
+            ready = self._framer.feed(data)
+        except ClientMessageError as exc:
+            self.error = exc.args[0] if exc.args else "client_message_denied"
+            await self.close(code=1008)
+            return False
+        if ready:
+            await self.upstream.send_raw(ready)
+        return True
 
     async def send_str(self, data: str) -> None:
         self.error = "unexpected_text_frame"
@@ -159,13 +253,22 @@ class RfbPassthroughSession:
     async def _emit(self, data: bytes) -> None:
         if self._closed:
             return
-        self.server_bytes += len(data)
+        size = len(data)
+        while not self._closed and self._buffered and self._buffered + size > self._buffer_limit:
+            self._room.clear()
+            await self._room.wait()
+        if self._closed:
+            return
+        self._buffered += size
+        self.peak_buffered_bytes = max(self.peak_buffered_bytes, self._buffered)
+        self.server_bytes += size
         await self._out.put(bytes(data))
 
     async def close(self, code: int = 1000) -> None:
         if self._closed:
             return
         self._closed = True
+        self._room.set()
         if self._relay_task is not None and not self._relay_task.done():
             self._relay_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -184,9 +287,12 @@ class RfbPassthroughSession:
         item = await self._out.get()
         if item is None:
             raise StopAsyncIteration
+        self._buffered -= len(item)
+        self._room.set()
         return WSMessage(WSMsgType.BINARY, item, "")
 
     def as_dict(self) -> dict[str, Any]:
         return {"protocol": self.protocol, "handshake_completed": self.handshake.completed,
                 "shared": self.handshake.shared, "client_bytes": self.client_bytes,
-                "server_bytes": self.server_bytes, "error": self.error}
+                "server_bytes": self.server_bytes, "buffered_bytes": self._buffered,
+                "peak_buffered_bytes": self.peak_buffered_bytes, "error": self.error}

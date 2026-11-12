@@ -4,8 +4,14 @@ from __future__ import annotations
 import re
 from urllib.parse import urlsplit
 
+from ..ast2100_protocol import RFB_VERSION, client_protocol_version
 from ..common import PASSTHROUGH_ADAPTER_ID, Problem
-from ..passthrough import BrowserHandshake, RfbPassthroughSession
+from ..passthrough import (
+    INSYDE_CLIENT_MESSAGES,
+    INSYDE_MESSAGE_SIZES,
+    BrowserHandshake,
+    RfbPassthroughSession,
+)
 from ..rfb_upstream import RfbUpstream, UpstreamConfig
 
 ASSET_PATH = re.compile(
@@ -35,6 +41,7 @@ def content_type_for(path: str) -> str:
 
 class PassthroughAdapter:
     adapter_id = PASSTHROUGH_ADAPTER_ID
+    connection_limit = 1
 
     def __init__(self, info):
         target = urlsplit(info["target"])
@@ -48,14 +55,20 @@ class PassthroughAdapter:
                 or len(fingerprint) != 32 or info["adapter"] != self.adapter_id):
             raise Problem("adapter_not_verified", 403)
         self.target = info["target"]
-        self.cfg = UpstreamConfig(
-            host=host,
-            port=target.port or 443,
-            cert_sha256=fingerprint.hex(),
-            max_frame_bytes=1024 * 1024,
-            max_total_bytes=64 * 1024 * 1024,
-            max_frames=4000,
-        )
+        declared = tuple(info.get("protocol_versions") or ())
+        try:
+            self.cfg = UpstreamConfig(
+                host=host,
+                port=target.port or 443,
+                cert_sha256=fingerprint.hex(),
+                max_frame_bytes=1024 * 1024,
+                max_total_bytes=64 * 1024 * 1024,
+                max_frames=4000,
+                enforce_relay_budget=False,
+                **({"protocol_versions": declared} if declared else {}),
+            )
+        except ValueError as exc:
+            raise Problem("invalid_target_policy", 502) from exc
         self.upstream: RfbUpstream | None = None
         self.session: RfbPassthroughSession | None = None
 
@@ -71,8 +84,12 @@ class PassthroughAdapter:
             raise Problem("connection_limit")
         if self.upstream is None or not self.upstream.server_init_raw:
             raise Problem("upstream_handshake_failed", 502)
+        negotiated = getattr(self.upstream, "protocol_version", None)
+        version = client_protocol_version(negotiated or RFB_VERSION.strip())
         session = RfbPassthroughSession(
-            self.upstream, BrowserHandshake(self.upstream.server_init_raw))
+            self.upstream, BrowserHandshake(self.upstream.server_init_raw, version=version),
+            allowed_client_messages=INSYDE_CLIENT_MESSAGES,
+            message_sizes=INSYDE_MESSAGE_SIZES)
         await session.start()
         self.session = session
         return session

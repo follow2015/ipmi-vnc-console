@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS adapter_capability (
  firmware_min TEXT NOT NULL DEFAULT '', firmware_max TEXT NOT NULL DEFAULT '',
  approved_at REAL NOT NULL DEFAULT 0, effective_from REAL NOT NULL DEFAULT 0,
  review_due REAL NOT NULL DEFAULT 0, status_reason TEXT NOT NULL DEFAULT '',
- revision INTEGER NOT NULL DEFAULT 0);
+ revision INTEGER NOT NULL DEFAULT 0,
+ protocol_versions TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS asset (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, vendor TEXT NOT NULL, model TEXT NOT NULL,
  firmware TEXT NOT NULL, capability_id TEXT NOT NULL REFERENCES adapter_capability(id),
@@ -60,10 +61,12 @@ CAPABILITY_COLUMNS = {
     "review_due": "REAL NOT NULL DEFAULT 0",
     "status_reason": "TEXT NOT NULL DEFAULT ''",
     "revision": "INTEGER NOT NULL DEFAULT 0",
+    "protocol_versions": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 END_REASONS = ("client_closed", "revoked", "capability_withdrawn", "upstream_error",
-               "lease_expired", "login_failed", "worker_shutdown", "exchange_failed")
+               "upstream_unresponsive", "lease_expired", "login_failed", "worker_shutdown",
+               "exchange_failed")
 
 
 class _CapabilityLost(Exception):
@@ -132,6 +135,10 @@ class Store:
             "firmware_min": str(entry.get("firmware_min") or "").strip(),
             "firmware_max": str(entry.get("firmware_max") or "").strip(),
         }
+        declared = capability.parse_protocol_versions(entry.get("protocol_versions"))
+        if declared is None:
+            raise Problem("capability_incomplete", 400)
+        values["protocol_versions"] = json.dumps(list(declared))
         if not cid or not all((values["vendor"], values["model"], values["adapter"])):
             raise Problem("capability_incomplete", 400)
         if not capability.window_parses(values):
@@ -141,10 +148,11 @@ class Store:
         self.db.execute(
             "INSERT INTO adapter_capability(id,vendor,model,firmware,adapter,status,expires,evidence,"
             "approver,console_impl,licence,concurrency_limit,models,firmware_min,firmware_max,"
-            "approved_at,effective_from,review_due,status_reason,revision) "
-            "VALUES(?,?,?,?,?,'draft',0,'','','','',1,?,?,?,0,0,0,'',0)",
+            "protocol_versions,approved_at,effective_from,review_due,status_reason,revision) "
+            "VALUES(?,?,?,?,?,'draft',0,'','','','',1,?,?,?,?,0,0,0,'',0)",
             (values["id"], values["vendor"], values["model"], values["firmware"], values["adapter"],
-             values["models"], values["firmware_min"], values["firmware_max"]))
+             values["models"], values["firmware_min"], values["firmware_max"],
+             values["protocol_versions"]))
         self.event(actor, "capability_registered",
                    detail={"capability": cid, "adapter": values["adapter"], "rationale": rationale})
 
@@ -260,8 +268,10 @@ class Store:
         reason = capability.evaluate(dict(cap) if cap else None, asset, self.clock())
         if reason is None and not self._adapter_allowed(asset | {"adapter": cap["adapter"]}):
             reason = "adapter_not_enabled"
+        declared = capability.parse_protocol_versions(cap["protocol_versions"]) if cap else ()
         allowed = asset | {"adapter": cap["adapter"] if cap else "",
-                           "cap_expires": cap["expires"] if cap else 0.0}
+                           "cap_expires": cap["expires"] if cap else 0.0,
+                           "protocol_versions": declared or ()}
         return allowed, reason
 
     def seed_mock(self, target: str, fingerprint: str, username: str, password: str):
@@ -290,12 +300,14 @@ class Store:
                          vendor: str = "Supermicro (Inspur OEM)",
                          model: str = "X10DRT-PS / SA5248M4", firmware: str = "8.78",
                          capability_id: str = "supermicro-x10-passthrough",
+                         protocol_versions: tuple[str, ...] = (),
                          evidence: str = "docs/implementation/evidence/real-bmc-kvm-phase2-20261111.json") -> None:
         assert self.cipher is not None, "seeding credentials requires the encryption key"
         with self.tx():
             if not self.db.execute("SELECT 1 FROM adapter_capability WHERE id=?", (capability_id,)).fetchone():
                 self._register({"id": capability_id, "vendor": vendor, "model": model,
-                                "firmware": firmware, "adapter": PASSTHROUGH_ADAPTER_ID},
+                                "firmware": firmware, "adapter": PASSTHROUGH_ADAPTER_ID,
+                                "protocol_versions": list(protocol_versions)},
                                "local-bootstrap")
             self._approve(capability_id, actor="local-bootstrap", approver=approver,
                           evidence=evidence, licence="未取得厂商书面许可；仅同源代理转发，不分发",
@@ -378,7 +390,8 @@ class Store:
             blob = asset["credential"]
             result = {"target": asset["target"], "fingerprint": asset["fingerprint"],
                       "adapter": asset["adapter"], "lease_seconds": lease-now,
-                      "hard_until": row["hard_until"]}
+                      "hard_until": row["hard_until"],
+                      "protocol_versions": list(asset["protocol_versions"])}
         try:
             if self.cipher is None:
                 raise ValueError("this store was opened without the credential key")

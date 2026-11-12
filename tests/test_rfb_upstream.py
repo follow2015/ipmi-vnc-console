@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from aiohttp import web
 
 from kvmhub.adapters import SupermicroX10IKVMAdapter
 from kvmhub.ast2100_protocol import ENCODING_AST2100
 from kvmhub.common import Problem
+from kvmhub.passthrough import BrowserHandshake
 from kvmhub.rfb_upstream import (
     DEFAULT_ENCODINGS,
     MAX_TICKET_CHARS,
@@ -41,15 +44,15 @@ def parse_client_messages(data: bytes) -> list[tuple]:
         elif kind == 3:
             incremental, x, y, width, height = struct.unpack_from(">BHHHH", data, index + 1)
             out.append(("FBURequest", incremental, x, y, width, height))
-            index += 9
+            index += 10
         elif kind == 4:
             down, keysym = struct.unpack_from(">B2xI", data, index + 1)
             out.append(("KeyEvent", down, keysym))
-            index += 7
+            index += 8
         elif kind == 5:
             mask, x, y = struct.unpack_from(">BHH", data, index + 1)
             out.append(("PointerEvent", mask, x, y))
-            index += 5
+            index += 6
         elif kind == 0:
             index += 20
         else:
@@ -64,8 +67,11 @@ class FakeBmc:
                  bootstrap_redirect: bool = False, bootstrap_ticket: bool = True,
                  fail_login_status: int = 200, auth_result: int = 0,
                  oversized_frame: bool = False, text_frame: bool = False,
-                 send_updates: int = 2, payload_bytes: int = 32):
+                 send_updates: int = 2, payload_bytes: int = 32,
+                 version: bytes = b"RFB 055.008\n", silent: bool = False):
         self.ticket, self.password = ticket, password
+        self.version = version
+        self.client_version: bytes | None = None
         self.expect_ticket = ticket if expect_ticket is None else expect_ticket
         self.bootstrap_redirect = bootstrap_redirect
         self.bootstrap_ticket = bootstrap_ticket
@@ -75,6 +81,8 @@ class FakeBmc:
         self.text_frame = text_frame
         self.send_updates = send_updates
         self.payload_bytes = payload_bytes
+        self.silent = silent
+        self._silent_stop = asyncio.Event()
         self.ws_headers: dict[str, str] = {}
         self.client_messages: list[tuple] = []
         self.logged_out = False
@@ -98,6 +106,7 @@ class FakeBmc:
 
     async def stop(self) -> None:
         assert self.runner is not None
+        self._silent_stop.set()
         await self.runner.cleanup()
 
     async def login(self, request: web.Request) -> web.Response:
@@ -131,11 +140,12 @@ class FakeBmc:
         self.ws_headers = {key.lower(): value for key, value in request.headers.items()}
         if request.cookies.get("SID") != "session-cookie":
             return web.Response(status=403)
-        ws = web.WebSocketResponse(max_msg_size=4 * 1024 * 1024)
+        ws = web.WebSocketResponse(max_msg_size=4 * 1024 * 1024, autoping=not self.silent)
         await ws.prepare(request)
         self.ws_started = True
-        await ws.send_bytes(b"RFB 055.008\n")
-        assert (await self._recv(ws)) == b"RFB 055.008\n"
+        await ws.send_bytes(self.version)
+        self.client_version = await self._recv(ws)
+        assert self.client_version == self.version
         await ws.send_bytes(bytes([1, 16]))
         assert (await self._recv(ws)) == bytes([16])
         await ws.send_bytes(b"Z" * 24)
@@ -147,6 +157,9 @@ class FakeBmc:
         await ws.send_bytes(struct.pack(">I", 0))
         assert (await self._recv(ws)) == b"\x01"
         await ws.send_bytes(SERVER_INIT)
+        if self.silent:
+            await self._silent_stop.wait()
+            return ws
         self.client_messages.extend(parse_client_messages(await self._recv(ws)))
         for index in range(self.send_updates):
             if self.oversized_frame:
@@ -380,6 +393,72 @@ async def test_frame_budget_is_enforced():
         await server.stop()
 
 
+class _FramesWs:
+
+    def __init__(self, frames: int, size: int = 24):
+        self.left, self.size = frames, size
+
+    async def receive(self):
+        if self.left == 0:
+            return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
+        self.left -= 1
+        return SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"\x00" * self.size)
+
+
+async def _run_relay(frames: int, *, size: int = 24, **cfg):
+    upstream = RfbUpstream(UpstreamConfig(host="127.0.0.1", cert_sha256="ab" * 32, **cfg))
+    upstream._ws, upstream.server_init = _FramesWs(frames, size), object()
+    delivered: list[bytes] = []
+
+    async def sink(data):
+        delivered.append(data)
+
+    try:
+        await upstream.relay(sink)
+    except Problem as exc:
+        return delivered, exc.code
+    finally:
+        await upstream.http.close()
+    return delivered, None
+
+
+async def test_relay_frame_budget_applies_by_default():
+    delivered, code = await _run_relay(10, max_frames=5)
+    assert code == "upstream_budget_exceeded"
+    assert len(delivered) == 5
+
+
+async def test_relay_byte_budget_applies_by_default():
+    delivered, code = await _run_relay(10, size=4096, max_frames=100, max_frame_bytes=4096,
+                                       max_total_bytes=4096 * 3)
+    assert code == "upstream_budget_exceeded"
+    assert len(delivered) == 3
+
+
+async def test_live_relay_outlives_the_probe_budget_when_not_enforced():
+    delivered, code = await _run_relay(50, max_frames=5, enforce_relay_budget=False)
+    assert code is None
+    assert len(delivered) == 50
+
+
+async def test_unenforced_relay_budget_still_caps_each_frame():
+    delivered, code = await _run_relay(3, size=5000, max_frame_bytes=4096, enforce_relay_budget=False)
+    assert code == "upstream_frame_too_large"
+    assert delivered == []
+
+
+async def test_handshake_budget_still_applies_when_relay_budget_is_off():
+    server = await FakeBmc().start()
+    try:
+        upstream = await opened(server, max_frames=5, enforce_relay_budget=False)
+        with pytest.raises(Problem) as excinfo:
+            await upstream.wait_frames(1, timeout=5)
+        assert excinfo.value.code == "upstream_budget_exceeded"
+        await upstream.close()
+    finally:
+        await server.stop()
+
+
 async def test_unreachable_websocket_is_reported():
     server = await FakeBmc().start()
     try:
@@ -440,6 +519,32 @@ def test_config_rejects_dangerous_combinations():
     assert UpstreamConfig(host="127.0.0.1", port=8443, scheme="http").base_url == "http://127.0.0.1:8443"
 
 
+def test_keepalive_is_on_by_default_and_can_be_disabled():
+    assert UpstreamConfig(host="192.0.2.11").keepalive_seconds == 20.0
+    assert UpstreamConfig(host="192.0.2.11", keepalive_seconds=None).keepalive_seconds is None
+    for bad in (0, -1, "20", True, 0.01):
+        with pytest.raises(ValueError, match="invalid_keepalive"):
+            UpstreamConfig(host="192.0.2.11", keepalive_seconds=bad)
+
+
+async def test_a_mute_upstream_is_declared_unresponsive():
+    server = await FakeBmc(silent=True).start()
+    try:
+        upstream = RfbUpstream(config_for(server, keepalive_seconds=0.4))
+        await upstream.login("operator", password=server.password)
+        await upstream.open()
+
+        async def ignore(_data):
+            return None
+
+        with pytest.raises(Problem) as error:
+            await asyncio.wait_for(upstream.relay(ignore), 10)
+        assert error.value.code == "upstream_unresponsive"
+        await upstream.close()
+    finally:
+        await server.stop()
+
+
 def test_absorb_set_cookie_keeps_exactly_one_live_sid():
     measured = ["SID=; expires=Thursday,01-Jan-1970 00:00:00 GMT; Secure; HttpOnly",
                 "SID=live-session; path=/; Secure; HttpOnly"]
@@ -489,3 +594,79 @@ def test_transport_defaults_match_the_adapter_console_spec():
     assert {"https": "wss", "http": "ws"}[config.scheme] == spec.websocket_scheme
     assert ENCODING_AST2100 in DEFAULT_ENCODINGS
     assert spec.max_frame_bytes >= config.max_frame_bytes
+
+
+
+def test_config_defaults_to_the_single_measured_version():
+    assert UpstreamConfig(host="192.0.2.11").protocol_versions == ("RFB 055.008",)
+
+
+def test_config_accepts_explicit_protocol_versions():
+    cfg = UpstreamConfig(host="192.0.2.11",
+                         protocol_versions=("RFB 055.008", "RFB 003.008"))
+    assert cfg.protocol_versions == ("RFB 055.008", "RFB 003.008")
+
+
+@pytest.mark.parametrize("bad", [
+    (), "RFB 055.008", ("XXXX 003.008",), ("RFB 055.008", "RFB 055.008"),
+    ("RFB 055.008\n",), ("",),
+])
+def test_config_rejects_malformed_protocol_versions(bad):
+    with pytest.raises(ValueError, match="invalid_protocol_versions"):
+        UpstreamConfig(host="127.0.0.1", scheme="http", protocol_versions=bad)
+
+
+async def test_upstream_negotiates_an_explicitly_allowed_version(fake_bmc):
+    fake_bmc.version = b"RFB 003.008\n"
+    upstream = await opened(fake_bmc, protocol_versions=("RFB 055.008", "RFB 003.008"))
+    try:
+        assert upstream.protocol_version == "RFB 003.008"
+        assert fake_bmc.client_version == b"RFB 003.008\n"
+        assert upstream.server_init is not None
+    finally:
+        await upstream.close()
+
+
+async def test_upstream_refuses_a_version_outside_the_allowance(fake_bmc):
+    fake_bmc.version = b"RFB 004.008\n"
+    upstream = RfbUpstream(config_for(fake_bmc, protocol_versions=("RFB 055.008", "RFB 003.008")))
+    try:
+        with pytest.raises(Problem, match="upstream_handshake_failed"):
+            await upstream.login("operator", password=fake_bmc.password)
+            await upstream.open()
+    finally:
+        await upstream.close()
+
+
+async def test_upstream_records_the_default_negotiated_version(fake_bmc):
+    upstream = await opened(fake_bmc)
+    try:
+        assert upstream.protocol_version == "RFB 055.008"
+    finally:
+        await upstream.close()
+
+
+async def test_upstream_still_refuses_standard_rfb_by_default(fake_bmc):
+    fake_bmc.version = b"RFB 003.008\n"
+    upstream = RfbUpstream(config_for(fake_bmc))
+    try:
+        with pytest.raises(Problem, match="upstream_handshake_failed"):
+            await upstream.login("operator", password=fake_bmc.password)
+            await upstream.open()
+    finally:
+        await upstream.close()
+
+
+async def test_browser_side_greeting_follows_the_negotiated_version(fake_bmc):
+    fake_bmc.version = b"RFB 003.008\n"
+    upstream = await opened(fake_bmc, protocol_versions=("RFB 055.008", "RFB 003.008"))
+    try:
+        browser = BrowserHandshake(upstream.server_init_raw, challenge=b"C" * 24,
+                                   version=b"RFB 003.008\n")
+        assert upstream.protocol_version == "RFB 003.008"
+        assert browser.start() == b"RFB 003.008\n"
+        out, trailing = browser.feed(b"RFB 003.008\n\x10" + b"X" * 48 + b"\x01")
+        assert browser.completed and trailing == b""
+        assert out.endswith(upstream.server_init_raw)
+    finally:
+        await upstream.close()

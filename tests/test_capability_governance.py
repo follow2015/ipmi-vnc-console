@@ -1,4 +1,5 @@
 """The compatibility matrix as a control, not a table (design §7)."""
+import json
 import sqlite3
 from pathlib import Path
 
@@ -279,3 +280,48 @@ def test_only_the_store_may_write_the_matrix():
 def test_no_http_route_exposes_the_matrix():
     path = Path(__file__).resolve().parents[1] / "kvmhub" / "manager.py"
     assert "capability" not in path.read_text(encoding="utf-8")
+
+
+
+def test_capability_registration_stores_explicit_protocol_versions(env):
+    store, *_ = env
+    store.register_capability(
+        {"id": "x10", "vendor": "v", "model": "m", "adapter": PASSTHROUGH_ADAPTER_ID,
+         "protocol_versions": ["RFB 055.008", "RFB 003.008"]}, "albert")
+    assert json.loads(store.capability("x10")["protocol_versions"]) == [
+        "RFB 055.008", "RFB 003.008"]
+
+
+@pytest.mark.parametrize("bad", [
+    ["RFB 055.008\n"], ["XXXX 003.008"], ["RFB 055.008", "RFB 055.008"], [""], "RFB 055.008",
+])
+def test_capability_registration_refuses_malformed_protocol_versions(env, bad):
+    store, *_ = env
+    with pytest.raises(Problem, match="capability_incomplete"):
+        store.register_capability(
+            {"id": "x10", "vendor": "v", "model": "m", "adapter": PASSTHROUGH_ADAPTER_ID,
+             "protocol_versions": bad}, "albert")
+
+
+def test_gate_exposes_the_approved_protocol_versions(env):
+    store, *_ = env
+    seed_real(store, protocol_versions=["RFB 055.008", "RFB 003.008"])
+    asset, reason = store.gate("a1", "local-admin")
+    assert reason is None
+    assert asset["protocol_versions"] == ("RFB 055.008", "RFB 003.008")
+
+
+def test_gate_without_an_allowance_exposes_an_empty_tuple(env):
+    store, *_ = env
+    seed_real(store)
+    asset, reason = store.gate("a1", "local-admin")
+    assert reason is None
+    assert asset["protocol_versions"] == ()
+
+
+def test_exchange_forwards_the_approved_versions_to_the_worker(env):
+    store, *_ = env
+    seed_real(store, protocol_versions=["RFB 055.008", "RFB 003.008"])
+    row = store.allocate("a1", "local-admin", "w1", "i1", "trace")
+    result = store.exchange(claims(row), "trace")
+    assert result["protocol_versions"] == ["RFB 055.008", "RFB 003.008"]

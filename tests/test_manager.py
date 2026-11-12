@@ -72,3 +72,17 @@ def test_index_escapes_session_fields(manager_app):
     body = client.get("/").text
     assert "<script>alert(1)</script>" not in body
     assert "&lt;script&gt;" in body
+
+
+def test_a_busy_asset_is_refused_with_a_sentence_not_a_code(manager_app):
+    ui, store, directory, cfg = manager_app
+    client = TestClient(ui, base_url=UI_ORIGIN)
+    headers = login(client, directory)
+    first = client.post("/api/assets/mock-1/sessions", headers=headers)
+    assert first.status_code == 200
+    second = client.post("/api/assets/mock-1/sessions", headers=headers)
+    assert second.status_code == 409
+    body = second.json()
+    assert body["error"] == "asset_busy"
+    assert body["message"] and "稍后重试" in body["message"]
+    assert body["trace_id"], "the trace id must survive so support can follow the event"

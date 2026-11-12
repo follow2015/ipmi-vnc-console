@@ -355,6 +355,36 @@ def test_adapter_no_longer_claims_the_handshake_was_never_done():
     assert "only mock-v1" in unconfirmed
 
 
+
+def test_client_protocol_version_echoes_the_negotiated_version():
+    assert proto.client_protocol_version("RFB 003.008") == b"RFB 003.008\n"
+
+
+def test_client_protocol_version_rejects_a_malformed_version():
+    with pytest.raises(proto.ProtocolError, match="malformed"):
+        proto.client_protocol_version("RFB 003.008\n\x00")
+    with pytest.raises(proto.ProtocolError, match="malformed"):
+        proto.client_protocol_version("XXXX 003.008")
+
+
+def test_parse_protocol_version_accepts_an_explicitly_allowed_version():
+    assert proto.parse_protocol_version(
+        b"RFB 003.008\n", allowed=("RFB 055.008\n", "RFB 003.008\n")) == "RFB 003.008"
+
+
+def test_parse_protocol_version_refuses_a_version_not_in_the_allowance():
+    with pytest.raises(proto.ProtocolError, match="unsupported"):
+        proto.parse_protocol_version(b"RFB 003.008\n", allowed=("RFB 055.008\n",))
+
+
+def test_handshake_accepts_an_explicitly_allowed_variant():
+    hs = proto.RfbHandshake(allowed_versions=("RFB 055.008\n", "RFB 003.008\n"))
+    stream = handshake_stream().replace(b"RFB 055.008\n", b"RFB 003.008\n", 1)
+    events = hs.feed(stream)
+    assert events[0]["stage"] == "ProtocolVersion"
+    assert events[0]["version"] == "RFB 003.008"
+
+
 def test_data_plane_and_exchange_gate_remain_closed():
     assert ENABLED_ADAPTER_IDS == frozenset({"mock-v1"})
     instance = SupermicroX10IKVMAdapter()

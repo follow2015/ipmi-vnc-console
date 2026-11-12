@@ -91,6 +91,8 @@ def _safe_password_value(m: re.Match, line: str) -> bool:
     lowered = value.lower()
     if not value or value == m.group(1):
         return True
+    if quoted is None and lowered in {"true", "false", "none", "null"}:
+        return True
     if value in SAFE_SYNTHETIC_VALUES or len(value) <= 2:
         return True
     if any(word in lowered for word in ("your", "xxx", "change", "example", "replace",

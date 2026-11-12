@@ -251,7 +251,7 @@ def inventory(client: Redfish, root: dict, max_members: int = 12) -> dict:
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(prog="redfish_probe", description=__doc__)
     p.add_argument("--host", required=True)
     p.add_argument("--port", type=int, default=443)
     trust = p.add_mutually_exclusive_group()

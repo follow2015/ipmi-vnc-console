@@ -61,6 +61,22 @@ ERROR_STATUS = {
 }
 
 
+USER_MESSAGES = {
+    "asset_busy": "该资产当前有一场会话，或上一场正在等待上游注销确认；请稍后重试，不要重复点击。",
+    "connection_limit": "该会话的控制台连接数已达上限，请关闭多余的标签页后刷新。",
+    "cleanup_not_pending": "该会话的清理状态不允许人工放行。",
+    "session_revoked": "该会话已被撤销，请返回 Manager 重新申请。",
+    "session_not_found": "找不到该会话，可能已被清理。",
+    "permission_denied": "没有该资产的访问权限。",
+    "adapter_not_verified": "该资产的适配器未通过核验、已过期或未获批准。",
+    "authentication_required": "会话已失效，请重新登录。",
+}
+
+
+def user_message(code: str) -> str | None:
+    return USER_MESSAGES.get(code)
+
+
 class Problem(Exception):
     def __init__(self, code: str, status: int | None = None):
         self.code = code

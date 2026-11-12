@@ -83,7 +83,7 @@ class RectHeader:
         return self.encoding in (ENCODING_AST2100, ENCODING_AST2100_JPEG)
 
 
-def parse_protocol_version(data: bytes) -> str:
+def parse_protocol_version(data: bytes, allowed=SUPPORTED_VERSIONS) -> str:
     if len(data) != RFB_VERSION_BYTES:
         raise ProtocolError("version must be exactly 12 bytes")
     try:
@@ -92,7 +92,7 @@ def parse_protocol_version(data: bytes) -> str:
         raise ProtocolError("version is not ASCII") from exc
     if not re.fullmatch(r"RFB \d{3}\.\d{3}\n", text):
         raise ProtocolError("malformed RFB version string")
-    if text not in SUPPORTED_VERSIONS:
+    if text not in allowed:
         raise ProtocolError(f"unsupported RFB version {text.strip()}")
     return text.strip()
 
@@ -159,7 +159,8 @@ def parse_rect_header(data: bytes) -> RectHeader:
 
 class RfbHandshake:
 
-    def __init__(self) -> None:
+    def __init__(self, allowed_versions=SUPPORTED_VERSIONS) -> None:
+        self._allowed_versions = allowed_versions
         self._buf = bytearray()
         self.stage = "version"
         self.events: list[dict[str, Any]] = []
@@ -198,7 +199,8 @@ class RfbHandshake:
 
     def _step(self) -> dict[str, Any] | None:
         if self.stage == "version":
-            version = parse_protocol_version(self._consume(RFB_VERSION_BYTES))
+            version = parse_protocol_version(self._consume(RFB_VERSION_BYTES),
+                                            self._allowed_versions)
             self.stage = "security"
             return {"stage": "ProtocolVersion", "version": version}
 
@@ -311,8 +313,10 @@ class RfbHandshake:
                 "payload_recorded": False}
 
 
-def client_protocol_version() -> bytes:
-    return RFB_VERSION.encode("ascii")
+def client_protocol_version(version: str = RFB_VERSION.strip()) -> bytes:
+    if not isinstance(version, str) or not re.fullmatch(r"RFB \d{3}\.\d{3}", version):
+        raise ProtocolError("malformed RFB version string")
+    return (version + "\n").encode("ascii")
 
 
 def client_security_scheme(scheme: int = SECURITY_TYPE_INSYDE) -> bytes:

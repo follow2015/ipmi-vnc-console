@@ -36,15 +36,22 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--frames", type=int, default=3, help="framebuffer updates to observe")
     p.add_argument("--timeout", type=float, default=8.0)
     p.add_argument("--no-input", action="store_true", help="skip the pointer and Shift events")
+    p.add_argument("--protocol-versions", default="",
+                   help="comma-separated RFB greetings approved for this device "
+                        "(default: the single measured RFB 055.008)")
     p.add_argument("--out", help="write the redacted report to this path")
     return p
 
 
 async def run(args, report: dict) -> int:
+    versions = tuple(v.strip() for v in args.protocol_versions.split(",") if v.strip())
+    allowance = {"protocol_versions": versions} if versions else {}
     cfg = UpstreamConfig(host=args.host, port=args.port, scheme="https",
                          cert_sha256=args.cert_sha256, bootstrap_path=args.entry_path,
-                         handshake_timeout=args.timeout, request_timeout=args.timeout)
+                         handshake_timeout=args.timeout, request_timeout=args.timeout,
+                         **allowance)
     upstream = RfbUpstream(cfg)
+    report["approved_protocol_versions"] = list(versions) if versions else ["RFB 055.008"]
     report["tls_pinning"] = "sha256 fingerprint pinned on every connection"
     started = time.monotonic()
     try:
@@ -56,7 +63,7 @@ async def run(args, report: dict) -> int:
         await upstream.open()
         init = upstream.server_init
         report["handshake"] = {
-            "protocol_version": "055.008",
+            "protocol_version": upstream.protocol_version,
             "security_type": 16,
             "server_init": None if init is None else {
                 "width": init.width, "height": init.height,

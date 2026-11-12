@@ -11,6 +11,7 @@ from .common import Problem
 
 class MockAdapter:
     adapter_id = "mock-v1"
+    connection_limit = 4
 
     def __init__(self, info):
         target = urlsplit(info["target"])

@@ -1,0 +1,19 @@
+{
+  "captured": "2026-11-12",
+  "device_family": "ATEN iKVM HTML5 console, AST2100 encoding, RFB 003.008 greeting, security type 16",
+  "source": "browser WebSocket send trace, one live session through the platform gateway",
+  "redaction": "the 48-byte security reply is replaced with placeholder bytes; no ticket, cookie, host address, user name or credential is retained",
+  "handshake_messages": [
+    {"bytes_hex": "524642203030332e3030380a", "meaning": "client greeting: RFB 003.008"},
+    {"bytes_hex": "10", "meaning": "security type 16 (Insyde), 1 byte"},
+    {"bytes_hex": "414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141", "meaning": "48-byte security reply (redacted placeholder)"},
+    {"bytes_hex": "01", "meaning": "ClientInit, shared=1"}
+  ],
+  "relay_messages": [
+    {"bytes_hex": "03000000000001e00280", "meaning": "FramebufferUpdateRequest, incremental=0, 480x640"},
+    {"bytes_hex": "03000000000004000300", "meaning": "FramebufferUpdateRequest for the 1024x768 canvas before the resize lands"},
+    {"bytes_hex": "19", "meaning": "insydeMTCursorPosReq, sent after every framebuffer update"},
+    {"bytes_hex": "050004006400c80000000000000000000000", "meaning": "pointerEventInsyde, 18 bytes"},
+    {"bytes_hex": "0400010000000000e1000000000000000000", "meaning": "keyEventInsyde, 18 bytes"}
+  ]
+}

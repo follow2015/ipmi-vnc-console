@@ -14,6 +14,7 @@ TRANSITIONS = {
 APPROVAL_INPUTS = ("approver", "evidence", "licence", "console_impl")
 
 _VERSION = re.compile(r"^[0-9]{1,6}(?:\.[0-9]{1,6}){0,3}$")
+_RFB_GREETING = re.compile(r"RFB \d{3}\.\d{3}")
 
 
 def transition_allowed(source: str, target: str) -> bool:
@@ -58,6 +59,26 @@ def models_in_family(entry, model: str) -> bool:
     if listed:
         return str(model or "") in listed
     return bool(entry.get("model")) and entry.get("model") == model
+
+
+def parse_protocol_versions(raw) -> tuple[str, ...] | None:
+    if raw is None or raw == "":
+        return ()
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+    elif isinstance(raw, (list, tuple)):
+        parsed = list(raw)
+    else:
+        return None
+    if not isinstance(parsed, list) or any(
+            not isinstance(v, str) or not _RFB_GREETING.fullmatch(v) for v in parsed):
+        return None
+    if len(set(parsed)) != len(parsed):
+        return None
+    return tuple(parsed)
 
 
 def window_parses(entry) -> bool:

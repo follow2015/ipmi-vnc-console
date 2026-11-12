@@ -17,6 +17,7 @@ from .ast2100_protocol import (
     AUTH_RESPONSE_BYTES,
     CLIENT_MSG_SET_ENCODINGS,
     ENCODING_AST2100,
+    RFB_VERSION,
     IncompleteFrame,
     ProtocolError,
     RfbHandshake,
@@ -90,9 +91,18 @@ class UpstreamConfig:
     max_total_bytes: int = 64 * 1024 * 1024
     max_frames: int = 4000
     max_redirects: int = 0
+    enforce_relay_budget: bool = True
+    protocol_versions: tuple[str, ...] = (RFB_VERSION.strip(),)
+    keepalive_seconds: float | None = 20.0
 
     def __post_init__(self) -> None:
         _validate_host(self.host)
+        versions = self.protocol_versions
+        if (not isinstance(versions, tuple) or not versions
+                or any(not isinstance(v, str) or not re.fullmatch(r"RFB \d{3}\.\d{3}", v)
+                       for v in versions)
+                or len(set(versions)) != len(versions)):
+            raise ValueError("invalid_protocol_versions")
         if not isinstance(self.port, int) or isinstance(self.port, bool) or not 1 <= self.port <= 65535:
             raise ValueError("invalid_bmc_port")
         if self.scheme not in ("https", "http"):
@@ -119,6 +129,11 @@ class UpstreamConfig:
         _validate_path(self.logout_path, allow_query=False)
         _validate_path(self.bootstrap_path, allow_query=True)
         _validate_path(self.ws_path, allow_query=False)
+        keepalive = self.keepalive_seconds
+        if keepalive is not None and (isinstance(keepalive, bool)
+                                      or not isinstance(keepalive, (int, float))
+                                      or not 0.1 <= keepalive <= 300):
+            raise ValueError("invalid_keepalive")
 
     @property
     def base_url(self) -> str:
@@ -213,6 +228,7 @@ class RfbUpstream:
         self.clock = clock
         self.stats = RelayStats()
         self.server_init = None
+        self.protocol_version: str | None = None
         self.server_init_raw: bytes = b""
         self.pending: bytes = b""
         self.init_event: dict[str, Any] | None = None
@@ -315,7 +331,7 @@ class RfbUpstream:
                     self.cfg.url(self.cfg.ws_path), protocols=(), compress=0,
                     headers={**self._cookie_header(), "Origin": self.cfg.base_url},
                     max_msg_size=min(self.cfg.max_frame_bytes * 2, 16 * 1024 * 1024),
-                    autoping=True, heartbeat=None,
+                    autoping=True, heartbeat=self.cfg.keepalive_seconds,
                     timeout=aiohttp.ClientWSTimeout(ws_close=2))
                 await self._handshake(request_frames=request_frames)
         except Problem:
@@ -324,12 +340,14 @@ class RfbUpstream:
             raise Problem("upstream_unavailable", 502) from None
 
     async def _handshake(self, *, request_frames: bool = True) -> None:
-        parser = RfbHandshake()
+        parser = RfbHandshake(allowed_versions=tuple(
+            version + "\n" for version in self.cfg.protocol_versions))
         self._parser = parser
         for expected in ("ProtocolVersion", "Security", "Authentication", "SecurityResult", "ServerInit"):
             event = await self._event(parser, expected)
             if expected == "ProtocolVersion":
-                await self._send(client_protocol_version())
+                self.protocol_version = event["version"]
+                await self._send(client_protocol_version(event["version"]))
             elif expected == "Security":
                 await self._send(client_security_scheme())
             elif expected == "Authentication":
@@ -437,11 +455,15 @@ class RfbUpstream:
                 self.stats.bytes += len(data)
                 self.stats.max_frame_bytes = max(self.stats.max_frame_bytes, len(data))
                 self.stats.last_event_at = self.clock()
-                if self.stats.frames > self.cfg.max_frames or self.stats.bytes > self.cfg.max_total_bytes:
+                if self.cfg.enforce_relay_budget and (
+                        self.stats.frames > self.cfg.max_frames
+                        or self.stats.bytes > self.cfg.max_total_bytes):
                     raise Problem("upstream_budget_exceeded", 502)
                 await on_bytes(data)
             elif message.type is aiohttp.WSMsgType.TEXT:
                 raise Problem("upstream_invalid_response", 502)
+            elif message.type is aiohttp.WSMsgType.ERROR:
+                raise Problem("upstream_unresponsive", 502)
             else:
                 return
 

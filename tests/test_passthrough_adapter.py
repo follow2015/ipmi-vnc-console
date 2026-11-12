@@ -30,6 +30,12 @@ def test_adapter_accepts_the_measured_target_shape():
     assert adapter.cfg.cert_sha256 == FINGERPRINT
 
 
+def test_live_relay_is_not_cut_off_by_the_probe_frame_budget():
+    cfg = PassthroughAdapter(info()).cfg
+    assert cfg.enforce_relay_budget is False
+    assert cfg.max_frame_bytes == 1024 * 1024
+
+
 @pytest.mark.parametrize("overrides", [
     {"adapter": "mock-v1"},
     {"target": "http://192.0.2.11"},
@@ -217,3 +223,51 @@ def test_asset_fetch_is_denied_outside_the_allowlist():
 
 def test_adapter_close_is_safe_before_login():
     assert asyncio.run(PassthroughAdapter(info()).close()) is False
+
+
+
+def test_adapter_forwards_the_approved_protocol_versions():
+    cfg = PassthroughAdapter(info(protocol_versions=["RFB 055.008", "RFB 003.008"])).cfg
+    assert cfg.protocol_versions == ("RFB 055.008", "RFB 003.008")
+
+
+def test_adapter_uses_the_measured_default_without_an_allowance():
+    assert PassthroughAdapter(info()).cfg.protocol_versions == ("RFB 055.008",)
+
+
+def test_adapter_rejects_a_malformed_allowance():
+    with pytest.raises(Problem, match="invalid_target_policy"):
+        PassthroughAdapter(info(protocol_versions=["XXXX 003.008"]))
+
+
+def test_connect_greets_the_browser_with_the_negotiated_version():
+    adapter = PassthroughAdapter(info())
+    adapter.upstream = FakeUpstream(b"\x00" * 40)
+    adapter.upstream.protocol_version = "RFB 003.008"
+
+    async def scenario():
+        session = await adapter.connect(["binary"])
+        message = await session.__anext__()
+        assert message.data == b"RFB 003.008\n"
+
+    asyncio.run(scenario())
+
+
+def test_connect_accepts_the_measured_insyde_client_messages():
+    adapter = PassthroughAdapter(info())
+    adapter.upstream = FakeUpstream(b"\x00" * 40)
+    pointer = b"\x05\x00\x04\x00\x64\x00\xc8" + b"\x00" * 11
+    key = b"\x04\x00\x01\x00\x00\x00\x00\x00\xe1" + b"\x00" * 9
+
+    async def scenario():
+        session = await adapter.connect(["binary"])
+        await session.send_bytes(b"RFB 055.008\n\x10" + b"A" * 48 + b"\x01")
+        await session.send_bytes(b"\x19")
+        await session.send_bytes(pointer)
+        await session.send_bytes(key)
+        await asyncio.sleep(0)
+        assert session.error is None
+        assert adapter.upstream.sent == [b"\x19", pointer, key]
+        await session.close()
+
+    asyncio.run(scenario())

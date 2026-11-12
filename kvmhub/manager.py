@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .common import (INTERNAL_PORT, TRACE_ID, UI_PORT, WORKER_PORT, Problem,
-                     digest, issue, secret_matches, verify)
+                     digest, issue, secret_matches, user_message, verify)
 from .store import Store
 
 LOGIN = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>KVM Hub</title>
@@ -22,7 +22,7 @@ LOGIN = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>KVM Hu
 STYLE = """body{font:16px system-ui;background:#edf1f5;color:#1a2738;margin:0}main{max-width:850px;margin:50px auto;padding:30px;background:white;border-radius:12px}input,button{font:inherit;padding:9px;margin:8px}button{cursor:pointer}article{border-top:1px solid #ddd;padding:16px 0}small{color:#556}#error{color:#a22}a{color:#167}code{overflow-wrap:anywhere}"""
 LOGIN_JS = """document.querySelector('#login').onsubmit=async e=>{e.preventDefault();const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:new FormData(e.target).get('token')})});if(r.ok)location.assign('/');else document.querySelector('#error').textContent='登录失败，请检查本地访问口令。';};"""
 APP_JS = """const csrf=document.querySelector('meta[name=csrf]').content;const error=document.querySelector('#error');
-async function post(url){const r=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':csrf}});const j=await r.json();if(!r.ok)throw Error(j.error+' · '+j.trace_id);return j;}
+async function post(url){const r=await fetch(url,{method:'POST',headers:{'X-CSRF-Token':csrf}});const j=await r.json();if(!r.ok)throw Error((j.message||('操作失败：'+j.error))+'（事件 '+j.trace_id+'）');return j;}
 document.querySelectorAll('[data-open]').forEach(b=>b.onclick=async()=>{const w=window.open('about:blank','_blank');if(!w){error.textContent='请允许打开控制台窗口';return;}try{const j=await post('/api/assets/'+b.dataset.open+'/sessions');const f=document.createElement('form');f.method='POST';f.action=j.accept_url;f.target=w.name='kvm-'+j.id;const t=document.createElement('input');t.type='hidden';t.name='ticket';t.value=j.ticket;f.append(t);document.body.append(f);f.submit();f.remove();setTimeout(()=>location.reload(),800);}catch(e){w.close();error.textContent=e.message;}});
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=async()=>{try{await post('/api/sessions/'+b.dataset.close+'/close');location.reload();}catch(e){error.textContent=e.message;}});
 document.querySelector('#logout').onclick=async()=>{await post('/api/logout');location.reload();};
@@ -61,7 +61,8 @@ def build_apps(cfg, store=None):
             incoming = request.headers.get("X-Trace-ID", "")
             request.state.trace = incoming if TRACE_ID.fullmatch(incoming) else uuid.uuid4().hex
             if request.headers.get("host") != expected_host:
-                return JSONResponse({"error": "invalid_host", "trace_id": request.state.trace}, status_code=421)
+                return JSONResponse({"error": "invalid_host", "trace_id": request.state.trace,
+                                     "message": user_message("invalid_host")}, status_code=421)
             response = await call_next(request)
             response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "strict-origin",
                                      "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
@@ -71,7 +72,8 @@ def build_apps(cfg, store=None):
 
         @app.exception_handler(Problem)
         async def problem(request, exc):
-            return JSONResponse({"error": exc.code, "trace_id": request.state.trace}, status_code=exc.status)
+            return JSONResponse({"error": exc.code, "message": user_message(exc.code),
+                                 "trace_id": request.state.trace}, status_code=exc.status)
 
     install(ui, f"localhost:{UI_PORT}")
     install(internal, f"localhost:{INTERNAL_PORT}")

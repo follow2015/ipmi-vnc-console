@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import html
+import logging
 import secrets
 import time
 import uuid
@@ -16,13 +17,42 @@ from .adapter import MockAdapter
 from .adapters.passthrough import ASSET_PATH as PASSTHROUGH_ASSET_PATH
 from .adapters.passthrough import PassthroughAdapter
 from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, SESSION_END_CODES,
-                     WORKER_HOST_SUFFIX, Problem, client_tls, digest, verify)
+                     WORKER_HOST_SUFFIX, Problem, client_tls, digest, user_message,
+                     verify)
 
 SESSION_KEY = web.RequestKey("session_id", str)
+
+log = logging.getLogger("kvmhub.worker")
+
+REPORT_RETRY_FIRST = 0.5
+REPORT_RETRY_MAX = 30.0
+
+CONNECTION_LIMIT = 4
+
+
+def connection_limit(adapter) -> int:
+    return min(CONNECTION_LIMIT, getattr(adapter, "connection_limit", CONNECTION_LIMIT))
+
+
+class ManagerRejected(Problem):
+
+    def __init__(self, code: str, upstream_status: int):
+        super().__init__(code)
+        self.upstream_status = upstream_status
+
+    @property
+    def permanent(self) -> bool:
+        return 400 <= self.upstream_status < 500 and self.upstream_status not in (408, 429)
 
 
 def cookie_max_age(hard_until: float, now: float) -> int:
     return max(1, min(14400, int(hard_until - now)))
+
+
+def upstream_end_reason(upstream) -> str:
+    error = getattr(upstream, "error", None)
+    return "upstream_unresponsive" if error == "upstream_unresponsive" else "upstream_error"
+
 
 CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>模拟 KVM 控制台</title>
 <style>body{background:#101c2c;color:#e6eef8;font:16px system-ui;padding:30px}canvas{border:1px solid #456;max-width:100%;background:#08111e}button{padding:10px;margin:10px}#status{min-height:24px}</style>
@@ -76,28 +106,82 @@ REAL_CONSOLE_JS = """'use strict';
 (function () {
   var status = document.getElementById('status');
   var canvas = document.getElementById('screen');
-  function setStatus(text) { status.textContent = text; status.title = text; }
+  var ended = false;
+  var explained = false;
+  // A failing console keeps a short breadcrumb of what it displayed and when.
+  // Without it, "the tab just said 'failed'" is all support ever gets.
+  var log = window.__kvmStatusLog = [];
+  function setStatus(text) {
+    log.push([Date.now(), text]);
+    if (log.length > 20) log.shift();
+    status.textContent = text;
+    status.title = text;
+  }
+  function explain(text) { explained = true; setStatus(text); }
+
+  function describe(counts) {
+    if (counts.connections + counts.opening >= counts.limit) {
+      explain('此会话的控制台连接已达上限（' + counts.limit + '）。通常是同一会话开了多个标签页；关闭其它标签页后刷新本页。');
+      return true;
+    }
+    return false;
+  }
+  // The upgrade's 429 is unreadable from the page, and the measured client only
+  // reports "failed" after about 17 seconds. Asking first avoids both: the
+  // operator is told at once, and no doomed handshake is sent to the BMC.
+  function askThenConnect() {
+    fetch('/_platform/limits', { cache: 'no-store' }).then(function (response) {
+      if (response.status === 401) {
+        explain('会话已结束或已失效（可能被撤销、租约到期或凭据过期）。请返回 Manager 查看状态后重新申请。');
+        return null;
+      }
+      return response.ok ? response.json() : null;
+    }).then(function (counts) {
+      if (!counts) { start(); return; }
+      log.push([Date.now(), 'limits ' + JSON.stringify(counts)]);
+      if (!describe(counts)) start();
+    }).catch(function () { start(); });
+  }
+  // After a connection is up this only fires when the session ends underneath
+  // the page, which is where the 401 branch above earns its keep.
+  function recheck() {
+    if (ended || explained) return;
+    fetch('/_platform/limits', { cache: 'no-store' }).then(function (response) {
+      if (response.status === 401) {
+        explain('会话已结束或已失效（可能被撤销、租约到期或凭据过期）。请返回 Manager 查看状态后重新申请。');
+        return null;
+      }
+      return response.ok ? response.json() : null;
+    }).then(function (counts) { if (counts) describe(counts); }).catch(function () {});
+  }
+
   var rfb;
-  try {
-    rfb = new RFB({
-      target: canvas, encrypt: true, shared: true, view_only: false,
-      wsProtocols: ['binary'], true_color: true, local_cursor: true,
-      onUpdateState: function (client, state, old, message) {
-        setStatus(state + (message ? ' · ' + message : ''));
-        if (state === 'normal') canvas.focus();
-      },
-      // The measured client dereferences the return value of this callback
-      // whenever the Insyde extension is active; the default noop returns
-      // undefined and silently drops every pointer event.
-      onMouseMove: function (x, y) { return { x: x, y: y }; },
-      onDesktopName: function (client, name) { document.title = name + ' · 真机 KVM'; },
-      onFBResize: function (client, width, height) { canvas.width = width; canvas.height = height; }
-    });
-  } catch (error) { setStatus('初始化失败：' + error); return; }
-  window.__kvm = rfb;
-  rfb.connect(location.hostname, location.port, '000000000000000000000000',
-              '000000000000000000000000', 'console');
+  function start() {
+    try {
+      rfb = new RFB({
+        target: canvas, encrypt: true, shared: true, view_only: false,
+        wsProtocols: ['binary'], true_color: true, local_cursor: true,
+        onUpdateState: function (client, state, old, message) {
+          if (state === 'normal') { explained = false; setStatus(state); canvas.focus(); return; }
+          if (explained) return;
+          setStatus(state + (message ? ' · ' + message : ''));
+          if (state === 'failed' || state === 'disconnected') recheck();
+        },
+        // The measured client dereferences the return value of this callback
+        // whenever the Insyde extension is active; the default noop returns
+        // undefined and silently drops every pointer event.
+        onMouseMove: function (x, y) { return { x: x, y: y }; },
+        onDesktopName: function (client, name) { document.title = name + ' · 真机 KVM'; },
+        onFBResize: function (client, width, height) { canvas.width = width; canvas.height = height; }
+      });
+    } catch (error) { setStatus('初始化失败：' + error); return; }
+    window.__kvm = rfb;
+    rfb.connect(location.hostname, location.port, '000000000000000000000000',
+                '000000000000000000000000', 'console');
+  }
+  askThenConnect();
   function endSession() {
+    ended = true;
     if (rfb) { try { rfb.disconnect(); } catch (error) {} }
     fetch('/_platform/close', { method: 'POST' }).catch(function () {});
   }
@@ -139,6 +223,7 @@ class Gateway:
         self.sessions: dict[str, Runtime] = {}
         self.traces: dict[str, str] = {}
         self.pending_reports = {}
+        self._report_retry: dict[str, tuple[int, float]] = {}
         self.control = None
         self.task = None
         self.watchdogs = set()
@@ -160,7 +245,7 @@ class Gateway:
                     body = await response.json(content_type=None)
                     if isinstance(body, dict) and body.get("error") in SESSION_END_CODES:
                         code = body["error"]
-                raise Problem(code)
+                raise ManagerRejected(code, response.status)
             return await response.json()
 
     async def start(self, app):
@@ -186,9 +271,31 @@ class Gateway:
         self.pending_reports[sid] = {"cleanup": cleanup, "reason": reason}
         try:
             await self.call(sid, "finish", self.pending_reports[sid])
-        except (Problem, aiohttp.ClientError, TimeoutError):
+        except ManagerRejected as exc:
+            if exc.permanent:
+                log.warning("finish report for session %s refused by the Manager "
+                            "(%s, HTTP %s); not retrying", sid, exc.code, exc.upstream_status)
+                self._forget_report(sid)
+            else:
+                self._retry_later(sid)
             return
+        except (Problem, aiohttp.ClientError, TimeoutError):
+            self._retry_later(sid)
+            return
+        self._forget_report(sid)
+
+    def _forget_report(self, sid):
         self.pending_reports.pop(sid, None)
+        self._report_retry.pop(sid, None)
+
+    def _retry_later(self, sid):
+        attempts = self._report_retry.get(sid, (0, 0.0))[0] + 1
+        delay = min(REPORT_RETRY_FIRST * 2 ** (attempts - 1), REPORT_RETRY_MAX)
+        self._report_retry[sid] = (attempts, time.monotonic() + delay)
+
+    def due_reports(self, now):
+        return [(sid, report) for sid, report in list(self.pending_reports.items())
+                if now >= self._report_retry.get(sid, (0, 0.0))[1]]
 
     def cancel_idle(self, sess):
         if sess.idle_task and not sess.idle_task.done() and sess.idle_task is not asyncio.current_task():
@@ -225,12 +332,18 @@ class Gateway:
             await self.report(sess.sid, "confirmed" if cleaned else "pending", reason)
             self.sessions.pop(sess.sid, None)
 
+    async def end_lost_upstream(self, sess, upstream):
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(3):
+                await upstream.close(code=1000)
+        await self.finish(sess, upstream_end_reason(upstream))
+
     async def supervise(self):
         while True:
             await asyncio.sleep(0.25)
             now = time.monotonic()
             await asyncio.gather(*(self.check_lease(s, now) for s in list(self.sessions.values())))
-            for sid, report in list(self.pending_reports.items()):
+            for sid, report in self.due_reports(now):
                 await self.report(sid, report["cleanup"], report["reason"])
 
     async def lease_watchdog(self, sess):
@@ -331,7 +444,7 @@ class Gateway:
             offered = ["binary"]
         if "binary" not in offered:
             raise Problem("subprotocol_required", 400)
-        if len(sess.ws) + sess.opening >= 4:
+        if len(sess.ws) + sess.opening >= connection_limit(sess.adapter):
             raise Problem("connection_limit")
         sess.opening += 1
         self.cancel_idle(sess)
@@ -366,10 +479,16 @@ class Gateway:
                         else:
                             break
 
-            pumps = [asyncio.create_task(pump(client, upstream)), asyncio.create_task(pump(upstream, client))]
+            to_upstream = asyncio.create_task(pump(client, upstream))
+            from_upstream = asyncio.create_task(pump(upstream, client))
+            pumps = [to_upstream, from_upstream]
             done, _ = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
+            if from_upstream in done and not sess.closing:
+                ending = asyncio.create_task(self.end_lost_upstream(sess, upstream))
+                self.watchdogs.add(ending)
+                ending.add_done_callback(self.watchdogs.discard)
         finally:
             for task in pumps:
                 task.cancel()
@@ -378,7 +497,7 @@ class Gateway:
                 async with asyncio.timeout(3):
                     await upstream.close(code=1000)
             sess.ws.discard(client)
-            if not sess.ws and not sess.closing:
+            if not sess.ws and not sess.closing and sess.idle_task is None:
                 self.schedule_idle_finish(sess)
         return client
 
@@ -394,6 +513,11 @@ class Gateway:
                 raise Problem("csrf_rejected", 403)
             await self.finish(sess, "client_closed")
             return web.json_response({"ok": True})
+        if request.path == "/_platform/limits" and request.method == "GET":
+            return web.json_response({"limit": connection_limit(sess.adapter),
+                                      "connections": len(sess.ws),
+                                      "opening": sess.opening,
+                                      "closing": sess.closing})
         if request.method != "GET" or request.query_string:
             raise Problem("route_denied", 403)
         real = isinstance(sess.adapter, PassthroughAdapter)
@@ -425,7 +549,8 @@ def create_worker(cfg):
                     '<p>请返回 Manager 查看会话状态或重新申请，不要重复提交票据。</p>'
                     f'<a href="{html.escape(cfg["manager_origin"], quote=True)}">返回 Manager</a></html>')
             return web.Response(text=page, content_type="text/html", status=status)
-        return web.json_response({"error": code, "trace_id": trace}, status=status)
+        return web.json_response({"error": code, "message": user_message(code),
+                                  "trace_id": trace}, status=status)
 
     @web.middleware
     async def guards(request, handler):
