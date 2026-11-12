@@ -23,11 +23,6 @@ _IPV4 = (
 )
 
 RULES: list[tuple[str, re.Pattern, str]] = [
-    ("INTERNAL_ASSET", re.compile(
-        r"(?<![\w.])10\.100\.1\.\d{1,3}(?![\d.])"
-        r"|(?<![\w.])58\.49\.146\.64(?![\d.])"
-        r"|\bipip\.local\b|\bgguu@\w[\w.-]*"
-    ), "内部资产地址 / 内部域标识"),
     ("IP_ADDR", re.compile(_IPV4), "IP 地址字面量"),
     ("PRIVATE_KEY", re.compile(r"-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE KEY-----"), "私钥"),
     ("GITHUB_TOKEN", re.compile(r"\b(gho_|ghp_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}\b"), "GitHub Token"),
