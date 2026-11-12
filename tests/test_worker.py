@@ -16,8 +16,8 @@ from kvmhub.adapter import MockAdapter
 from kvmhub.common import WORKER_PORT, Problem, digest, issue, server_tls
 from kvmhub.mock_bmc import create_mock
 from kvmhub import worker as worker_module
-from kvmhub.worker import (GATEWAY_KEY, SESSION_KEY, Gateway, ManagerRejected, Runtime,
-                           create_worker)
+from kvmhub.worker import (GATEWAY_KEY, MAX_TRACES, SESSION_KEY, Gateway, ManagerRejected,
+                           Runtime, create_worker)
 from tools.bootstrap import generate
 
 
@@ -133,6 +133,44 @@ async def test_local_lease_expires_without_manager(identities):
     await asyncio.wait_for(gateway.lease_watchdog(sess), timeout=1)
     assert adapter.closed and sess.closing and not gateway.sessions
     assert gateway.pending_reports["sid"]["reason"] == "lease_expired"
+
+
+async def test_a_finished_session_leaves_no_trace_behind(identities):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+
+    class Adapter:
+        async def close(self):
+            return True
+
+    sess = Runtime("sid", "hash", Adapter(), time.monotonic()+30)
+    gateway.sessions[sess.sid] = sess
+    gateway.traces[sess.sid] = "trace-from-ticket"
+
+    async def unavailable(*args, **kwargs):
+        raise aiohttp.ClientConnectionError()
+
+    gateway.call = unavailable
+    await gateway.finish(sess, "client_closed")
+    assert sess.sid not in gateway.sessions
+    assert sess.sid not in gateway.traces
+
+
+async def test_an_unknown_host_does_not_grow_the_trace_table(identities):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+    assert gateway.trace_of("never-seen")
+    assert gateway.traces == {}
+
+
+async def test_the_trace_table_is_bounded(identities):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+    for index in range(MAX_TRACES + 10):
+        gateway.trace_for(f"sid-{index}")
+    assert len(gateway.traces) == MAX_TRACES
+    assert f"sid-{MAX_TRACES + 9}" in gateway.traces
+    assert "sid-0" not in gateway.traces
 
 
 async def test_failed_logout_is_reported_as_pending(identities):
@@ -361,6 +399,9 @@ def test_upstream_end_reason_keeps_heartbeat_failure_distinct():
     assert upstream_end_reason(SimpleNamespace(error="upstream_frame_too_large")) == "upstream_error"
     assert upstream_end_reason(SimpleNamespace(error=None)) == "upstream_error"
     assert upstream_end_reason(SimpleNamespace()) == "upstream_error"
+    for code in ("client_message_denied", "client_message_malformed"):
+        assert upstream_end_reason(SimpleNamespace(error=code)) == code
+        assert code in END_REASONS
     assert set(END_REASONS) >= {"upstream_error", "upstream_unresponsive", "client_closed"}
 
 

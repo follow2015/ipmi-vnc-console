@@ -10,17 +10,24 @@ on:
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
+# 最小权限：这个工作流只读代码、跑测试，不需要写任何东西。不写 permissions
+# 时 token 会带上仓库默认的写权限，等于给每个 action 多开一道门。
+permissions:
+  contents: read
+
 jobs:
   gate:
     name: 门禁 / 扫密 / 全套测试
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Action 按 commit SHA 固定，不用浮动的 tag：tag 可以被上游改指向，
+      # 而 SHA 不会。注释保留可读的版本号，升级时人读得懂。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           # 提交历史扫密要看到全部 commit，浅克隆会把旧提交藏起来。
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.14"
 

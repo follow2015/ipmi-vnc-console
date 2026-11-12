@@ -27,6 +27,8 @@ log = logging.getLogger("kvmhub.worker")
 REPORT_RETRY_FIRST = 0.5
 REPORT_RETRY_MAX = 30.0
 
+MAX_TRACES = 1024
+
 CONNECTION_LIMIT = 4
 
 
@@ -49,9 +51,16 @@ def cookie_max_age(hard_until: float, now: float) -> int:
     return max(1, min(14400, int(hard_until - now)))
 
 
+CLIENT_SIDE_END_REASONS = frozenset({"client_message_denied", "client_message_malformed"})
+
+
 def upstream_end_reason(upstream) -> str:
     error = getattr(upstream, "error", None)
-    return "upstream_unresponsive" if error == "upstream_unresponsive" else "upstream_error"
+    if error == "upstream_unresponsive":
+        return "upstream_unresponsive"
+    if error in CLIENT_SIDE_END_REASONS:
+        return error
+    return "upstream_error"
 
 
 CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>模拟 KVM 控制台</title>
@@ -232,7 +241,14 @@ class Gateway:
     def trace_for(self, sid):
         if sid is None:
             return uuid.uuid4().hex
+        if sid not in self.traces and len(self.traces) >= MAX_TRACES:
+            self.traces.pop(next(iter(self.traces)), None)
         return self.traces.setdefault(sid, uuid.uuid4().hex)
+
+    def trace_of(self, sid):
+        if sid is None:
+            return uuid.uuid4().hex
+        return self.traces.get(sid) or uuid.uuid4().hex
 
     async def call(self, sid, operation, data=None):
         async with self.control.post(self.cfg["manager_internal"] + f"/internal/v1/sessions/{sid}/{operation}",
@@ -331,8 +347,17 @@ class Gateway:
             cleaned = await sess.adapter.close()
             await self.report(sess.sid, "confirmed" if cleaned else "pending", reason)
             self.sessions.pop(sess.sid, None)
+            self.traces.pop(sess.sid, None)
 
     async def end_lost_upstream(self, sess, upstream):
+        transport = getattr(upstream, "upstream", None)
+        log.warning("session %s ended: reason=%s upstream_close_code=%s key_events=%s "
+                    "client_bytes=%s denied=%s",
+                    sess.sid, upstream_end_reason(upstream),
+                    getattr(transport, "upstream_close_code", None),
+                    getattr(upstream, "client_key_events", 0),
+                    getattr(upstream, "client_bytes", 0),
+                    getattr(upstream, "denied", None))
         with contextlib.suppress(Exception):
             async with asyncio.timeout(3):
                 await upstream.close(code=1000)
@@ -559,7 +584,7 @@ def create_worker(cfg):
         sid = match[1] if match else None
         if sid:
             request[SESSION_KEY] = sid
-        fallback = gateway.trace_for(sid)
+        fallback = gateway.trace_of(sid)
 
         def linked():
             return gateway.traces.get(sid, fallback) if sid else fallback

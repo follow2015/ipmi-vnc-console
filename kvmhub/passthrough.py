@@ -54,7 +54,12 @@ class BrowserHandshakeError(ValueError):
 
 
 class ClientMessageError(ValueError):
-    pass
+
+    def __init__(self, code: str, *, kind: int | None = None, length: int = 0) -> None:
+        super().__init__(code)
+        self.code = code
+        self.kind = kind
+        self.length = length
 
 
 class ClientMessageFramer:
@@ -64,21 +69,23 @@ class ClientMessageFramer:
         self._allowed = frozenset(allowed)
         self._sizes = dict(_FIXED_CLIENT_MESSAGE_BYTES if sizes is None else sizes)
         self._buf = bytearray()
+        self.key_events = 0
 
     def _next_size(self) -> int | None:
         kind = self._buf[0]
+        buffered = len(self._buf)
         if kind not in self._allowed:
-            raise ClientMessageError("client_message_denied")
+            raise ClientMessageError("client_message_denied", kind=kind, length=buffered)
         if kind == CLIENT_MSG_SET_ENCODINGS:
             if len(self._buf) < 4:
                 return None
             count = int.from_bytes(self._buf[2:4], "big")
             if not 1 <= count <= MAX_SET_ENCODINGS:
-                raise ClientMessageError("client_message_malformed")
+                raise ClientMessageError("client_message_malformed", kind=kind, length=buffered)
             return 4 + 4 * count
         size = self._sizes.get(kind)
         if size is None:
-            raise ClientMessageError("client_message_denied")
+            raise ClientMessageError("client_message_denied", kind=kind, length=buffered)
         return size
 
     def feed(self, data: bytes) -> bytes:
@@ -89,6 +96,8 @@ class ClientMessageFramer:
             if size is None or len(self._buf) < size:
                 break
             ready += self._buf[:size]
+            if self._buf[0] == CLIENT_MSG_KEY_EVENT:
+                self.key_events += 1
             del self._buf[:size]
         return bytes(ready)
 
@@ -191,8 +200,13 @@ class RfbPassthroughSession:
         self._room.set()
         self.started = False
         self.error: str | None = None
+        self.denied: dict[str, int] | None = None
         self.client_bytes = 0
         self.server_bytes = 0
+
+    @property
+    def client_key_events(self) -> int:
+        return self._framer.key_events
 
     async def start(self) -> None:
         if self.started:
@@ -224,7 +238,8 @@ class RfbPassthroughSession:
         try:
             ready = self._framer.feed(data)
         except ClientMessageError as exc:
-            self.error = exc.args[0] if exc.args else "client_message_denied"
+            self.error = exc.code
+            self.denied = {"kind": exc.kind, "length": exc.length}
             await self.close(code=1008)
             return False
         if ready:

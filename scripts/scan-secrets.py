@@ -98,7 +98,8 @@ def _safe_password_value(m: re.Match, line: str) -> bool:
     if any(word in lowered for word in ("your", "xxx", "change", "example", "replace",
                                         "placeholder", "<", "%", "fingerprint")):
         return True
-    if re.fullmatch(r"[A-Z][A-Z0-9_]*", value) or re.fullmatch(r"[a-z_][a-z0-9_]*", value):
+    if quoted is None and (re.fullmatch(r"[A-Z][A-Z0-9_]*", value)
+                           or re.fullmatch(r"[a-z_][a-z0-9_]*", value)):
         return True
     if _PLACEHOLDER.match(value):
         return True

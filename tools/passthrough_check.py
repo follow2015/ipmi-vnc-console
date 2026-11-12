@@ -26,7 +26,7 @@ STARTUP_TIMEOUT = 60.0
 SETTLE_SECONDS = 5.0
 
 SECRET_PLACEHOLDER = "@secret"
-_STEP_FIELDS = {"label", "text", "keys", "enter", "wait", "delay", "shot", "shot_before",
+_STEP_FIELDS = {"label", "text", "keys", "enter", "wait", "delay", "hold", "shot", "shot_before",
                 "expect_change", "reload"}
 
 CLIENT_MODIFIERS = ("Shift", "Control", "Alt", "Meta")
@@ -64,11 +64,15 @@ def parse_type_script(raw: str) -> list[dict]:
                 raise ValueError(f"step {index} takes one of text or keys, not both")
             if text is None and keys is None:
                 raise ValueError(f"step {index} needs text or keys")
+        hold = int(item.get("hold", 0))
+        if hold < 0:
+            raise ValueError(f"step {index}: hold must be zero or a positive number of ms")
         steps.append({"label": label, "text": str(text or ""), "keys": str(keys or ""),
                       "reload": reload,
                       "enter": False if reload else bool(item.get("enter", keys is None)),
                       "wait": int(item.get("wait", 1200)),
                       "delay": int(item.get("delay", 55)),
+                      "hold": hold,
                       "shot": str(item.get("shot") or ""),
                       "shot_before": str(item.get("shot_before") or ""),
                       "expect_change": bool(item.get("expect_change", False))})
@@ -96,6 +100,7 @@ def describe_steps(steps: list[dict]) -> list[dict]:
 
 PROBE_TEXT = "AbC1"
 PROBE_LABEL = "probe_echo"
+PROBE_CASE_LABEL = "probe_case"
 PROBE_CLEAR_LABEL = "probe_clear"
 _PROBE_MIN_LENGTH, _PROBE_MAX_LENGTH = 2, 16
 _PROBE_CHARS = re.compile(r"[A-Za-z0-9]+")
@@ -114,10 +119,28 @@ def probe_steps(text: str = PROBE_TEXT) -> list[dict]:
         raise ValueError("probe marker needs a lowercase letter to prove the base key travels")
     return [
         {"label": PROBE_LABEL, "text": marker, "keys": None, "enter": False,
-         "wait": 2500, "delay": 90, "shot": "probe-echo", "shot_before": "probe-before"},
+         "wait": 2500, "delay": 90, "hold": 0, "shot": "probe-echo",
+         "shot_before": "probe-before"},
         {"label": PROBE_CLEAR_LABEL, "text": None, "keys": "Control+U", "enter": False,
-         "wait": 800, "delay": 55, "shot": "", "shot_before": ""},
+         "wait": 800, "delay": 55, "hold": 0, "shot": "", "shot_before": ""},
     ]
+
+
+def probe_case_steps() -> list[dict]:
+    return [
+        {"label": PROBE_CASE_LABEL, "text": "a", "keys": None, "enter": False,
+         "wait": 900, "delay": 90, "hold": 0, "shot": "probe-case", "shot_before": ""},
+        {"label": PROBE_CLEAR_LABEL, "text": None, "keys": "Control+U", "enter": False,
+         "wait": 800, "delay": 55, "hold": 0, "shot": "", "shot_before": ""},
+    ]
+
+
+def apply_probe_case(steps: list[dict], enabled: bool) -> list[dict]:
+    if not enabled:
+        return steps
+    if any(step.get("label") == PROBE_CASE_LABEL for step in steps):
+        return steps
+    return probe_case_steps() + steps
 
 
 def apply_probe(steps: list[dict], enabled: bool) -> list[dict]:
@@ -129,9 +152,39 @@ def apply_probe(steps: list[dict], enabled: bool) -> list[dict]:
 
 
 def probe_verdict(probe: dict | None) -> str:
+    return probe_report(probe, None)["verdict"]
+
+
+def probe_report(probe: dict | None, case: dict | None) -> dict:
     if not probe:
-        return "not_run"
-    return "echoed" if probe.get("changed") else "silent"
+        return {"verdict": "not_run", "expected_chars": None, "visible_groups": None,
+                "accuracy": None, "case_sensitive": None, "notes": []}
+    echo = probe.get("echo") if isinstance(probe, dict) else None
+    expected = probe.get("expected_chars")
+    groups = (echo or {}).get("groups")
+    notes: list[str] = []
+    case_sensitive = None
+    if isinstance(case, dict):
+        lower = (case.get("lower") or {}).get("signature")
+        upper = (case.get("upper") or {}).get("signature")
+        if isinstance(lower, int) and isinstance(upper, int):
+            case_sensitive = lower != upper
+            if not case_sensitive:
+                notes.append("case_not_distinguished")
+    if not isinstance(expected, int) or not isinstance(groups, int):
+        verdict = "echoed" if probe.get("changed") else "silent"
+        return {"verdict": verdict, "expected_chars": expected, "visible_groups": None,
+                "accuracy": None, "case_sensitive": case_sensitive, "notes": notes}
+    accuracy = round(groups / expected, 3) if expected > 0 else None
+    if groups <= 0:
+        verdict = "silent"
+    elif groups >= expected:
+        verdict = "echoed"
+    else:
+        verdict = "partial"
+        notes.append("fewer_glyphs_than_sent")
+    return {"verdict": verdict, "expected_chars": expected, "visible_groups": groups,
+            "accuracy": accuracy, "case_sensitive": case_sensitive, "notes": notes}
 
 
 LIVENESS_MIN_SAMPLES = 3
@@ -144,7 +197,8 @@ def _fingerprint(block) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def liveness_series(payload: dict, exclude: tuple[str, ...] = (PROBE_LABEL, PROBE_CLEAR_LABEL)) -> list[int]:
+def liveness_series(payload: dict, exclude: tuple[str, ...] = (PROBE_LABEL, PROBE_CASE_LABEL,
+                                                              PROBE_CLEAR_LABEL)) -> list[int]:
     payload = payload or {}
     series: list[int] = []
     first = _fingerprint(payload.get("canvas_initial"))
@@ -264,6 +318,9 @@ def main() -> int:
     parser.add_argument("--probe-echo", action="store_true",
                         help="type a mixed-case marker and erase it before the script, "
                              "so a missing Shift shows up as a read-back mismatch")
+    parser.add_argument("--probe-case", action="store_true",
+                        help="also compare a lowercase and an uppercase probe glyph; "
+                             "equal glyphs mean the host never saw the case we sent")
     parser.add_argument("--keep", action="store_true", help="keep the fixture directory")
     parser.add_argument("--playwright", default=os.environ.get("KVM_PLAYWRIGHT"))
     parser.add_argument("--chromium", default=os.environ.get("KVM_CHROMIUM"))
@@ -282,6 +339,7 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
     steps = apply_probe(steps, args.probe_echo)
+    steps = apply_probe_case(steps, args.probe_case)
     if any(step["text"] == SECRET_PLACEHOLDER for step in steps) and not os.environ.get("KVM_SECRET"):
         parser.error("a step uses '@secret' but KVM_SECRET is not set")
     if args.shot_dir:
@@ -305,7 +363,8 @@ def main() -> int:
     evidence = {"target_host": args.host, "asset": args.asset,
                 "adapter": "supermicro-x10-passthrough",
                 "approved_protocol_versions": list(versions) if versions else ["RFB 055.008"],
-                "probe_echo": bool(args.probe_echo), "steps": [], "errors": []}
+                "probe_echo": bool(args.probe_echo), "probe_case": bool(args.probe_case),
+                "steps": [], "errors": []}
     exit_code = 1
     try:
         for process in processes:
@@ -326,7 +385,9 @@ def main() -> int:
         evidence.update(payload)
         if steps:
             evidence["typed_steps"] = describe_steps(steps)
-        evidence["probe_result"] = probe_verdict(payload.get("probe"))
+        report = probe_report(payload.get("probe"), payload.get("probe_case"))
+        evidence["probe_result"] = report["verdict"]
+        evidence["probe_readback"] = report
         series = liveness_series(payload)
         evidence["liveness_samples"] = series
         evidence["liveness"] = liveness_verdict(series)

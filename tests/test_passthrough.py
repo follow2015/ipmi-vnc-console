@@ -356,6 +356,21 @@ def test_framer_rejects_an_implausible_encoding_count(count):
         ClientMessageFramer().feed(struct.pack(">BBH", 2, 0, count))
 
 
+def test_framer_reports_only_the_shape_of_a_denied_message():
+    framer = ClientMessageFramer()
+    with pytest.raises(ClientMessageError) as error:
+        framer.feed(b"\x06" + b"\x00" * 7 + b"secret-pw")
+    assert error.value.code == "client_message_denied"
+    assert error.value.kind == 6
+    assert error.value.length == 17
+
+
+def test_framer_counts_the_key_events_it_forwards():
+    framer = ClientMessageFramer()
+    assert framer.feed(KEY + KEY + POINTER) == KEY + KEY + POINTER
+    assert framer.key_events == 2
+
+
 def test_framer_yields_nothing_from_a_chunk_that_contains_a_denied_message():
     framer = ClientMessageFramer()
     with pytest.raises(ClientMessageError):
@@ -443,6 +458,8 @@ def test_session_ends_and_forwards_nothing_on_a_denied_client_message():
         await session.send_bytes(client_bytes())
         await session.send_bytes(KEY + b"\x06\x00\x00\x00\x00\x00\x00\x01x")
         assert session.error == "client_message_denied"
+        assert session.denied == {"kind": 6, "length": 9}
+        assert session.client_key_events == 1
         assert session.closed
         assert upstream.sent == []
         await session.send_bytes(POINTER)

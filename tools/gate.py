@@ -69,12 +69,43 @@ def check_lockfile(root: Path) -> list[str]:
     return problems
 
 
+LOCAL_PACKAGES = ("kvmhub", "tools", "demos")
+
+
+def check_test_imports(root: Path) -> list[str]:
+    import ast
+
+    root = Path(root)
+    problems: list[str] = []
+    for path in sorted((root / "tests").rglob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as exc:
+            problems.append(f"{path.relative_to(root)}: unreadable ({exc})")
+            continue
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module)
+            elif isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+        for module in sorted(modules):
+            if module.split(".")[0] not in LOCAL_PACKAGES:
+                continue
+            target = root.joinpath(*module.split("."))
+            if target.with_suffix(".py").is_file() or target.is_dir():
+                continue
+            problems.append(f"{path.relative_to(root)}: imports missing module {module}")
+    return problems
+
+
 def main() -> int:
     problems = {
         "missing .gitignore rules": check_gitignore(ROOT),
         "tracked secret-like files": tracked_secrets(ROOT),
         "unstable error codes": check_error_codes(),
         "lockfile pin drift": check_lockfile(ROOT),
+        "tests importing absent modules": check_test_imports(ROOT),
     }
     failed = False
     for label, items in problems.items():
@@ -82,7 +113,8 @@ def main() -> int:
             failed = True
             print(f"GATE FAIL: {label}: {items}", file=sys.stderr)
     if not failed:
-        print("GATE OK: ignore rules, tracked secrets and error codes are clean")
+        print("GATE OK: ignore rules, tracked secrets, error codes, lockfile pins "
+              "and test imports are clean")
     return 1 if failed else 0
 
 

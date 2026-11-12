@@ -10,6 +10,17 @@ const { chromium } = require(PW);
 const TEXT = 'kvmprobe';
 const MAX_KEYS = 24;
 const PIXEL_DELTA = 24;
+const KEY_HOLD_MS = Math.max(0, Number(process.env.KVM_KEY_HOLD_MS || 0) || 0);
+
+async function pressKey(page, key) {
+  if (!KEY_HOLD_MS) {
+    await page.keyboard.press(key);
+    return;
+  }
+  await page.keyboard.down(key);
+  await page.waitForTimeout(KEY_HOLD_MS);
+  await page.keyboard.up(key);
+}
 
 const FORBIDDEN = new Set([
   'Enter', 'NumpadEnter', 'Tab', 'Escape', 'Delete',
@@ -128,7 +139,7 @@ function guardCombo(combo) {
     for (const character of TEXT) {
       if (keyEvents >= MAX_KEYS) throw new Error('key budget exhausted');
       guardKey(character);
-      await consolePage.keyboard.press(character);
+      await pressKey(consolePage, character);
       keyEvents += 1;
     }
     result.steps.push('letters_typed');
@@ -142,7 +153,7 @@ function guardCombo(combo) {
     for (let index = 0; index < TEXT.length; index += 1) {
       if (keyEvents >= MAX_KEYS) throw new Error('key budget exhausted');
       guardKey('Backspace');
-      await consolePage.keyboard.press('Backspace');
+      await pressKey(consolePage, 'Backspace');
       keyEvents += 1;
     }
     result.steps.push('letters_erased');

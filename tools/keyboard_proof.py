@@ -42,11 +42,13 @@ def prepare(directory: Path, host: str, fingerprint: str, username: str, passwor
 
 
 def run_browser(node: str, module: str, chromium: str, base: str, token: str, asset: str,
-                shots: str | None = None):
+                shots: str | None = None, hold: int = 0):
     env = dict(os.environ, KVM_PLAYWRIGHT=module, KVM_CHROMIUM=chromium,
                KVM_BASE=base, KVM_TOKEN=token, KVM_ASSET=asset)
     if shots:
         env["KVM_SHOTS"] = shots
+    if hold:
+        env["KVM_KEY_HOLD_MS"] = str(hold)
     completed = subprocess.run([node, "tools/keyboard_proof.cjs"], cwd=ROOT, env=env,
                                capture_output=True, text=True, timeout=180)
     payload = None
@@ -91,6 +93,9 @@ def main() -> int:
     parser.add_argument("--asset", default="real-1")
     parser.add_argument("--out")
     parser.add_argument("--shots", help="local PNG directory; never committed")
+    parser.add_argument("--hold", type=int, default=0, metavar="MS",
+                        help="hold each key this many ms (0 = tap); separates "
+                             "'host missed the poll' from 'key path is broken'")
     parser.add_argument("--keep", action="store_true", help="keep the fixture directory")
     parser.add_argument("--playwright", default=os.environ.get("KVM_PLAYWRIGHT"))
     parser.add_argument("--chromium", default=os.environ.get("KVM_CHROMIUM"))
@@ -121,7 +126,7 @@ def main() -> int:
                  ctx.Process(target=worker_process, args=(str(root / "worker.json"),), name="worker")]
     evidence = {"target_host": args.host, "asset": args.asset,
                 "adapter": "supermicro-x10-passthrough", "claim": "keyboard reaches the host",
-                "steps": [], "errors": []}
+                "key_hold_ms": args.hold, "steps": [], "errors": []}
     exit_code = 1
     try:
         for process in processes:
@@ -132,7 +137,7 @@ def main() -> int:
             evidence["errors"].append("services_not_ready")
             return 1
         payload, returncode, stderr = run_browser(args.node, module, chromium, UI_ORIGIN, token,
-                                                  args.asset, args.shots)
+                                                  args.asset, args.shots, args.hold)
         evidence["browser_exit"] = returncode
         if stderr:
             evidence["browser_stderr_tail"] = stderr

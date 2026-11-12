@@ -14,6 +14,7 @@ from tools.passthrough_check import (
     not_changed_steps,
     parse_type_script,
     probe_steps,
+    probe_report,
     probe_verdict,
     script_env,
 )
@@ -176,6 +177,36 @@ def test_probe_verdict_separates_not_run_from_a_silent_console():
     assert probe_verdict({"before": 7, "after": 7, "changed": False}) == "silent"
 
 
+def test_probe_report_counts_what_actually_came_back():
+    probe = {"changed": True, "expected_chars": 4,
+             "echo": {"groups": 3, "changed_columns": 40, "signature": 9}}
+    report = probe_report(probe, None)
+    assert report["verdict"] == "partial"
+    assert report["expected_chars"] == 4
+    assert report["visible_groups"] == 3
+    assert report["accuracy"] == 0.75
+
+
+def test_probe_report_calls_a_complete_echo_echoed():
+    probe = {"changed": True, "expected_chars": 4, "echo": {"groups": 4}}
+    report = probe_report(probe, None)
+    assert report["verdict"] == "echoed" and report["accuracy"] == 1.0
+
+
+def test_probe_report_says_case_was_not_distinguished():
+    probe = {"changed": True, "expected_chars": 1, "echo": {"groups": 1}}
+    case = {"lower": {"signature": 5}, "upper": {"signature": 5}}
+    report = probe_report(probe, case)
+    assert report["case_sensitive"] is False
+    assert "case_not_distinguished" in report["notes"]
+
+
+def test_probe_report_admits_it_did_not_measure_the_echo():
+    report = probe_report({"changed": True}, None)
+    assert report["verdict"] == "echoed"
+    assert report["accuracy"] is None and report["visible_groups"] is None
+
+
 def test_liveness_calls_a_changing_screen_moving():
     assert liveness_verdict([11, 12, 13]) == "moving"
 
@@ -283,9 +314,24 @@ def test_change_assertions_skip_observations_without_a_baseline():
 def test_reload_step_needs_no_text_and_carries_no_enter():
     steps = parse_type_script(json.dumps([{"label": "reload", "reload": True, "wait": 5000}]))
     assert steps == [{"label": "reload", "text": "", "keys": "", "reload": True,
-                      "enter": False, "wait": 5000, "delay": 55, "shot": "",
+                      "enter": False, "wait": 5000, "delay": 55, "hold": 0, "shot": "",
                       "shot_before": "", "expect_change": False}]
     assert describe_steps(steps) == [{"label": "reload", "reload": True}]
+
+
+def test_script_carries_a_hold_duration_per_step():
+    steps = parse_type_script(json.dumps([{"label": "hold", "text": "a", "hold": 120}]))
+    assert steps[0]["hold"] == 120
+
+
+def test_hold_defaults_to_zero_so_existing_scripts_are_unchanged():
+    steps = parse_type_script(json.dumps([{"label": "plain", "text": "a"}]))
+    assert steps[0]["hold"] == 0
+
+
+def test_a_negative_hold_is_refused():
+    with pytest.raises(ValueError, match="hold"):
+        parse_type_script(json.dumps([{"label": "bad", "text": "a", "hold": -1}]))
 
 
 def test_reload_cannot_be_combined_with_typing():

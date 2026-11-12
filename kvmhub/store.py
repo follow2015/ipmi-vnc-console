@@ -66,7 +66,8 @@ CAPABILITY_COLUMNS = {
 
 END_REASONS = ("client_closed", "revoked", "capability_withdrawn", "upstream_error",
                "upstream_unresponsive", "lease_expired", "login_failed", "worker_shutdown",
-               "exchange_failed")
+               "exchange_failed",
+               "client_message_denied", "client_message_malformed")
 
 
 class _CapabilityLost(Exception):

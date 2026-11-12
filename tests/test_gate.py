@@ -18,6 +18,23 @@ def test_repository_gate_is_clean():
     assert gate.tracked_secrets(ROOT) == []
     assert gate.check_error_codes() == []
     assert gate.check_lockfile(ROOT) == []
+    assert gate.check_test_imports(ROOT) == []
+
+
+def test_gate_catches_a_test_importing_an_absent_local_module(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "present.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests" / "test_ok.py").write_text(
+        "from tools.present import VALUE\nimport kvmhub.common\n")
+    (tmp_path / "kvmhub").mkdir()
+    (tmp_path / "kvmhub" / "common.py").write_text("PORT = 1\n")
+    assert gate.check_test_imports(tmp_path) == []
+
+    (tmp_path / "tests" / "test_broken.py").write_text(
+        "from tools.absent_check import Relay\n")
+    problems = gate.check_test_imports(tmp_path)
+    assert any("tools.absent_check" in problem for problem in problems)
 
 
 def test_gate_detects_unpinned_or_drifted_lockfile(tmp_path):

@@ -32,17 +32,27 @@ const SHIFTED = {
   ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`',
 };
 
-async function typeText(page, text, delay) {
+async function pressKey(page, key, hold) {
+  if (!hold) {
+    await page.keyboard.press(key);
+    return;
+  }
+  await page.keyboard.down(key);
+  await page.waitForTimeout(hold);
+  await page.keyboard.up(key);
+}
+
+async function typeText(page, text, delay, hold) {
   for (const char of text) {
     const base = char.toUpperCase() === char && char.toLowerCase() !== char
       ? char.toLowerCase()
       : SHIFTED[char];
     if (base) {
       await page.keyboard.down('Shift');
-      await page.keyboard.press(base);
+      await pressKey(page, base, hold);
       await page.keyboard.up('Shift');
     } else {
-      await page.keyboard.press(char === ' ' ? 'Space' : char);
+      await pressKey(page, char === ' ' ? 'Space' : char, hold);
     }
     await page.waitForTimeout(delay || 40);
   }
@@ -108,6 +118,61 @@ const { chromium } = require(PW);
         fingerprint: hash,
       };
     });
+
+    const echoReadout = (mode) => consolePage.evaluate((action) => {
+      const canvas = document.getElementById('screen');
+      const context2d = canvas.getContext('2d');
+      const grab = () => context2d.getImageData(0, 0, canvas.width, canvas.height).data;
+      const now = grab();
+      if (action === 'base') {
+        window.__echoBase = now;
+        return { width: canvas.width, height: canvas.height };
+      }
+      const base = window.__echoBase;
+      if (!base || base.length !== now.length) return { error: 'no_baseline' };
+      const width = canvas.width;
+      const height = canvas.height;
+      const columns = new Uint8Array(width);
+      let firstRow = height;
+      let lastRow = -1;
+      for (let y = 0; y < height; y += 1) {
+        const offset = y * width * 4;
+        for (let x = 0; x < width; x += 1) {
+          const i = offset + x * 4;
+          const delta = Math.abs(now[i] - base[i]) + Math.abs(now[i + 1] - base[i + 1])
+            + Math.abs(now[i + 2] - base[i + 2]);
+          if (delta > 30) {
+            columns[x] = 1;
+            if (y < firstRow) firstRow = y;
+            if (y > lastRow) lastRow = y;
+          }
+        }
+      }
+      let groups = 0;
+      let changed = 0;
+      let inside = false;
+      for (let x = 0; x < width; x += 1) {
+        if (columns[x]) {
+          changed += 1;
+          if (!inside) { groups += 1; inside = true; }
+        } else {
+          inside = false;
+        }
+      }
+      let signature = 2166136261;
+      if (lastRow >= 0) {
+        for (let y = firstRow; y <= lastRow; y += 1) {
+          const offset = y * width * 4;
+          for (let x = 0; x < width; x += 1) {
+            const i = offset + x * 4;
+            signature ^= now[i] + (now[i + 1] << 8) + (now[i + 2] << 16);
+            signature = Math.imul(signature, 16777619) >>> 0;
+          }
+        }
+      }
+      return { changed_columns: changed, groups, first_row: firstRow, last_row: lastRow,
+               signature };
+    }, mode);
 
     await consolePage.waitForTimeout(1500);
     result.canvas_initial = await canvasStats();
@@ -182,11 +247,28 @@ const { chromium } = require(PW);
         }
         await consolePage.waitForTimeout(200);
         const before = await canvasStats();
-        if (step.keys) {
-          await consolePage.keyboard.press(step.keys);
+        if (step.label === 'probe_case') {
+          const delay = step.delay || 55;
+          const holdMs = step.hold || 0;
+          await echoReadout('base');
+          await typeText(consolePage, 'a', delay, holdMs);
+          await consolePage.waitForTimeout(step.wait || 900);
+          const lower = await echoReadout('diff');
+          await pressKey(consolePage, 'Backspace', 0);
+          await consolePage.waitForTimeout(500);
+          await echoReadout('base');
+          await typeText(consolePage, 'A', delay, holdMs);
+          await consolePage.waitForTimeout(step.wait || 900);
+          const upper = await echoReadout('diff');
+          await pressKey(consolePage, 'Backspace', 0);
+          result.probe_case = { lower, upper,
+                                same: lower.signature === upper.signature };
+        } else if (step.keys) {
+          await pressKey(consolePage, step.keys, step.hold || 0);
         } else {
-          await typeText(consolePage, text, step.delay || 55);
-          if (step.enter !== false) await consolePage.keyboard.press('Enter');
+          if (step.label === 'probe_echo') await echoReadout('base');
+          await typeText(consolePage, text, step.delay || 55, step.hold || 0);
+          if (step.enter !== false) await pressKey(consolePage, 'Enter', step.hold || 0);
         }
         await consolePage.waitForTimeout(step.wait || 1200);
         if (SHOT_DIR && step.shot) {
@@ -196,7 +278,8 @@ const { chromium } = require(PW);
         const canvas = await canvasStats();
         if (step.label === 'probe_echo') {
           result.probe = { before: before.fingerprint, after: canvas.fingerprint,
-                           changed: before.fingerprint !== canvas.fingerprint };
+                           changed: before.fingerprint !== canvas.fingerprint,
+                           expected_chars: text.length, echo: await echoReadout('diff') };
         }
         result.step_samples.push({
           label: step.label, secret, chars: secret ? null : text.length, state, canvas,

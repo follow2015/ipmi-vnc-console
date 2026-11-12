@@ -18,7 +18,7 @@ ASSET_PATH = re.compile(
     r"^/(?:novnc/include/[A-Za-z0-9_.-]{1,64}\.js"
     r"|js/[A-Za-z0-9_.-]{1,64}\.js"
     r"|css/[A-Za-z0-9_.-]{1,64}\.css"
-    r"|images/[A-Za-z0-9_./-]{1,120}\.(?:png|gif|jpg|svg)"
+    r"|images/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-][A-Za-z0-9_.-]{0,79}\.(?:png|gif|jpg|svg)"
     r"|favicon\.ico)$")
 
 CONTENT_TYPES = {

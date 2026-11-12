@@ -67,6 +67,20 @@ def test_asset_allowlist_denies_everything_else(path):
     assert not ASSET_PATH.fullmatch(path)
 
 
+@pytest.mark.parametrize("path", [
+    "/images/../../cgi/login.cgi.png",
+    "/images/../../../etc/passwd.png",
+    "/images/./logo.png",
+    "/images//logo.png",
+])
+def test_asset_allowlist_refuses_parent_directory_segments(path):
+    assert not ASSET_PATH.fullmatch(path)
+
+
+def test_asset_allowlist_still_accepts_a_nested_image():
+    assert ASSET_PATH.fullmatch("/images/icons/logo.png")
+
+
 def test_content_type_is_decided_by_extension_not_by_upstream():
     assert content_type_for("/novnc/include/rfb.js") == "application/javascript"
     assert content_type_for("/css/bootstrap.css") == "text/css"

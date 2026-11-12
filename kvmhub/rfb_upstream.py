@@ -231,6 +231,7 @@ class RfbUpstream:
         self.protocol_version: str | None = None
         self.server_init_raw: bytes = b""
         self.pending: bytes = b""
+        self.upstream_close_code: int | None = None
         self.init_event: dict[str, Any] | None = None
         self._rx = bytearray()
         self._capturing = True
@@ -465,6 +466,10 @@ class RfbUpstream:
             elif message.type is aiohttp.WSMsgType.ERROR:
                 raise Problem("upstream_unresponsive", 502)
             else:
+                if message.type is aiohttp.WSMsgType.CLOSE:
+                    self.upstream_close_code = message.data
+                elif message.type is aiohttp.WSMsgType.CLOSED:
+                    self.upstream_close_code = getattr(self._ws, "close_code", None)
                 return
 
     async def send_raw(self, data: bytes) -> None:
