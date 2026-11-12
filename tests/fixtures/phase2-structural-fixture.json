@@ -1,0 +1,36 @@
+{
+  "public_synthetic_fixture": true,
+  "scope": "Synthetic structural fixture for the public mirror. Contains protocol constants only; no real device address, model, firmware, credential, timestamp or evidence file is reproduced here.",
+  "websocket": {
+    "path": "/",
+    "subprotocol_selected": "",
+    "handshake_status": 101
+  },
+  "rfb": {
+    "protocol_version": "RFB 055.008",
+    "security_types": [16],
+    "challenge_bytes": 24,
+    "client_auth_response_bytes": 48,
+    "security_result": 0
+  },
+  "framebuffer": {
+    "rect_header_bytes": 20,
+    "observed_rect": {
+      "width": 1024,
+      "height": 768,
+      "encoding": 87
+    }
+  },
+  "credentials": {
+    "value_recorded": false
+  },
+  "safety": {
+    "raw_video_bytes_written": false,
+    "raw_websocket_payloads_written": false,
+    "ticket_value_recorded": false,
+    "cookie_values_recorded": false
+  },
+  "adapter_decision": {
+    "gate_status": "unverified"
+  }
+}

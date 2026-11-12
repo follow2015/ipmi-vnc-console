@@ -13,7 +13,7 @@ from kvmhub.adapters import SupermicroX10IKVMAdapter
 from kvmhub.adapters import supermicro_x10 as adapter_module
 
 EVIDENCE_FILE = (Path(__file__).resolve().parents[1]
-                 / "docs/implementation/evidence/real-bmc-kvm-phase2-20261111.json")
+                 / "tests/fixtures/phase2-structural-fixture.json")
 
 
 def rect_bytes(x=0, y=0, width=1024, height=768, encoding=proto.ENCODING_AST2100,
