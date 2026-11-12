@@ -1,0 +1,41 @@
+name: ci
+
+# 公开部署仓的验收口径：与开发仓一致，不因「只是发布镜像」而放宽。
+# 工作流文件由 scripts/sync_to_deploy.py 从 publish/ci.yml 生成，不在本仓手工维护。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  gate:
+    name: 门禁 / 扫密 / 全套测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装锁版依赖
+        run: python -m pip install -r requirements.lock
+
+      - name: 组件清单
+        run: |
+          python -V
+          python -m pip list --format=freeze | sort
+
+      # 公开仓的最后一道闸：对**已跟踪的全部文件**再扫一遍，
+      # 防止同步脚本之外的内容（人工改动、误提交）夹带内部信息。
+      - name: 机密扫描
+        run: python scripts/scan-secrets.py $(git ls-files)
+
+      - name: 安全与错误码门禁
+        run: python tools/gate.py
+
+      - name: 全套测试
+        run: python -m pytest -q --basetemp=/tmp/kvmhub-ci-basetemp

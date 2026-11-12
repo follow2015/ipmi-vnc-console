@@ -1,0 +1,24 @@
+# Python virtualenv / caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local synthetic run directories (private keys, tokens, database)
+.local/
+.local*/
+
+# macOS
+.DS_Store
+
+# Local secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# 公开部署仓（sync_to_deploy.py 的目标，独立 git 仓，不进主仓）
+ipmi-vnc-console-deploy/
