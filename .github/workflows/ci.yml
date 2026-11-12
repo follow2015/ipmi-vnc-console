@@ -16,6 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 提交历史扫密要看到全部 commit，浅克隆会把旧提交藏起来。
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -33,6 +36,13 @@ jobs:
       # 防止同步脚本之外的内容（人工改动、误提交）夹带内部信息。
       - name: 机密扫描
         run: python scripts/scan-secrets.py $(git ls-files)
+
+      # commit message 与 author/committer 会永久留在公开历史：导出整条历史
+      # 过同一台扫密器，拦住「文件干净但提交元数据泄露」的情形。
+      - name: 提交历史与作者信息扫密
+        run: |
+          git log --format='A:%an <%ae>%nC:%cn <%ce>%n%s%n%b' HEAD > /tmp/public-history.txt
+          python scripts/scan-secrets.py /tmp/public-history.txt
 
       - name: 安全与错误码门禁
         run: python tools/gate.py
