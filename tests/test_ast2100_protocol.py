@@ -352,7 +352,12 @@ def test_adapter_no_longer_claims_the_handshake_was_never_done():
     assert "no WebSocket handshake" not in unconfirmed
     assert "AST2100 bitstream decoding is not implemented" in unconfirmed
     assert "not independently verified" in unconfirmed
-    assert "only mock-v1" in unconfirmed
+    assert "only mock-v1" not in unconfirmed
+    assert "no adapter_capability row is approved" not in unconfirmed
+    assert "no protocol-gateway data plane" not in unconfirmed
+    assert "passthrough_targets" in unconfirmed
+    assert "checked by length only" in unconfirmed
+    assert "AdapterUnavailable" in unconfirmed
 
 
 

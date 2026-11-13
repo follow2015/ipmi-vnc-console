@@ -49,6 +49,7 @@ SAFE_IPS = {
     "0.0.0.0", "127.0.0.1", "255.255.255.255", "1.1.1.1", "8.8.8.8", "8.8.4.4",
     "1.2.3.4", "239.0.0.1", "255.255.255.0", "255.255.0.0", "255.0.0.0",
     "8.78.1.2",
+    "10.0.0.1",
 }
 SAFE_NETWORKS = ("192.0.2.", "198.51.100.", "203.0.113.")
 
@@ -70,11 +71,7 @@ def is_safe_ip(ip: str) -> bool:
         return False
     if ip in SAFE_IPS or any(ip.startswith(prefix) for prefix in SAFE_NETWORKS):
         return True
-    if o[0] in (10, 127, 255) or (o[0] == 172 and 16 <= o[1] <= 31):
-        return True
-    if (o[0] == 192 and o[1] == 168) or (o[0] == 169 and o[1] == 254):
-        return True
-    if o[0] == 100 and 64 <= o[1] <= 127:
+    if o[0] in (127, 255):
         return True
     if o[0] == 239:
         return True

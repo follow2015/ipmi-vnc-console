@@ -60,8 +60,12 @@ UNCONFIRMED = (
     "upstream ticket expiry, revocation and concurrency limits are unknown",
     "KVM licensing and least-privilege account scope are unknown",
     "certificate fingerprint was collected over the network, not independently verified",
-    "no adapter_capability row is approved; exchange still accepts only mock-v1",
-    "no protocol-gateway data plane is wired into Worker; authenticate/open_console/keepalive/logout remain unavailable",
+    "adapter_capability approval is per capability row: exchange accepts mock-v1 by default and the "
+    "passthrough adapter only for targets listed in passthrough_targets (empty by default)",
+    "the Worker relays browser and BMC frames in a passthrough session but does not decode the "
+    "AST2100 bitstream itself; input field layout is checked by length only",
+    "the adapter contract's data plane (authenticate/open_console/keepalive/logout) still raises "
+    "AdapterUnavailable; a real console is reached only through the passthrough relay",
 )
 
 
