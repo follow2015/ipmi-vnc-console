@@ -19,6 +19,22 @@ def test_repository_gate_is_clean():
     assert gate.check_error_codes() == []
     assert gate.check_lockfile(ROOT) == []
     assert gate.check_test_imports(ROOT) == []
+    assert gate.check_collection(ROOT) == []
+
+
+def test_gate_catches_tests_pytest_cannot_collect(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_broken.py").write_text(
+        "import tools.never_shipped\n\n\ndef test_it():\n    pass\n")
+    problems = gate.check_collection(tmp_path)
+    assert problems, "a test file pytest cannot import must fail the gate"
+    assert "collect" in problems[0]
+
+
+def test_gate_collection_rule_passes_on_a_clean_tree(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_fine.py").write_text("def test_it():\n    assert True\n")
+    assert gate.check_collection(tmp_path) == []
 
 
 def test_gate_catches_a_test_importing_an_absent_local_module(tmp_path):

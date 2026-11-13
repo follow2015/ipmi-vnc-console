@@ -450,6 +450,29 @@ def test_session_relays_the_allowed_message_set_in_arrival_order():
     run(scenario())
 
 
+def test_forwarded_types_are_counted_and_payloads_are_not_kept():
+    framer = ClientMessageFramer()
+    stream = (bytes([0]) + b"\x00" * 19
+              + bytes([2, 0, 0, 2]) + struct.pack(">II", 1, 2)
+              + fb_request()
+              + KEY + KEY)
+    out = framer.feed(stream)
+    assert out == stream
+    assert framer.client_types == {0: 1, 2: 1, 3: 1, 4: 2}
+    assert framer.type_summary() == "0:1,2:1,3:1,4:2"
+    assert framer.key_events == 2
+
+
+def test_the_type_summary_survives_a_session_surface_check():
+    session = RfbPassthroughSession(FakeUpstream(), BrowserHandshake(server_init_bytes()))
+    session._framer.feed(fb_request())
+    assert session.client_message_types == {3: 1}
+    assert session.client_message_summary == "3:1"
+    assert session.as_dict()["client_message_types"] == {"3": 1}
+    for forbidden in ("SID", "ticket", "pwd", "passw"):
+        assert forbidden not in repr(session.as_dict())
+
+
 def test_session_ends_and_forwards_nothing_on_a_denied_client_message():
     async def scenario():
         upstream = FakeUpstream()

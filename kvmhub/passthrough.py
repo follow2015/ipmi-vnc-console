@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+import time
 from typing import Any
 
+import aiohttp
 from aiohttp import WSMsgType, WSMessage
 
 from .ast2100_protocol import (
@@ -18,6 +20,8 @@ from .ast2100_protocol import (
     RFB_VERSION_BYTES,
     SECURITY_TYPE_INSYDE,
 )
+from .common import Problem
+from .recovery import RecoveryPolicy, RecoveryState, retryable
 
 SECURITY_TYPES_FRAME = bytes([1, SECURITY_TYPE_INSYDE])
 SECURITY_RESULT_OK = b"\x00\x00\x00\x00"
@@ -70,6 +74,7 @@ class ClientMessageFramer:
         self._sizes = dict(_FIXED_CLIENT_MESSAGE_BYTES if sizes is None else sizes)
         self._buf = bytearray()
         self.key_events = 0
+        self.client_types: dict[int, int] = {}
 
     def _next_size(self) -> int | None:
         kind = self._buf[0]
@@ -96,10 +101,15 @@ class ClientMessageFramer:
             if size is None or len(self._buf) < size:
                 break
             ready += self._buf[:size]
-            if self._buf[0] == CLIENT_MSG_KEY_EVENT:
+            kind = self._buf[0]
+            if kind == CLIENT_MSG_KEY_EVENT:
                 self.key_events += 1
+            self.client_types[kind] = self.client_types.get(kind, 0) + 1
             del self._buf[:size]
         return bytes(ready)
+
+    def type_summary(self) -> str:
+        return ",".join(f"{kind}:{count}" for kind, count in sorted(self.client_types.items()))
 
 
 class BrowserHandshake:
@@ -186,9 +196,11 @@ class RfbPassthroughSession:
     def __init__(self, upstream, handshake: BrowserHandshake, *, queue_size: int = 64,
                  queue_bytes: int = MAX_BUFFERED_BYTES,
                  allowed_client_messages=ALLOWED_CLIENT_MESSAGES,
-                 message_sizes: dict[int, int] | None = None) -> None:
+                 message_sizes: dict[int, int] | None = None,
+                 recovery: RecoveryPolicy | None = None) -> None:
         self.upstream = upstream
         self.handshake = handshake
+        self.recovery: RecoveryState | None = RecoveryState(recovery) if recovery else None
         self._framer = ClientMessageFramer(allowed_client_messages, sizes=message_sizes)
         self._out: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=queue_size)
         self._relay_task: asyncio.Task | None = None
@@ -207,6 +219,14 @@ class RfbPassthroughSession:
     @property
     def client_key_events(self) -> int:
         return self._framer.key_events
+
+    @property
+    def client_message_types(self) -> dict[int, int]:
+        return dict(self._framer.client_types)
+
+    @property
+    def client_message_summary(self) -> str:
+        return self._framer.type_summary()
 
     async def start(self) -> None:
         if self.started:
@@ -243,7 +263,12 @@ class RfbPassthroughSession:
             await self.close(code=1008)
             return False
         if ready:
-            await self.upstream.send_raw(ready)
+            try:
+                await self.upstream.send_raw(ready)
+            except Problem:
+                if self.recovery is None or self.recovery.state != "recovering":
+                    raise
+                self.recovery.dropped_input += 1
         return True
 
     async def send_str(self, data: str) -> None:
@@ -256,7 +281,17 @@ class RfbPassthroughSession:
 
     async def _relay(self) -> None:
         try:
-            await self.upstream.relay(self._emit)
+            while not self._closed:
+                error = await self._relay_once()
+                if self._closed:
+                    break
+                if self.recovery is None or not self.recovery.may_try(
+                        error, getattr(self.upstream, "upstream_close_code", None)):
+                    self.error = error or self.error
+                    break
+                if not await self._recover(error):
+                    self.error = self.recovery.last_error or error or self.error
+                    break
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - classified into a stable code
@@ -264,6 +299,63 @@ class RfbPassthroughSession:
         finally:
             with contextlib.suppress(asyncio.QueueFull):
                 self._out.put_nowait(None)
+
+    async def _relay_once(self) -> str | None:
+        try:
+            await self.upstream.relay(self._emit)
+        except asyncio.CancelledError:
+            raise
+        except Problem as exc:
+            return exc.code
+        except Exception as exc:  # noqa: BLE001
+            return getattr(exc, "code", None) or type(exc).__name__
+        return "upstream_closed"
+
+    async def _recover(self, error: str) -> bool:
+        state = self.recovery
+        assert state is not None
+        state.begin()
+        expected = self.handshake._server_init[:20]
+        started = time.monotonic()
+        await self.upstream.drop_websocket()
+        for attempt in range(1, state.policy.attempts + 1):
+            await asyncio.sleep(state.policy.delay(attempt))
+            if self._closed:
+                state.give_up(None)
+                return False
+            if time.monotonic() - started > state.policy.deadline:
+                state.give_up(state.last_error or error)
+                return False
+            state.attempt()
+            attempt_started = time.monotonic()
+            try:
+                await self.upstream.reopen()
+            except Problem as exc:
+                state.fail(exc.code)
+                if not retryable(exc.code):
+                    state.give_up(exc.code)
+                    return False
+                continue
+            except (aiohttp.ClientError, TimeoutError):
+                state.fail("upstream_unavailable")
+                continue
+            if self.upstream.server_init_raw[:20] != expected:
+                state.fail("upstream_changed")
+                await self.upstream.drop_websocket()
+                state.give_up("upstream_changed")
+                return False
+            try:
+                await self.upstream.wait_first_frame(timeout=state.policy.frame_timeout)
+            except Problem as exc:
+                state.fail(exc.code)
+                continue
+            except (aiohttp.ClientError, TimeoutError):
+                state.fail("upstream_unavailable")
+                continue
+            state.succeed(int((time.monotonic() - attempt_started) * 1000))
+            return True
+        state.give_up(state.last_error or error)
+        return False
 
     async def _emit(self, data: bytes) -> None:
         if self._closed:
@@ -307,7 +399,12 @@ class RfbPassthroughSession:
         return WSMessage(WSMsgType.BINARY, item, "")
 
     def as_dict(self) -> dict[str, Any]:
-        return {"protocol": self.protocol, "handshake_completed": self.handshake.completed,
+        data = {"protocol": self.protocol, "handshake_completed": self.handshake.completed,
                 "shared": self.handshake.shared, "client_bytes": self.client_bytes,
                 "server_bytes": self.server_bytes, "buffered_bytes": self._buffered,
-                "peak_buffered_bytes": self.peak_buffered_bytes, "error": self.error}
+                "peak_buffered_bytes": self.peak_buffered_bytes, "error": self.error,
+                "client_message_types": {str(kind): count
+                                         for kind, count in self._framer.client_types.items()}}
+        if self.recovery is not None:
+            data.update(self.recovery.counters())
+        return data

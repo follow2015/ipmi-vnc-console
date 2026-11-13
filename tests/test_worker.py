@@ -13,11 +13,14 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from kvmhub.adapter import MockAdapter
+from kvmhub.adapters.passthrough import PassthroughAdapter
+from kvmhub.adapters.passthrough import PassthroughAdapter
 from kvmhub.common import WORKER_PORT, Problem, digest, issue, server_tls
 from kvmhub.mock_bmc import create_mock
 from kvmhub import worker as worker_module
+from kvmhub.recovery import RecoveryPolicy
 from kvmhub.worker import (GATEWAY_KEY, MAX_TRACES, SESSION_KEY, Gateway, ManagerRejected,
-                           Runtime, create_worker)
+                           Runtime, create_worker, wire_recovery)
 from tools.bootstrap import generate
 
 
@@ -405,6 +408,21 @@ def test_upstream_end_reason_keeps_heartbeat_failure_distinct():
     assert set(END_REASONS) >= {"upstream_error", "upstream_unresponsive", "client_closed"}
 
 
+def test_a_spent_rebuild_has_its_own_end_reason():
+    from kvmhub.store import END_REASONS
+    from kvmhub.worker import upstream_end_reason
+    spent = SimpleNamespace(error="upstream_silent",
+                            recovery=SimpleNamespace(state="given_up", attempts=2))
+    assert upstream_end_reason(spent) == "upstream_reconnect_failed"
+    assert "upstream_reconnect_failed" in END_REASONS
+    assert upstream_end_reason(SimpleNamespace(
+        error="upstream_unresponsive",
+        recovery=SimpleNamespace(state="relaying", attempts=0))) == "upstream_unresponsive"
+    assert upstream_end_reason(SimpleNamespace(
+        error="client_message_denied",
+        recovery=SimpleNamespace(state="relaying", attempts=0))) == "client_message_denied"
+
+
 def test_cookie_max_age_never_exceeds_hard_until():
     from kvmhub.worker import cookie_max_age
     now = 1_000_000.0
@@ -675,3 +693,184 @@ async def test_a_single_console_adapter_lowers_the_limit_the_page_is_told(identi
                 assert response.status == 429
     assert adapter.calls == 0, "the second tab must be refused before the BMC is contacted"
     assert sid in gateway.sessions and not runtime.closing
+
+
+async def test_stats_endpoint_separates_a_flapping_link_from_a_second_tab(identities):
+    _, cfg = identities
+    app = create_worker(cfg)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    gateway = app[GATEWAY_KEY]
+    sid = "c" * 32
+    runtime = Runtime(sid, digest("browser-secret"), None, time.monotonic() + 30)
+    runtime.ws.update({_StubSocket(), _StubSocket()})
+    runtime.telemetry.note_connection()
+    runtime.telemetry.note_connection()
+    gateway.sessions[sid] = runtime
+    gateway.evidence.add({"sid": "9" * 32, "end_reason": "upstream_error", "cleanup": "pending"})
+    host = f"w1-{sid}.kvm.localhost:{WORKER_PORT}"
+    headers = {"Host": host, "Cookie": "__Host-kvm_sid=browser-secret"}
+    async with TestServer(app) as server:
+        async with aiohttp.ClientSession() as browser:
+            async with browser.get(server.make_url("/_platform/stats"), headers=headers) as response:
+                assert response.status == 200
+                assert response.headers["Cache-Control"] == "no-store"
+                body = await response.json()
+    session = body["session"]
+    assert (session["connections"], session["reconnects"]) == (2, 1)
+    assert (session["ws_open"], session["state"]) == (2, "live")
+    assert session["key_events"] == 0 and session["client_message_types"] == {}
+    assert 0 <= session["lease_remaining_s"] <= 30 and session["uptime_s"] >= 0
+    assert body["recent_ended"] == [{"sid": "9" * 8 + "…", "end_reason": "upstream_error",
+                                     "cleanup": "pending"}], \
+        "another session's record keeps its shape but never its addressable id"
+    assert "/_platform/stats" in worker_module.REAL_CONSOLE_JS
+
+
+async def test_stats_endpoint_is_closed_without_the_session_cookie(identities):
+    _, cfg = identities
+    app = create_worker(cfg)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    gateway = app[GATEWAY_KEY]
+    sid = "d" * 32
+    gateway.sessions[sid] = Runtime(sid, digest("browser-secret"), None, time.monotonic() + 30)
+    host = f"w1-{sid}.kvm.localhost:{WORKER_PORT}"
+    async with TestServer(app) as server:
+        async with aiohttp.ClientSession() as browser:
+            url = server.make_url("/_platform/stats")
+            async with browser.get(url, headers={"Host": host}) as response:
+                assert response.status == 401
+            async with browser.get(url, headers={"Host": host,
+                                                 "Cookie": "__Host-kvm_sid=wrong"}) as response:
+                assert response.status == 401
+
+
+async def test_every_ending_leaves_one_evidence_record(identities, caplog):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+
+    class Adapter:
+        async def close(self):
+            return False
+
+    sess = Runtime("f" * 32, "hash", Adapter(), time.monotonic() + 30)
+    gateway.sessions[sess.sid] = sess
+    sess.telemetry.note_connection()
+    sess.telemetry.note_connection()
+
+    async def unavailable(*args, **kwargs):
+        raise aiohttp.ClientConnectionError()
+
+    gateway.call = unavailable
+    with caplog.at_level("WARNING", logger="kvmhub.worker"):
+        await gateway.finish(sess, "lease_expired")
+
+    record = gateway.evidence.recent(1, mask=False)[0]
+    assert record["sid"] == sess.sid
+    assert record["end_reason"] == "lease_expired" and record["cleanup"] == "pending"
+    assert (record["connections"], record["reconnects"]) == (2, 1)
+    assert record["duration_ms"] >= 0
+    line = caplog.text
+    assert "reason=lease_expired" in line and "cleanup=pending" in line
+    assert "reconnects=1" in line
+
+
+def test_the_recovery_budget_comes_from_config_and_is_clamped(identities):
+    _, cfg = identities
+    assert Gateway(cfg).recovery == RecoveryPolicy(), "defaults when nothing is configured"
+    cfg.update({"upstream_recovery_attempts": 4, "upstream_recovery_max_total": 1,
+                "upstream_recovery_delay_seconds": 0.1})
+    configured = Gateway(cfg).recovery
+    assert (configured.attempts, configured.max_total, configured.first_delay) == (4, 1, 0.1)
+    cfg.update({"upstream_recovery_attempts": "many", "upstream_recovery_deadline_seconds": 0})
+    assert Gateway(cfg).recovery.attempts == RecoveryPolicy.attempts
+    assert Gateway(cfg).recovery.deadline == 1.0
+
+
+async def test_only_an_adapter_that_can_rebuild_gets_the_policy(identities):
+    _, cfg = identities
+    policy = Gateway(cfg).recovery
+    passthrough = object.__new__(PassthroughAdapter)
+    assert wire_recovery(passthrough, policy).recovery is policy
+    synthetic = MockAdapter({"target": "https://127.0.0.1:443", "fingerprint": "00" * 32,
+                             "adapter": "mock-v1"})
+    try:
+        assert not hasattr(wire_recovery(synthetic, policy), "recovery")
+    finally:
+        await synthetic.close()
+
+
+async def test_stats_shows_a_rebuild_in_flight(identities):
+    _, cfg = identities
+    app = create_worker(cfg)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    gateway = app[GATEWAY_KEY]
+    sid = "e" * 32
+    runtime = Runtime(sid, digest("browser-secret"), None, time.monotonic() + 30)
+    relay = SimpleNamespace(recovery=SimpleNamespace(state="recovering", recoveries=1,
+                                                     attempts=2, dropped_input=3),
+                            as_dict=lambda: {"recoveries": 1, "recovery_attempts": 2,
+                                             "dropped_input": 3})
+    runtime.telemetry.note_connection(relay)
+    gateway.sessions[sid] = runtime
+    host = f"w1-{sid}.kvm.localhost:{WORKER_PORT}"
+    headers = {"Host": host, "Cookie": "__Host-kvm_sid=browser-secret"}
+    async with TestServer(app) as server:
+        async with aiohttp.ClientSession() as browser:
+            async with browser.get(server.make_url("/_platform/stats"), headers=headers) as response:
+                assert response.status == 200
+                session = (await response.json())["session"]
+    assert session["state"] == "recovering"
+    assert session["recoveries"] == 1 and session["dropped_input"] == 3
+
+
+def test_the_recovery_budget_comes_from_config_and_is_clamped(identities):
+    _, cfg = identities
+    assert Gateway(cfg).recovery == RecoveryPolicy(), "defaults when nothing is configured"
+    cfg.update({"upstream_recovery_attempts": 4, "upstream_recovery_max_total": 1,
+                "upstream_recovery_delay_seconds": 0.1})
+    configured = Gateway(cfg).recovery
+    assert (configured.attempts, configured.max_total, configured.first_delay) == (4, 1, 0.1)
+    cfg.update({"upstream_recovery_attempts": "many", "upstream_recovery_deadline_seconds": 0})
+    assert Gateway(cfg).recovery.attempts == RecoveryPolicy.attempts
+    assert Gateway(cfg).recovery.deadline == 1.0
+
+
+async def test_only_an_adapter_that_can_rebuild_gets_the_policy(identities):
+    _, cfg = identities
+    policy = Gateway(cfg).recovery
+    passthrough = object.__new__(PassthroughAdapter)
+    assert wire_recovery(passthrough, policy).recovery is policy
+    synthetic = MockAdapter({"target": "https://127.0.0.1:443", "fingerprint": "00" * 32,
+                             "adapter": "mock-v1"})
+    try:
+        assert not hasattr(wire_recovery(synthetic, policy), "recovery")
+    finally:
+        await synthetic.close()
+
+
+async def test_stats_shows_a_rebuild_in_flight(identities):
+    _, cfg = identities
+    app = create_worker(cfg)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    gateway = app[GATEWAY_KEY]
+    sid = "e" * 32
+    runtime = Runtime(sid, digest("browser-secret"), None, time.monotonic() + 30)
+    relay = SimpleNamespace(recovery=SimpleNamespace(state="recovering", recoveries=1,
+                                                     attempts=2, dropped_input=3),
+                            as_dict=lambda: {"recoveries": 1, "recovery_attempts": 2,
+                                             "dropped_input": 3})
+    runtime.telemetry.note_connection(relay)
+    gateway.sessions[sid] = runtime
+    host = f"w1-{sid}.kvm.localhost:{WORKER_PORT}"
+    headers = {"Host": host, "Cookie": "__Host-kvm_sid=browser-secret"}
+    async with TestServer(app) as server:
+        async with aiohttp.ClientSession() as browser:
+            async with browser.get(server.make_url("/_platform/stats"), headers=headers) as response:
+                assert response.status == 200
+                session = (await response.json())["session"]
+    assert session["state"] == "recovering"
+    assert session["recoveries"] == 1 and session["dropped_input"] == 3

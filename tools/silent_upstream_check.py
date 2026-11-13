@@ -176,6 +176,9 @@ def _is_open(sock: socket.socket) -> bool:
     return sock.fileno() != -1
 
 
+UPSTREAM_END_REASONS = ("upstream_unresponsive", "upstream_reconnect_failed")
+
+
 def silent_verdict(evidence: dict) -> dict:
     reasons: list[str] = []
     if evidence.get("errors"):
@@ -190,8 +193,9 @@ def silent_verdict(evidence: dict) -> dict:
     session = evidence.get("session") or {}
     if session.get("status") not in ("closed", "failed", "lost"):
         reasons.append("status_not_terminal")
-    if session.get("reason") != "upstream_unresponsive":
-        reasons.append("reason_not_upstream_unresponsive")
+    reason = session.get("reason")
+    if reason not in UPSTREAM_END_REASONS:
+        reasons.append("reason_not_upstream_side")
     if session.get("cleanup") != "pending":
         reasons.append("cleanup_not_pending")
     if not evidence.get("slot_held_after_session_end"):
@@ -219,7 +223,8 @@ def silent_verdict(evidence: dict) -> dict:
         reasons.append("end_not_audited")
     if "manual_slot_release" not in actions:
         reasons.append("release_not_audited")
-    return {"verdict": "pass" if not reasons else "fail", "reasons": reasons}
+    return {"verdict": "pass" if not reasons else "fail", "reasons": reasons,
+            "reason": reason}
 
 
 def slot_holder(store: Store, asset: str) -> str | None:

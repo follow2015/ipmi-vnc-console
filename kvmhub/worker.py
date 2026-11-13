@@ -19,6 +19,8 @@ from .adapters.passthrough import PassthroughAdapter
 from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, SESSION_END_CODES,
                      WORKER_HOST_SUFFIX, Problem, client_tls, digest, user_message,
                      verify)
+from .recovery import RecoveryPolicy
+from .telemetry import EvidenceLog, SessionTelemetry
 
 SESSION_KEY = web.RequestKey("session_id", str)
 
@@ -56,6 +58,9 @@ CLIENT_SIDE_END_REASONS = frozenset({"client_message_denied", "client_message_ma
 
 def upstream_end_reason(upstream) -> str:
     error = getattr(upstream, "error", None)
+    recovery = getattr(upstream, "recovery", None)
+    if recovery is not None and getattr(recovery, "state", None) == "given_up":
+        return "upstream_reconnect_failed"
     if error == "upstream_unresponsive":
         return "upstream_unresponsive"
     if error in CLIENT_SIDE_END_REASONS:
@@ -68,14 +73,46 @@ CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title
 <h1>模拟 KVM 控制台</h1><p>画面和按键由本机模拟设备产生，不代表真机 KVM 兼容性。</p>
 <p id="status">正在连接…</p><canvas id="screen" width="800" height="420" tabindex="0"></canvas>
 <p>点击画面后按键可验证输入通道。<button id="close">结束会话</button></p><script src="/_platform/console.js"></script></html>"""
-CONSOLE_JS = """const status=document.querySelector('#status'), canvas=document.querySelector('canvas'), ctx=canvas.getContext('2d');let stopped=false;
-const ws=new WebSocket('wss://'+location.host+'/console',['binary']);ws.binaryType='arraybuffer';
-ws.onopen=()=>{status.textContent='已连接模拟设备';canvas.focus();};
-ws.onmessage=e=>{const s=new TextDecoder().decode(e.data);ctx.fillStyle='#08111e';ctx.fillRect(0,0,800,420);ctx.fillStyle='#70dda4';ctx.font='20px monospace';s.split('\\n').forEach((line,i)=>ctx.fillText(line,28,55+i*36));};
-ws.onerror=()=>{status.textContent='连接失败，请返回 Manager 查看会话状态。';};
-ws.onclose=()=>{status.textContent=stopped?'会话已结束':'连接已断开。请返回 Manager 查看状态并重新申请。';};
-canvas.onkeydown=e=>{e.preventDefault();if(ws.readyState===WebSocket.OPEN)ws.send(new TextEncoder().encode(e.key));};
-document.querySelector('#close').onclick=async()=>{stopped=true;await fetch('/_platform/close',{method:'POST'});ws.close();};"""
+CONSOLE_JS = """const status=document.querySelector('#status'), canvas=document.querySelector('canvas'), ctx=canvas.getContext('2d');
+let stopped=false, ws=null, timer=null, attempts=0, total=0;
+const DELAYS=[0,400,900], MAX_TOTAL=6;
+const health={state:'connecting',attempts:0,total_attempts:0,recovered:0,last_state:'',last_message:'',exhausted:false};
+window.__kvm_health=health;
+function setStatus(text){status.textContent=text;status.title=text;}
+function connect(){
+  if(stopped)return;
+  const sock=new WebSocket('wss://'+location.host+'/console',['binary']);
+  sock.binaryType='arraybuffer';ws=sock;
+  sock.onopen=()=>{if(sock!==ws)return;if(attempts>0)health.recovered+=1;attempts=0;health.attempts=0;health.state='normal';setStatus('已连接模拟设备');canvas.focus();};
+  sock.onmessage=e=>{if(sock!==ws)return;const s=new TextDecoder().decode(e.data);ctx.fillStyle='#08111e';ctx.fillRect(0,0,800,420);ctx.fillStyle='#70dda4';ctx.font='20px monospace';s.split('\\n').forEach((line,i)=>ctx.fillText(line,28,55+i*36));};
+  sock.onerror=()=>{if(sock!==ws)return;health.last_state='error';setStatus('连接失败，正在重试或返回 Manager 查看会话状态。');};
+  sock.onclose=()=>{
+    if(sock!==ws)return;
+    if(stopped){health.state='closed';setStatus('会话已结束');return;}
+    health.last_state='disconnected';
+    retry();
+  };
+}
+function retry(){
+  if(timer!==null||health.exhausted)return;
+  attempts+=1;total+=1;
+  health.attempts=attempts;health.total_attempts=total;
+  if(attempts>DELAYS.length||total>MAX_TOTAL){
+    health.exhausted=true;health.state='exhausted';
+    setStatus('连接已断开。请返回 Manager 查看状态并重新申请。');return;
+  }
+  health.state='reconnecting';
+  setStatus('连接中断，正在重连 '+attempts+'/'+DELAYS.length+'…');
+  timer=setTimeout(()=>{timer=null;connect();},DELAYS[attempts-1]);
+}
+canvas.onkeydown=e=>{e.preventDefault();if(ws&&ws.readyState===WebSocket.OPEN)ws.send(new TextEncoder().encode(e.key));};
+document.querySelector('#close').onclick=async()=>{
+  stopped=true;if(timer!==null){clearTimeout(timer);timer=null;}
+  health.state='closed';setStatus('会话已结束');
+  await fetch('/_platform/close',{method:'POST'}).catch(()=>{});
+  if(ws)ws.close();
+};
+connect();"""
 
 REAL_CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <title>真机 KVM 控制台</title>
@@ -139,13 +176,16 @@ REAL_CONSOLE_JS = """'use strict';
   // reports "failed" after about 17 seconds. Asking first avoids both: the
   // operator is told at once, and no doomed handshake is sent to the BMC.
   function askThenConnect() {
+    var refused = false;
     fetch('/_platform/limits', { cache: 'no-store' }).then(function (response) {
       if (response.status === 401) {
+        refused = true;
         explain('会话已结束或已失效（可能被撤销、租约到期或凭据过期）。请返回 Manager 查看状态后重新申请。');
         return null;
       }
       return response.ok ? response.json() : null;
     }).then(function (counts) {
+      if (refused) return;
       if (!counts) { start(); return; }
       log.push([Date.now(), 'limits ' + JSON.stringify(counts)]);
       if (!describe(counts)) start();
@@ -154,7 +194,7 @@ REAL_CONSOLE_JS = """'use strict';
   // After a connection is up this only fires when the session ends underneath
   // the page, which is where the 401 branch above earns its keep.
   function recheck() {
-    if (ended || explained) return;
+    if (stopped) return;
     fetch('/_platform/limits', { cache: 'no-store' }).then(function (response) {
       if (response.status === 401) {
         explain('会话已结束或已失效（可能被撤销、租约到期或凭据过期）。请返回 Manager 查看状态后重新申请。');
@@ -164,6 +204,70 @@ REAL_CONSOLE_JS = """'use strict';
     }).then(function (counts) { if (counts) describe(counts); }).catch(function () {});
   }
 
+  // The Worker keeps the BMC session for a short grace period after the browser
+  // socket closes (Gateway.RECONNECT_GRACE). A reload is the only safe way to
+  // rebuild this vendor client: it attaches its keyboard listeners to
+  // `document`, so a second RFB in the same page would send every key twice.
+  // Retries are bounded, consecutive and cumulative; the first one is instant
+  // so it lands inside the grace window, the rest back off but stay under it.
+  var DELAYS = [0, 400, 900];
+  var MAX_TOTAL = 6;
+  var KEY = '__kvm_recovery_v1';
+  var EXHAUSTED_TEXT = '连接已断开，自动重连已用尽。请返回 Manager 查看会话状态并重新申请。';
+  function readRecovery() {
+    try { return JSON.parse(sessionStorage.getItem(KEY) || '{}') || {}; }
+    catch (error) { return {}; }
+  }
+  function writeRecovery(data) {
+    try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (error) {}
+  }
+  var rec = readRecovery();
+  var stopped = false;
+  var reloadTimer = null;
+  var health = {
+    state: rec.closed ? 'closed' : 'connecting',
+    attempts: rec.attempts || 0,
+    total_attempts: rec.total || 0,
+    recovered: rec.recovered || 0,
+    last_state: '', last_message: '', exhausted: !!rec.exhausted
+  };
+  window.__kvm_health = health;
+  // The page's counters reset on every reload, and a reload is exactly what
+  // happens when the link flaps. This asks the gateway for its own side: how
+  // many consoles the session carried, how many were reconnects, and what the
+  // upstream close code was. Driver-only; nothing on the page calls it on a timer.
+  window.__kvm_stats = function () {
+    return fetch('/_platform/stats', { cache: 'no-store' })
+      .then(function (response) { return response.ok ? response.json() : null; })
+      .catch(function () { return null; });
+  };
+  if (rec.attempts > 0 && !rec.closed && !rec.exhausted) health.state = 'reconnecting';
+  if (rec.exhausted) health.state = 'exhausted';
+
+  function exhaust(message) {
+    rec.exhausted = true; writeRecovery(rec);
+    health.exhausted = true; health.state = 'exhausted';
+    health.last_message = message;
+    setStatus(EXHAUSTED_TEXT);
+    // When the session is gone (revoked, lease expired) "retry later" is the
+    // wrong advice; ask once and let the 401 branch say what actually happened.
+    recheck();
+  }
+  function retry(state) {
+    if (stopped || rec.closed || health.exhausted || reloadTimer !== null) return;
+    if (explained) { exhaust('客户端状态：' + state); return; }
+    var n = (rec.attempts || 0) + 1;
+    var total = (rec.total || 0) + 1;
+    rec.attempts = n; rec.total = total; writeRecovery(rec);
+    health.attempts = n; health.total_attempts = total;
+    if (state === 'fatal' || n > DELAYS.length || total > MAX_TOTAL) {
+      exhaust('客户端状态：' + state); return;
+    }
+    health.state = 'reconnecting';
+    setStatus('连接中断（' + state + '），正在重连 ' + n + '/' + DELAYS.length + '…');
+    reloadTimer = setTimeout(function () { location.reload(); }, DELAYS[n - 1]);
+  }
+
   var rfb;
   function start() {
     try {
@@ -171,10 +275,23 @@ REAL_CONSOLE_JS = """'use strict';
         target: canvas, encrypt: true, shared: true, view_only: false,
         wsProtocols: ['binary'], true_color: true, local_cursor: true,
         onUpdateState: function (client, state, old, message) {
-          if (state === 'normal') { explained = false; setStatus(state); canvas.focus(); return; }
-          if (explained) return;
+          health.last_state = state;
+          if (message) health.last_message = String(message);
+          if (state === 'normal') {
+            explained = false;
+            if (rec.attempts > 0) health.recovered += 1;
+            rec.attempts = 0; rec.exhausted = false; rec.recovered = health.recovered;
+            writeRecovery(rec);
+            health.state = 'normal'; health.attempts = 0; health.exhausted = false;
+            setStatus(state);
+            canvas.focus();
+            return;
+          }
+          if (health.exhausted) { if (!explained) setStatus(EXHAUSTED_TEXT); return; }
           setStatus(state + (message ? ' · ' + message : ''));
-          if (state === 'failed' || state === 'disconnected') recheck();
+          // The vendor client reports a failure twice: `failed` and, 50 ms
+          // later, `disconnected`. The timer guard collapses them into one retry.
+          if (state === 'failed' || state === 'fatal' || state === 'disconnected') retry(state);
         },
         // The measured client dereferences the return value of this callback
         // whenever the Insyde extension is active; the default noop returns
@@ -183,19 +300,32 @@ REAL_CONSOLE_JS = """'use strict';
         onDesktopName: function (client, name) { document.title = name + ' · 真机 KVM'; },
         onFBResize: function (client, width, height) { canvas.width = width; canvas.height = height; }
       });
-    } catch (error) { setStatus('初始化失败：' + error); return; }
+    } catch (error) { exhaust('初始化失败：' + error); return; }
     window.__kvm = rfb;
     rfb.connect(location.hostname, location.port, '000000000000000000000000',
                 '000000000000000000000000', 'console');
   }
-  askThenConnect();
+  if (rec.exhausted) {
+    setStatus(EXHAUSTED_TEXT);
+  } else if (!rec.closed) {
+    // This page load is itself a retry, so it is already inside the grace
+    // window; probing limits first would only add a round trip before connect.
+    if (rec.attempts > 0) start(); else askThenConnect();
+  }
   function endSession() {
     ended = true;
+    stopped = true;
+    if (reloadTimer !== null) { clearTimeout(reloadTimer); reloadTimer = null; }
+    rec.closed = true; writeRecovery(rec);
+    health.state = 'closed';
     if (rfb) { try { rfb.disconnect(); } catch (error) {} }
     fetch('/_platform/close', { method: 'POST' }).catch(function () {});
+    setStatus('会话已结束');
   }
   document.getElementById('close').onclick = endSession;
   window.addEventListener('beforeunload', function () {
+    stopped = true;
+    if (reloadTimer !== null) { clearTimeout(reloadTimer); reloadTimer = null; }
     if (rfb) { try { rfb.disconnect(); } catch (error) {} }
   });
 })();"""
@@ -207,6 +337,12 @@ def make_adapter(info):
     if info["adapter"] == PASSTHROUGH_ADAPTER_ID:
         return PassthroughAdapter(info)
     raise Problem("adapter_not_verified", 403)
+
+
+def wire_recovery(adapter, policy):
+    if getattr(adapter, "supports_upstream_recovery", False):
+        adapter.recovery = policy
+    return adapter
 
 
 @dataclass
@@ -221,18 +357,28 @@ class Runtime:
     next_renew: float = 0
     idle_task: asyncio.Task | None = None
     opening: int = 0
+    telemetry: SessionTelemetry = field(default_factory=SessionTelemetry)
 
 
 class Gateway:
-    RECONNECT_GRACE = 2.0
+    DEFAULT_RECONNECT_GRACE = 8.0
+    MAX_RECONNECT_GRACE = 30.0
+    STATS_RECENT = 5
 
     def __init__(self, cfg):
         self.cfg = cfg
+        try:
+            grace = float(cfg.get("reconnect_grace_seconds", self.DEFAULT_RECONNECT_GRACE))
+        except (TypeError, ValueError):
+            grace = self.DEFAULT_RECONNECT_GRACE
+        self.RECONNECT_GRACE = max(0.1, min(self.MAX_RECONNECT_GRACE, grace))
+        self.recovery = RecoveryPolicy.from_config(cfg)
         self.public = load_pem_public_key(Path(cfg["public_key"]).read_bytes())
         self.sessions: dict[str, Runtime] = {}
         self.traces: dict[str, str] = {}
         self.pending_reports = {}
         self._report_retry: dict[str, tuple[int, float]] = {}
+        self.evidence = EvidenceLog()
         self.control = None
         self.task = None
         self.watchdogs = set()
@@ -345,19 +491,35 @@ class Gateway:
                     async with asyncio.timeout(3):
                         await ws.close(code=1001, message=b"session ended")
             cleaned = await sess.adapter.close()
-            await self.report(sess.sid, "confirmed" if cleaned else "pending", reason)
+            cleanup = "confirmed" if cleaned else "pending"
+            self.record_end(sess, reason, cleanup)
+            await self.report(sess.sid, cleanup, reason)
             self.sessions.pop(sess.sid, None)
             self.traces.pop(sess.sid, None)
 
+    def record_end(self, sess, reason, cleanup):
+        record = sess.telemetry.evidence(sid=sess.sid, reason=reason, cleanup=cleanup)
+        self.evidence.add(record)
+        log.warning("session %s ended: reason=%s cleanup=%s upstream_close_code=%s "
+                    "key_events=%s client_bytes=%s client_message_types=%s denied=%s "
+                    "connections=%s reconnects=%s recoveries=%s recovery_attempts=%s "
+                    "last_recovery=%s dropped_input=%s duration_ms=%s",
+                    sess.sid, reason, cleanup, record["upstream_close_code"],
+                    record["key_events"], record["client_bytes"],
+                    record["client_message_summary"] or "-", record["denied"],
+                    record["connections"], record["reconnects"],
+                    record["recoveries"], record["recovery_attempts"],
+                    record["recovery_last_error"] or "-", record["dropped_input"],
+                    record["duration_ms"])
+
+    def stats(self, sess):
+        return {"session": sess.telemetry.live(ws_open=len(sess.ws), opening=sess.opening,
+                                               lease_remaining=sess.lease_end - time.monotonic(),
+                                               closing=sess.closing),
+                "recent_ended": self.evidence.recent(self.STATS_RECENT),
+                "evidence_keep": self.evidence.keep}
+
     async def end_lost_upstream(self, sess, upstream):
-        transport = getattr(upstream, "upstream", None)
-        log.warning("session %s ended: reason=%s upstream_close_code=%s key_events=%s "
-                    "client_bytes=%s denied=%s",
-                    sess.sid, upstream_end_reason(upstream),
-                    getattr(transport, "upstream_close_code", None),
-                    getattr(upstream, "client_key_events", 0),
-                    getattr(upstream, "client_bytes", 0),
-                    getattr(upstream, "denied", None))
         with contextlib.suppress(Exception):
             async with asyncio.timeout(3):
                 await upstream.close(code=1000)
@@ -431,7 +593,7 @@ class Gateway:
         try:
             info = await self.call(claims["sid"], "exchange", {"ticket": tokens[0]})
             hard_until = info["hard_until"]
-            adapter = make_adapter(info)
+            adapter = wire_recovery(make_adapter(info), self.recovery)
             deadline = started + info["lease_seconds"]
             async with asyncio.timeout(max(0.01, min(10, deadline-time.monotonic()))):
                 await adapter.login(info.pop("username"), info.pop("password"))
@@ -493,6 +655,7 @@ class Gateway:
             await client.prepare(request)
             self.cancel_idle(sess)
             sess.ws.add(client)
+            sess.telemetry.note_connection(upstream)
 
             async def pump(src, dst):
                 async for message in src:
@@ -543,6 +706,8 @@ class Gateway:
                                       "connections": len(sess.ws),
                                       "opening": sess.opening,
                                       "closing": sess.closing})
+        if request.path == "/_platform/stats" and request.method == "GET":
+            return web.json_response(self.stats(sess))
         if request.method != "GET" or request.query_string:
             raise Problem("route_denied", 403)
         real = isinstance(sess.adapter, PassthroughAdapter)

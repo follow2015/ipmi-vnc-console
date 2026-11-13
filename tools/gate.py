@@ -99,6 +99,26 @@ def check_test_imports(root: Path) -> list[str]:
     return problems
 
 
+COLLECT_TIMEOUT = 180
+
+
+def check_collection(root: Path) -> list[str]:
+    root = Path(root)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q",
+             "-p", "no:cacheprovider", str(root / "tests")],
+            cwd=str(root), capture_output=True, text=True,
+            timeout=COLLECT_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"pytest --collect-only could not run: {exc}"]
+    if result.returncode == 0:
+        return []
+    output = (result.stdout + result.stderr).strip().splitlines()
+    tail = [line.strip() for line in output if line.strip()][-5:]
+    return ["pytest --collect-only failed: " + " | ".join(tail)]
+
+
 def main() -> int:
     problems = {
         "missing .gitignore rules": check_gitignore(ROOT),
@@ -106,6 +126,7 @@ def main() -> int:
         "unstable error codes": check_error_codes(),
         "lockfile pin drift": check_lockfile(ROOT),
         "tests importing absent modules": check_test_imports(ROOT),
+        "tests that pytest cannot collect": check_collection(ROOT),
     }
     failed = False
     for label, items in problems.items():
@@ -113,8 +134,8 @@ def main() -> int:
             failed = True
             print(f"GATE FAIL: {label}: {items}", file=sys.stderr)
     if not failed:
-        print("GATE OK: ignore rules, tracked secrets, error codes, lockfile pins "
-              "and test imports are clean")
+        print("GATE OK: ignore rules, tracked secrets, error codes, lockfile pins, "
+              "test imports and test collection are clean")
     return 1 if failed else 0
 
 

@@ -77,6 +77,29 @@ def user_message(code: str) -> str | None:
     return USER_MESSAGES.get(code)
 
 
+END_REASON_MESSAGES = {
+    "client_closed": "操作员结束了会话。",
+    "revoked": "会话已被撤销。",
+    "capability_withdrawn": "该资产的能力在会话期间被收回，会话随之结束。",
+    "upstream_error": "与 BMC 的连接异常中断。",
+    "upstream_unresponsive": "BMC 长时间没有响应，连接已判定失效。",
+    "upstream_reconnect_failed": "BMC 连接断开，自动重建控制台没有成功，会话已结束。",
+    "lease_expired": "租约到期，会话已结束。",
+    "login_failed": "登录 BMC 失败，会话未能建立。",
+    "worker_shutdown": "网关进程重启或停止，会话已结束。",
+    "exchange_failed": "与 Manager 的票据交换失败，会话未能建立。",
+    "client_message_denied": "浏览器发来了白名单之外的消息，为安全起见结束了会话。",
+    "client_message_malformed": "浏览器发来的消息格式非法，会话已结束。",
+    "manual_release": "管理员核对上游已清理后人工放行。",
+    "deadline": "到达硬性截止时间，平台结束了会话。",
+    "credential_unavailable": "BMC 凭据不可用，会话已结束。",
+}
+
+
+def end_reason_message(reason: str) -> str | None:
+    return END_REASON_MESSAGES.get(reason)
+
+
 class Problem(Exception):
     def __init__(self, code: str, status: int | None = None):
         self.code = code

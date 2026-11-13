@@ -32,7 +32,15 @@ def observation(**overrides) -> dict:
 
 
 def test_full_run_passes_with_no_reasons():
-    assert silent_verdict(observation()) == {"verdict": "pass", "reasons": []}
+    assert silent_verdict(observation()) == {"verdict": "pass", "reasons": [],
+                                             "reason": "upstream_unresponsive"}
+
+
+def test_a_spent_rebuild_also_counts_as_an_upstream_ending():
+    verdict = silent_verdict(observation(session={"status": "closed", "cleanup": "pending",
+                                                  "reason": "upstream_reconnect_failed"}))
+    assert verdict["verdict"] == "pass"
+    assert verdict["reason"] == "upstream_reconnect_failed"
 
 
 def test_console_that_stayed_normal_is_not_a_cut():
@@ -43,7 +51,7 @@ def test_console_that_stayed_normal_is_not_a_cut():
 def test_a_clean_upstream_close_is_not_a_silent_one():
     evidence = observation(session={"status": "closed", "cleanup": "pending",
                                     "reason": "upstream_error"})
-    assert "reason_not_upstream_unresponsive" in silent_verdict(evidence)["reasons"]
+    assert "reason_not_upstream_side" in silent_verdict(evidence)["reasons"]
 
 
 def test_slot_freed_without_a_confirmed_logout_is_a_failure():
@@ -64,7 +72,8 @@ def test_detection_before_the_heartbeat_cannot_be_the_heartbeat():
 def test_slow_logout_does_not_get_reported_as_slow_detection():
     evidence = observation(silent_to_console_close_ms=30_600,
                            silent_to_manager_record_ms=MAX_SILENT_MS + 5_000)
-    assert silent_verdict(evidence) == {"verdict": "pass", "reasons": []}
+    assert silent_verdict(evidence) == {"verdict": "pass", "reasons": [],
+                                        "reason": "upstream_unresponsive"}
 
 
 def test_a_run_where_the_browser_never_noticed_fails():
@@ -111,7 +120,7 @@ def test_verdict_names_every_failure_at_once():
         audit_actions=[],
     )
     reasons = set(silent_verdict(evidence)["reasons"])
-    assert {"browser_errors", "status_not_terminal", "reason_not_upstream_unresponsive",
+    assert {"browser_errors", "status_not_terminal", "reason_not_upstream_side",
             "cleanup_not_pending", "slot_released_early", "asset_not_blocked",
             "silent_too_slow", "end_not_audited", "release_not_audited"} <= reasons
 

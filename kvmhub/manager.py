@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .common import (INTERNAL_PORT, TRACE_ID, UI_PORT, WORKER_PORT, Problem,
-                     digest, issue, secret_matches, user_message, verify)
+                     digest, end_reason_message, issue, secret_matches, user_message, verify)
 from .store import Store
 
 LOGIN = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>KVM Hub</title>
@@ -164,9 +164,14 @@ def build_apps(cfg, store=None):
         content += '<h2>最近会话</h2>'
         for s in sessions:
             sid = html.escape(s["id"], quote=True)
+            reason = html.escape(s["reason"] or "")
             content += (f'<article><code>{sid}</code><p>{html.escape(s["asset_id"])} · '
-                        f'{html.escape(s["status"])} · 清理 {html.escape(s["cleanup"])}</p>'
-                        f'<button data-close="{sid}">结束会话</button>')
+                        f'{html.escape(s["status"])} · 清理 {html.escape(s["cleanup"])}</p>')
+            if reason:
+                sentence = end_reason_message(reason)
+                content += (f'<p class="reason">结束原因：<code>{reason}</code>'
+                            + (f' {html.escape(sentence)}' if sentence else '') + '</p>')
+            content += f'<button data-close="{sid}">结束会话</button>'
             if s["cleanup"] == "pending" and s["status"] in ("closed", "failed", "lost"):
                 content += f'<button data-release="{sid}">人工放行（需已核对上游）</button>'
             content += '</article>'

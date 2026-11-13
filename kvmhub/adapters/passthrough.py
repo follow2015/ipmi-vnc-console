@@ -42,6 +42,7 @@ def content_type_for(path: str) -> str:
 class PassthroughAdapter:
     adapter_id = PASSTHROUGH_ADAPTER_ID
     connection_limit = 1
+    supports_upstream_recovery = True
 
     def __init__(self, info):
         target = urlsplit(info["target"])
@@ -71,6 +72,7 @@ class PassthroughAdapter:
             raise Problem("invalid_target_policy", 502) from exc
         self.upstream: RfbUpstream | None = None
         self.session: RfbPassthroughSession | None = None
+        self.recovery = None
 
     async def login(self, username, password):
         self.upstream = RfbUpstream(self.cfg)
@@ -89,7 +91,8 @@ class PassthroughAdapter:
         session = RfbPassthroughSession(
             self.upstream, BrowserHandshake(self.upstream.server_init_raw, version=version),
             allowed_client_messages=INSYDE_CLIENT_MESSAGES,
-            message_sizes=INSYDE_MESSAGE_SIZES)
+            message_sizes=INSYDE_MESSAGE_SIZES,
+            recovery=self.recovery)
         await session.start()
         self.session = session
         return session

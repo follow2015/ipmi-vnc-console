@@ -11,7 +11,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from fastapi.testclient import TestClient
 
-from kvmhub.common import BMC_BASE_URL, UI_ORIGIN
+from kvmhub.common import BMC_BASE_URL, UI_ORIGIN, end_reason_message
 from kvmhub.manager import build_apps
 from kvmhub.store import Store
 from tools.bootstrap import generate
@@ -61,6 +61,18 @@ def test_manual_release_endpoint_is_csrf_protected_and_audited(manager_app):
     assert store.allocate("mock-1", "local-admin", cfg["worker_id"], cfg["instance_id"], "trace")["id"] != row["id"]
     events = list(store.db.execute("SELECT actor,action FROM audit WHERE action='manual_slot_release'"))
     assert len(events) == 1 and events[0]["actor"] == "local-admin"
+
+
+def test_a_finished_session_explains_why_it_ended(manager_app):
+    ui, store, directory, cfg = manager_app
+    client = TestClient(ui, base_url=UI_ORIGIN)
+    login(client, directory)
+    row = store.allocate("mock-1", "local-admin", cfg["worker_id"], cfg["instance_id"], "trace")
+    store.db.execute("UPDATE session SET status='closed',cleanup='confirmed',"
+                     "reason='client_message_denied' WHERE id=?", (row["id"],))
+    body = client.get("/").text
+    assert "client_message_denied" in body
+    assert end_reason_message("client_message_denied") in body
 
 
 def test_index_escapes_session_fields(manager_app):

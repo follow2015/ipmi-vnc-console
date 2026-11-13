@@ -4,6 +4,7 @@ import http.server
 import json
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -146,8 +147,10 @@ def test_aborted_peer_is_not_dumped_and_the_server_keeps_serving(device):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    with socket.create_connection(("127.0.0.1", device["port"]), timeout=5) as raw:
-        context.wrap_socket(raw).close()
+    raw = socket.create_connection(("127.0.0.1", device["port"]), timeout=5)
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    tls = context.wrap_socket(raw)
+    tls.close()
     deadline = time.monotonic() + 5
     while not device["handler_errors"] and time.monotonic() < deadline:
         time.sleep(0.02)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import re
 import struct
@@ -241,6 +242,7 @@ class RfbUpstream:
         self._parser: RfbHandshake | None = None
         self._closed = False
         self._logged_in = False
+        self.last_logout_status: int | None = None
         self._owns_session = session is None
         if session is not None:
             self.http = session
@@ -255,7 +257,7 @@ class RfbUpstream:
         if self.cfg.scheme == "https":
             ssl = (aiohttp.Fingerprint(bytes.fromhex(self.cfg.cert_sha256))
                    if self.cfg.cert_sha256 else True)
-        return aiohttp.TCPConnector(ssl=ssl, limit=2)
+        return aiohttp.TCPConnector(ssl=ssl, limit=4)
 
     async def login(self, username: str, password: str) -> None:
         if (not isinstance(username, str) or not username or len(username) > MAX_NAME_CHARS
@@ -433,7 +435,8 @@ class RfbUpstream:
             self.stats.modes.add(header.mode)
 
     async def _send(self, data: bytes) -> None:
-        assert self._ws is not None
+        if self._ws is None:
+            raise Problem("upstream_unavailable", 502)
         try:
             async with asyncio.timeout(self.cfg.request_timeout):
                 await self._ws.send_bytes(data)
@@ -443,11 +446,12 @@ class RfbUpstream:
     async def relay(self, on_bytes: Callable[[bytes], Awaitable[None]]) -> None:
         if self._ws is None or self.server_init is None:
             raise Problem("upstream_handshake_failed", 502)
+        ws = self._ws
         if self.pending:
             buffered, self.pending = self.pending, b""
             await on_bytes(buffered)
         while True:
-            message = await self._ws.receive()
+            message = await ws.receive()
             if message.type is aiohttp.WSMsgType.BINARY:
                 data = message.data
                 if len(data) > self.cfg.max_frame_bytes:
@@ -502,6 +506,31 @@ class RfbUpstream:
             raise Problem("upstream_unavailable", 502) from None
         return content_type, body
 
+    def _reset_console_state(self) -> None:
+        self._rx.clear()
+        self._capturing = True
+        self._parser = None
+        self.server_init = None
+        self.server_init_raw = b""
+        self.pending = b""
+        self.upstream_close_code = None
+
+    async def drop_websocket(self, code: int = 1000) -> None:
+        ws, self._ws = self._ws, None
+        self._reset_console_state()
+        if ws is None:
+            return
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(2):
+                await ws.close(code=code)
+
+    async def reopen(self, *, request_frames: bool = True) -> None:
+        if not self._logged_in:
+            raise Problem("bmc_auth_failed", 502)
+        await self.drop_websocket()
+        self._ticket = None
+        await self.open(request_frames=request_frames)
+
     async def wait_frames(self, count: int = 2, timeout: float = 10.0) -> int:
         if self._ws is None or self.server_init is None:
             raise Problem("upstream_handshake_failed", 502)
@@ -517,6 +546,37 @@ class RfbUpstream:
                     await self._send(framebuffer_update_request(
                         True, 0, 0, self.stats.width, self.stats.height))
         return seen
+
+    async def wait_first_frame(self, timeout: float = 3.0) -> bytes:
+        if self.pending:
+            return self.pending
+        if self._ws is None:
+            raise Problem("upstream_handshake_failed", 502)
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    message = await self._ws.receive()
+                    if message.type is aiohttp.WSMsgType.BINARY:
+                        data = message.data
+                        if len(data) > self.cfg.max_frame_bytes:
+                            raise Problem("upstream_frame_too_large", 502)
+                        self.stats.frames += 1
+                        self.stats.bytes += len(data)
+                        self.stats.max_frame_bytes = max(self.stats.max_frame_bytes, len(data))
+                        self.stats.last_event_at = self.clock()
+                        self.pending = bytes(data) + self.pending
+                        return bytes(data)
+                    if message.type is aiohttp.WSMsgType.CLOSE:
+                        self.upstream_close_code = message.data
+                        raise Problem("upstream_unavailable", 502)
+                    if message.type in (aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED,
+                                        aiohttp.WSMsgType.ERROR):
+                        self.upstream_close_code = getattr(self._ws, "close_code", None)
+                        raise Problem("upstream_unavailable", 502)
+                    if message.type is aiohttp.WSMsgType.TEXT:
+                        raise Problem("upstream_invalid_response", 502)
+        except (TimeoutError, asyncio.TimeoutError):
+            raise Problem("upstream_silent", 502) from None
 
     async def send_pointer(self, x: int, y: int, mask: int = 0) -> None:
         await self._send(pointer_event(x, y, mask))
@@ -545,6 +605,7 @@ class RfbUpstream:
                                                   data=b"", headers=self._cookie_header(),
                                                   allow_redirects=False) as response:
                             await response.read()
+                            self.last_logout_status = response.status
                             cleaned = "ok" if response.status in (200, 204) else "failed"
                 except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError):
                     cleaned = "failed"
