@@ -155,10 +155,103 @@ def probe_verdict(probe: dict | None) -> str:
     return probe_report(probe, None)["verdict"]
 
 
+PROBE_PASS_VERDICTS = ("not_run", "echoed", "echoed_correct")
+
+MIN_CASE_HEIGHT_DELTA = 2
+
+
+def probe_ok(report: dict | None) -> bool:
+    return (report or {}).get("verdict") in PROBE_PASS_VERDICTS
+
+
+def _glyph_height(cell) -> int | None:
+    if not isinstance(cell, dict):
+        return None
+    top, bottom = cell.get("top"), cell.get("bottom")
+    if not isinstance(top, int) or not isinstance(bottom, int) or bottom < top:
+        return None
+    return bottom - top + 1
+
+
+def _tallest_cell(block) -> dict | None:
+    cells = block.get("cells") if isinstance(block, dict) else None
+    best: tuple[tuple[int, int], dict] | None = None
+    for cell in cells or []:
+        height = _glyph_height(cell)
+        if height is None:
+            continue
+        ink = cell.get("ink") if isinstance(cell.get("ink"), int) else 0
+        key = (height, ink)
+        if best is None or key > best[0]:
+            best = (key, cell)
+    return best[1] if best else None
+
+
+def case_reference(case: dict | None) -> dict | None:
+    if not isinstance(case, dict):
+        return None
+    heights = [_glyph_height(_tallest_cell(case.get(name))) for name in ("lower", "upper")]
+    if any(height is None for height in heights):
+        return None
+    tall, short = max(heights), min(heights)
+    if tall - short < MIN_CASE_HEIGHT_DELTA:
+        return None
+    return {"upper_height": tall, "lower_height": short, "split": (tall + short) / 2}
+
+
+def case_verdict(probe: dict, case: dict | None) -> tuple[str, str, list[str]]:
+    if not isinstance(case, dict):
+        return "unknown", "none", []
+    cells = (probe.get("echo") or {}).get("cells")
+    case_map = probe.get("case_map")
+    expected = probe.get("expected_chars")
+    if _tallest_cell(case.get("lower")) is None or _tallest_cell(case.get("upper")) is None:
+        return "unknown", "none", []
+    reference = case_reference(case)
+    if reference is None:
+        return "unknown", "none", ["glyphs_too_close_in_height"]
+    if not isinstance(cells, list) or not isinstance(expected, int) or len(cells) != expected:
+        return "unknown", "none", []
+    if not isinstance(case_map, list) or not case_map:
+        return "unknown", "none", []
+    matches = mismatches = 0
+    for entry in case_map:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            return "unknown", "none", []
+        index, wanted = entry
+        if not isinstance(index, int) or wanted not in ("u", "l"):
+            return "unknown", "none", []
+        if not 0 <= index < len(cells):
+            return "unknown", "none", []
+        height = _glyph_height(cells[index])
+        if height is None:
+            return "unknown", "none", []
+        if (height > reference["split"]) == (wanted == "u"):
+            matches += 1
+        else:
+            mismatches += 1
+    if not matches and not mismatches:
+        return "unknown", "glyph_height", []
+    if mismatches and not matches:
+        return "inverted", "glyph_height", []
+    if matches and not mismatches:
+        return "correct", "glyph_height", []
+    return "mixed", "glyph_height", ["case_mixed"]
+
+
+def caps_state(case: dict | None) -> str:
+    reference = case_reference(case)
+    height = _glyph_height(_tallest_cell((case or {}).get("lower")))
+    if reference is None or height is None:
+        return "unknown"
+    return "on" if height > reference["split"] else "off"
+
+
 def probe_report(probe: dict | None, case: dict | None) -> dict:
     if not probe:
         return {"verdict": "not_run", "expected_chars": None, "visible_groups": None,
-                "accuracy": None, "case_sensitive": None, "notes": []}
+                "accuracy": None, "case_sensitive": None, "case": "unknown",
+                "case_method": "none", "caps_lock": "unknown", "notes": []}
     echo = probe.get("echo") if isinstance(probe, dict) else None
     expected = probe.get("expected_chars")
     groups = (echo or {}).get("groups")
@@ -171,20 +264,33 @@ def probe_report(probe: dict | None, case: dict | None) -> dict:
             case_sensitive = lower != upper
             if not case_sensitive:
                 notes.append("case_not_distinguished")
+    case_state, case_method, case_notes = case_verdict(probe, case)
+    notes.extend(case_notes)
+    caps = caps_state(case)
+    if caps == "on":
+        notes.append("plain_key_rendered_uppercase")
     if not isinstance(expected, int) or not isinstance(groups, int):
         verdict = "echoed" if probe.get("changed") else "silent"
         return {"verdict": verdict, "expected_chars": expected, "visible_groups": None,
-                "accuracy": None, "case_sensitive": case_sensitive, "notes": notes}
+                "accuracy": None, "case_sensitive": case_sensitive, "case": case_state,
+                "case_method": case_method, "caps_lock": caps, "notes": notes}
     accuracy = round(groups / expected, 3) if expected > 0 else None
     if groups <= 0:
         verdict = "silent"
-    elif groups >= expected:
-        verdict = "echoed"
-    else:
+    elif groups < expected:
         verdict = "partial"
         notes.append("fewer_glyphs_than_sent")
+    elif case_state == "correct":
+        verdict = "echoed_correct"
+    elif case_state == "inverted":
+        verdict = "echoed_inverted_case"
+    elif case_state == "mixed":
+        verdict = "partial"
+    else:
+        verdict = "echoed"
     return {"verdict": verdict, "expected_chars": expected, "visible_groups": groups,
-            "accuracy": accuracy, "case_sensitive": case_sensitive, "notes": notes}
+            "accuracy": accuracy, "case_sensitive": case_sensitive, "case": case_state,
+            "case_method": case_method, "caps_lock": caps, "notes": notes}
 
 
 LIVENESS_MIN_SAMPLES = 3
@@ -403,7 +509,7 @@ def main() -> int:
         ok = (not payload["errors"]
               and steps_ok
               and not unchanged
-              and probe_verdict(payload.get("probe")) != "silent"
+              and probe_ok(report)
               and payload.get("canvas_initial", {}).get("non_black", 0) > 0
               and payload.get("state_after_input") == "normal"
               and payload.get("client_bytes_after", 0) > payload.get("client_bytes_before", 0)

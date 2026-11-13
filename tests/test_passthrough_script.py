@@ -14,6 +14,7 @@ from tools.passthrough_check import (
     not_changed_steps,
     parse_type_script,
     probe_steps,
+    probe_ok,
     probe_report,
     probe_verdict,
     script_env,
@@ -340,3 +341,129 @@ def test_reload_cannot_be_combined_with_typing():
                 {"label": "x", "reload": "yes"}):
         with pytest.raises(ValueError, match="reload"):
             parse_type_script(json.dumps([bad]))
+
+
+
+def _glyph(top: int, bottom: int = 13, ink: int = 24) -> dict:
+    return {"x": 0, "width": 8, "top": top, "bottom": bottom, "ink": ink}
+
+
+def _case_pair(lower_top: int = 6, upper_top: int = 3) -> dict:
+    return {"lower": {"signature": 11, "cells": [_glyph(lower_top)]},
+            "upper": {"signature": 22, "cells": [_glyph(upper_top)]}}
+
+
+def _probe_with(text_cells: list[dict], signature: int = 33) -> dict:
+    return {"changed": True, "expected_chars": 4,
+            "echo": {"groups": len(text_cells), "cells": text_cells, "signature": signature}}
+
+
+CASE_MAP = [[0, "u"], [1, "l"], [2, "u"]]
+
+
+def test_probe_report_names_a_correct_case_mapping():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    report = probe_report(probe, _case_pair())
+    assert report["verdict"] == "echoed_correct"
+    assert report["case"] == "correct"
+    assert report["case_method"] == "glyph_height"
+
+
+def test_probe_report_names_an_inverted_case_mapping():
+    probe = _probe_with([_glyph(6), _glyph(3), _glyph(6), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    report = probe_report(probe, _case_pair())
+    assert report["verdict"] == "echoed_inverted_case"
+    assert report["case"] == "inverted"
+
+
+def test_a_mixed_case_mapping_is_not_reported_as_correct():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(6), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    report = probe_report(probe, _case_pair())
+    assert report["verdict"] == "partial"
+    assert report["case"] == "mixed"
+    assert "case_mixed" in report["notes"]
+
+
+def test_digits_do_not_take_part_in_the_case_verdict():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3), _glyph(1, 13, 40)])
+    probe["case_map"] = CASE_MAP
+    assert probe_report(probe, _case_pair())["case"] == "correct"
+
+
+def test_case_is_unknown_when_both_calibration_glyphs_are_the_same_height():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    report = probe_report(probe, _case_pair(lower_top=6, upper_top=6))
+    assert report["case"] == "unknown"
+    assert report["case_method"] == "none"
+    assert "glyphs_too_close_in_height" in report["notes"]
+    assert report["verdict"] == "echoed"
+
+
+def test_case_is_unknown_when_the_glyph_count_does_not_match():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    report = probe_report(probe, _case_pair())
+    assert report["verdict"] == "partial"
+    assert report["case"] == "unknown"
+
+
+def test_case_is_unknown_when_the_payload_carries_no_case_map():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3), _glyph(3)])
+    report = probe_report(probe, _case_pair())
+    assert report["case"] == "unknown"
+    assert report["verdict"] == "echoed"
+
+
+def test_the_report_states_that_no_glyph_geometry_was_available():
+    report = probe_report({"changed": True, "expected_chars": 4, "echo": {"groups": 4}}, None)
+    assert report["case"] == "unknown" and report["case_method"] == "none"
+    assert report["verdict"] == "echoed"
+
+
+def test_partial_echo_is_not_a_pass():
+    probe = {"changed": True, "expected_chars": 4, "echo": {"groups": 3}}
+    assert probe_ok(probe_report(probe, None)) is False
+
+
+def test_inverted_case_is_not_a_pass():
+    probe = _probe_with([_glyph(6), _glyph(3), _glyph(6), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    assert probe_ok(probe_report(probe, _case_pair())) is False
+
+
+def test_a_complete_echo_with_the_right_case_is_a_pass():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    assert probe_ok(probe_report(probe, _case_pair())) is True
+
+
+def test_a_run_that_never_probed_is_not_failed_for_it():
+    assert probe_ok(probe_report(None, None)) is True
+
+
+def test_older_evidence_without_geometry_is_still_a_pass_when_it_echoed():
+    assert probe_ok(probe_report({"changed": True}, None)) is True
+    assert probe_ok(probe_report({"changed": False}, None)) is False
+
+
+def test_the_report_states_the_case_state_it_measured():
+    probe = _probe_with([_glyph(6), _glyph(3), _glyph(6), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    report = probe_report(probe, _case_pair(lower_top=3, upper_top=6))
+    assert report["caps_lock"] == "on"
+    assert report["case"] == "inverted"
+    assert "plain_key_rendered_uppercase" in report["notes"]
+
+
+def test_caps_state_is_off_when_the_plain_key_stays_short():
+    probe = _probe_with([_glyph(3), _glyph(6), _glyph(3), _glyph(3)])
+    probe["case_map"] = CASE_MAP
+    assert probe_report(probe, _case_pair())["caps_lock"] == "off"
+
+
+def test_caps_state_is_unknown_without_a_calibration():
+    assert probe_report({"changed": True}, None)["caps_lock"] == "unknown"

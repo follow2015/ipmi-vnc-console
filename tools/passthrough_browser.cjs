@@ -133,6 +133,9 @@ const { chromium } = require(PW);
       const width = canvas.width;
       const height = canvas.height;
       const columns = new Uint8Array(width);
+      const inkOf = new Int32Array(width);
+      const topOf = new Int32Array(width).fill(height);
+      const bottomOf = new Int32Array(width).fill(-1);
       let firstRow = height;
       let lastRow = -1;
       for (let y = 0; y < height; y += 1) {
@@ -143,22 +146,40 @@ const { chromium } = require(PW);
             + Math.abs(now[i + 2] - base[i + 2]);
           if (delta > 30) {
             columns[x] = 1;
+            inkOf[x] += 1;
+            if (y < topOf[x]) topOf[x] = y;
+            if (y > bottomOf[x]) bottomOf[x] = y;
             if (y < firstRow) firstRow = y;
             if (y > lastRow) lastRow = y;
           }
         }
       }
+      const cellFrom = (from, to) => {
+        let top = height;
+        let bottom = -1;
+        let ink = 0;
+        for (let x = from; x <= to; x += 1) {
+          ink += inkOf[x];
+          if (topOf[x] < top) top = topOf[x];
+          if (bottomOf[x] > bottom) bottom = bottomOf[x];
+        }
+        return { x: from, width: to - from + 1, top, bottom, ink };
+      };
       let groups = 0;
       let changed = 0;
       let inside = false;
+      let start = -1;
+      const cells = [];
       for (let x = 0; x < width; x += 1) {
         if (columns[x]) {
           changed += 1;
-          if (!inside) { groups += 1; inside = true; }
-        } else {
+          if (!inside) { groups += 1; inside = true; start = x; }
+        } else if (inside) {
           inside = false;
+          cells.push(cellFrom(start, x - 1));
         }
       }
+      if (inside) cells.push(cellFrom(start, width - 1));
       let signature = 2166136261;
       if (lastRow >= 0) {
         for (let y = firstRow; y <= lastRow; y += 1) {
@@ -171,7 +192,7 @@ const { chromium } = require(PW);
         }
       }
       return { changed_columns: changed, groups, first_row: firstRow, last_row: lastRow,
-               signature };
+               signature, cells };
     }, mode);
 
     await consolePage.waitForTimeout(1500);
@@ -277,9 +298,18 @@ const { chromium } = require(PW);
         const state = await consolePage.evaluate(() => window.__kvm._rfb_state);
         const canvas = await canvasStats();
         if (step.label === 'probe_echo') {
+          const caseMap = [];
+          if (!secret) {
+            for (let index = 0; index < text.length; index += 1) {
+              const char = text[index];
+              if (char !== char.toLowerCase()) caseMap.push([index, 'u']);
+              else if (char !== char.toUpperCase()) caseMap.push([index, 'l']);
+            }
+          }
           result.probe = { before: before.fingerprint, after: canvas.fingerprint,
                            changed: before.fingerprint !== canvas.fingerprint,
-                           expected_chars: text.length, echo: await echoReadout('diff') };
+                           expected_chars: text.length, case_map: caseMap,
+                           echo: await echoReadout('diff') };
         }
         result.step_samples.push({
           label: step.label, secret, chars: secret ? null : text.length, state, canvas,
