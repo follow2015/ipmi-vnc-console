@@ -105,6 +105,15 @@ def cmd_withdraw(store, args, action) -> int:
     return 0
 
 
+def cmd_rotate_fingerprint(store, args) -> int:
+    result = store.rotate_asset_fingerprint(
+        args.asset_id, fingerprint=args.cert_sha256, actor=args.actor,
+        evidence=args.evidence, rationale=args.why or "")
+    print(f"rotated {result['asset']}: {result['old']}.. -> {result['new']}.. "
+          f"(live sessions untouched: {result['live_sessions']})")
+    return 0
+
+
 def cmd_check(store, args) -> int:
     asset, reason = store.gate(args.asset_id, args.user)
     entry = store.db.execute("SELECT * FROM adapter_capability WHERE id=?",
@@ -160,6 +169,16 @@ def build_parser() -> argparse.ArgumentParser:
         node.add_argument("--reason", required=True)
         node.add_argument("--why", default="")
 
+    rotate = sub.add_parser("rotate-fingerprint",
+                            help="pin an asset to a renewed BMC certificate (audited)")
+    rotate.add_argument("--asset-id", dest="asset_id", required=True)
+    rotate.add_argument("--cert-sha256", dest="cert_sha256", required=True,
+                        help="new certificate digest; the AA:BB:.. form is accepted too")
+    rotate.add_argument("--actor", required=True)
+    rotate.add_argument("--evidence", required=True,
+                        help="what was checked before trusting the new certificate")
+    rotate.add_argument("--why", default="")
+
     check = sub.add_parser("check", help="show why an asset is or is not exchangeable")
     check.add_argument("--asset-id", dest="asset_id", required=True)
     check.add_argument("--user", default="local-admin")
@@ -181,6 +200,8 @@ def main(argv=None) -> int:
             return cmd_approve(store, args)
         if args.command in ("suspend", "retire"):
             return cmd_withdraw(store, args, args.command)
+        if args.command == "rotate-fingerprint":
+            return cmd_rotate_fingerprint(store, args)
         return cmd_check(store, args)
     except Problem as exc:
         print(f"refused: {exc.code}", file=sys.stderr)

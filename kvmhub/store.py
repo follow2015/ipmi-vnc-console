@@ -329,6 +329,30 @@ class Store:
             "SELECT a.id,a.name FROM asset a JOIN access_grant g ON a.id=g.asset_id WHERE g.user_id=? AND g.expires>?",
             (user, self.clock()))]
 
+    LIVE_STATES = ("pending", "connecting", "active", "closing")
+
+    def rotate_asset_fingerprint(self, aid, *, fingerprint, actor, evidence, rationale=""):
+        if not str(actor or "").strip() or not str(evidence or "").strip():
+            raise Problem("rotation_incomplete", 400)
+        digest = str(fingerprint or "").replace(":", "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise Problem("fingerprint_invalid", 400)
+        with self.tx():
+            row = self.db.execute("SELECT id,fingerprint FROM asset WHERE id=?", (aid,)).fetchone()
+            if row is None:
+                raise Problem("asset_not_found", 404)
+            if row["fingerprint"] == digest:
+                raise Problem("fingerprint_unchanged", 409)
+            self.db.execute("UPDATE asset SET fingerprint=? WHERE id=?", (digest, aid))
+            live = self.db.execute(
+                "SELECT COUNT(*) FROM session WHERE asset_id=? AND status IN (?,?,?,?)",
+                (aid, *self.LIVE_STATES)).fetchone()[0]
+            self.event(actor, "asset_fingerprint_rotated",
+                       detail={"asset": aid, "old": row["fingerprint"][:12], "new": digest[:12],
+                               "evidence": str(evidence).strip(), "rationale": rationale})
+        return {"asset": aid, "old": row["fingerprint"][:12], "new": digest[:12],
+                "live_sessions": live}
+
     def eligible(self, aid, user):
         asset, reason = self.gate(aid, user)
         if reason is not None:

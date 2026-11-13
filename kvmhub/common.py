@@ -58,6 +58,8 @@ ERROR_STATUS = {
     "credential_unavailable": 503, "subprotocol_required": 400,
     "internal_error": 500, "unknown_operation": 404, "session_not_found": 404,
     "worker_authentication_failed": 403, "instance_mismatch": 403,
+    "asset_not_found": 404, "fingerprint_invalid": 400,
+    "fingerprint_unchanged": 409, "rotation_incomplete": 400,
 }
 
 

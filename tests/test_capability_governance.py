@@ -325,3 +325,107 @@ def test_exchange_forwards_the_approved_versions_to_the_worker(env):
     row = store.allocate("a1", "local-admin", "w1", "i1", "trace")
     result = store.exchange(claims(row), "trace")
     assert result["protocol_versions"] == ["RFB 055.008", "RFB 003.008"]
+
+
+
+NEW_FINGERPRINT = "cd" * 32
+
+
+def audit_detail(store, action):
+    row = store.db.execute("SELECT detail FROM audit WHERE action=?", (action,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def test_rotating_a_pinned_fingerprint_is_audited_and_leaves_the_credential_alone(env):
+    store, now, *_ = env
+    seed_real(store)
+    before = store.db.execute("SELECT credential FROM asset WHERE id='a1'").fetchone()[0]
+    result = store.rotate_asset_fingerprint("a1", fingerprint=NEW_FINGERPRINT, actor="albert",
+                                            evidence="ticket-42", rationale="cert renewed")
+    row = store.db.execute("SELECT fingerprint, credential FROM asset WHERE id='a1'").fetchone()
+    assert row["fingerprint"] == NEW_FINGERPRINT
+    assert row["credential"] == before
+    assert result == {"asset": "a1", "old": FINGERPRINT[:12], "new": NEW_FINGERPRINT[:12],
+                      "live_sessions": 0}
+    detail = audit_detail(store, "asset_fingerprint_rotated")
+    assert detail == {"asset": "a1", "old": FINGERPRINT[:12], "new": NEW_FINGERPRINT[:12],
+                      "evidence": "ticket-42", "rationale": "cert renewed"}
+    assert NEW_FINGERPRINT not in json.dumps(detail)
+
+
+def test_a_rotation_accepts_the_colon_form_an_operator_copies_from_openssl(env):
+    store, *_ = env
+    seed_real(store)
+    printed = ":".join(NEW_FINGERPRINT.upper()[i:i + 2] for i in range(0, 64, 2))
+    store.rotate_asset_fingerprint("a1", fingerprint=printed, actor="albert", evidence="ticket-42")
+    assert store.db.execute("SELECT fingerprint FROM asset WHERE id='a1'").fetchone()[0] == NEW_FINGERPRINT
+
+
+def test_a_rotation_that_changes_nothing_is_refused_and_not_audited(env):
+    store, *_ = env
+    seed_real(store)
+    with pytest.raises(Problem, match="fingerprint_unchanged"):
+        store.rotate_asset_fingerprint("a1", fingerprint=FINGERPRINT.upper(), actor="albert",
+                                       evidence="ticket-42")
+    assert audit_detail(store, "asset_fingerprint_rotated") is None
+
+
+def test_a_rotation_refuses_anything_that_is_not_a_sha256(env):
+    store, *_ = env
+    seed_real(store)
+    for bad in ("", "not-a-digest", "ab" * 31, "zz" * 32):
+        with pytest.raises(Problem, match="fingerprint_invalid"):
+            store.rotate_asset_fingerprint("a1", fingerprint=bad, actor="albert", evidence="t")
+
+
+def test_a_rotation_needs_who_and_why_it_was_checked(env):
+    store, *_ = env
+    seed_real(store)
+    for kwargs in ({"actor": "", "evidence": "t"}, {"actor": "albert", "evidence": " "}):
+        with pytest.raises(Problem, match="rotation_incomplete"):
+            store.rotate_asset_fingerprint("a1", fingerprint=NEW_FINGERPRINT, **kwargs)
+
+
+def test_a_rotation_names_an_asset_that_exists(env):
+    store, *_ = env
+    with pytest.raises(Problem, match="asset_not_found"):
+        store.rotate_asset_fingerprint("nope", fingerprint=NEW_FINGERPRINT, actor="albert",
+                                       evidence="t")
+
+
+def test_a_rotation_counts_live_sessions_without_ending_them(env):
+    store, now, *_ = env
+    seed_real(store)
+    sid = store.allocate("a1", "local-admin", "w1", "i1", "trace")["id"]
+    result = store.rotate_asset_fingerprint("a1", fingerprint=NEW_FINGERPRINT, actor="albert",
+                                           evidence="ticket-42")
+    assert result["live_sessions"] == 1
+    assert store.get(sid)["status"] == "pending"
+
+
+def test_the_rotation_command_changes_the_pin_and_leaves_the_audit_line(env, capsys):
+    from tools import capability_admin
+
+    store, now, path, _key = env
+    seed_real(store)
+    code = capability_admin.main(["--db", str(path), "rotate-fingerprint", "--asset-id", "a1",
+                                  "--cert-sha256", NEW_FINGERPRINT, "--actor", "albert",
+                                  "--evidence", "cert-20270201.pem"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "a1" in out and "live sessions untouched: 0" in out
+    assert store.db.execute("SELECT fingerprint FROM asset WHERE id='a1'").fetchone()[0] == NEW_FINGERPRINT
+    assert audit_detail(store, "asset_fingerprint_rotated")["evidence"] == "cert-20270201.pem"
+
+
+def test_the_rotation_command_refuses_a_malformed_digest_without_touching_anything(env, capsys):
+    from tools import capability_admin
+
+    store, now, path, _key = env
+    seed_real(store)
+    code = capability_admin.main(["--db", str(path), "rotate-fingerprint", "--asset-id", "a1",
+                                  "--cert-sha256", "dead-beef", "--actor", "albert",
+                                  "--evidence", "cert.pem"])
+    assert code == 1
+    assert "fingerprint_invalid" in capsys.readouterr().err
+    assert store.db.execute("SELECT fingerprint FROM asset WHERE id='a1'").fetchone()[0] == FINGERPRINT
