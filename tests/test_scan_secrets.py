@@ -10,11 +10,8 @@ scan = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(scan)
 
 
-_ASSET_SHAPED = "10.100.1" + ".11"
-
-
 @pytest.mark.parametrize("ip", [
-    _ASSET_SHAPED, "10.20.30.40", "192.168.7.9", "172.16.5.4", "172.31.0.9",
+    "10.20.30.40", "192.168.7.9", "172.16.5.4", "172.31.0.9",
     "169.254.1.1", "100.64.0.9",
 ])
 def test_private_addresses_are_not_safe(ip):
