@@ -31,9 +31,11 @@ def _chrome():
 def test_input_block_starts_as_one_button():
     html = worker.REAL_CONSOLE_HTML
     js = worker.REAL_CONSOLE_JS
-    assert '<div id="inputpanel" class="collapsed">' in html
+    assert '<aside id="inputpanel" class="collapsed">' in html, "the dock is a left rail"
+    assert '<div id="work">' in html, "the picture owns its own column"
     assert 'id="input-toggle"' in html
     assert "#inputpanel.collapsed #input-body{display:none}" in html
+    assert "#inputpanel:not(.collapsed){flex-basis:300px}" in html, "expansion steals width"
     assert "inputPanel.classList.toggle('collapsed')" in js
     block = js[js.index("inputToggle.onclick"):js.index("skRoot.addEventListener")]
     assert "loadKeymap();" in block, "the first expansion is what loads the table"
@@ -51,7 +53,9 @@ def test_a_live_console_no_longer_fetches_the_keymap():
 def test_zoom_button_switches_between_fit_and_raw_pixels():
     html = worker.REAL_CONSOLE_HTML
     js = worker.REAL_CONSOLE_JS
-    assert 'id="zoom-mode"' in html and "画面 100%" in html
+    assert 'id="zoom-mode"' in html and "画面自适应" in html
+    assert "var zoomMode = 'oneone'" in js, "native pixels are the crisp default"
+    assert "setZoomMode('oneone');" in js
     assert "zoomMode === 'oneone'" in js
     assert "stage.style.overflow = 'auto'" in js, "1:1 larger than the stage must scroll"
     assert "stage.style.justifyContent = 'flex-start'" in js, "centring would make the top unreachable"
@@ -135,13 +139,32 @@ def test_controls_behave_in_a_browser():
     assert initial["keymapRequests"] == 0, "no request before the first click"
     assert initial["inputBodyVisible"] is False
     assert initial["toggleVisible"] is True
+    assert initial["panelCollapsed"] is True
+    assert initial["panelWidth"] <= 50, "the collapsed rail must not steal width"
     assert initial["label"] == "192.0.2.11"
     assert initial["title"].endswith("192.0.2.11")
+    assert initial["scale"] == pytest.approx(1.0, abs=0.001), "crisp 1:1 on first paint"
+    assert initial["zoom"] == "100%"
+    assert initial["cssWidth"] == 1024 and initial["cssHeight"] == 768
+    assert initial["stageOverflow"] == "auto", "a small window scrolls at 1:1"
 
     opened = steps["opened"]
     assert opened["keymapRequests"] == 1
     assert opened["inputBodyVisible"] is True
     assert opened["keyEnabled"] is True
+    assert opened["panelCollapsed"] is False
+    assert opened["panelWidth"] > 200, "the expanded dock shows the keyboard"
+    assert opened["scale"] == pytest.approx(1.0, abs=0.001), "the dock never rescales the picture"
+
+    fit = steps["fit"]
+    assert fit["scale"] < 0.995, "fit shows the whole framebuffer when asked"
+    assert fit["stageOverflow"] != "auto"
+    assert fit["zoom"].endswith("%")
+
+    nosignal = steps["nosignal"]
+    assert nosignal["overlayVisible"] is True
+    assert "无视频信号" in nosignal["overlayText"]
+    assert steps["signal"]["overlayVisible"] is False
 
     oneone = steps["oneone"]
     assert oneone["scale"] == pytest.approx(1.0, abs=0.001)
@@ -150,13 +173,3 @@ def test_controls_behave_in_a_browser():
     assert oneone["stageOverflow"] == "auto"
     assert oneone["stageScrollHeight"] > oneone["stageClientHeight"]
     assert oneone["zoom"] == "100%"
-
-    nosignal = steps["nosignal"]
-    assert nosignal["overlayVisible"] is True
-    assert "无视频信号" in nosignal["overlayText"]
-    assert steps["signal"]["overlayVisible"] is False
-
-    back = steps["back"]
-    assert back["scale"] < 0.995, "fit comes back when the button is pressed again"
-    assert back["stageOverflow"] != "auto"
-    assert back["zoom"].endswith("%")

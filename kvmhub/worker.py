@@ -122,7 +122,12 @@ REAL_CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <title>真机 KVM 控制台</title>
 <style>
 :root{color-scheme:dark}
-body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:row;height:100vh;overflow:hidden}
+/* The picture owns a column of its own. Docking the input controls on the
+   left keeps them out of the framebuffer's width and height entirely: even
+   collapsed they used to eat the bottom of the window, forcing the picture
+   to scale below 100% and making text fuzzy from interpolation. */
+#work{flex:1 1 auto;display:flex;flex-direction:column;min-width:0;min-height:0}
 header{display:flex;gap:14px;align-items:center;padding:10px 16px;background:#111c2e;border-bottom:1px solid #24344d}
 header strong{font-weight:600;white-space:nowrap}
 #status{color:#8fb6e8;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -140,17 +145,24 @@ canvas{background:#000;outline:none;flex:none;display:block}
 #nosignal .card{max-width:min(560px,82%);padding:18px 22px;border:1px solid #c8a24a;border-radius:10px;background:#141d2b;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)}
 #nosignal .card strong{display:block;font-size:18px;color:#f0cf82;margin-bottom:8px}
 #nosignal .card span{font-size:13px;color:#b9c8dc;line-height:1.6}
-/* The input block is never scrolled or clipped: it takes its natural height
-   and the picture above absorbs whatever is left, scaled to fit. */
-#inputpanel{flex:0 0 auto}
+/* The input block docks on the left as a narrow rail. Collapsed it is a
+   44px strip showing only the toggle; expanded it becomes a 300px column.
+   Either way it steals width, never height, so the picture keeps the whole
+   window height and a 100% framebuffer is never squeezed vertically. */
+#inputpanel{flex:0 0 44px;background:#0e192b;border-right:1px solid #24344d;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+#inputpanel:not(.collapsed){flex-basis:300px}
+#inputpanel.collapsed #input-body{display:none}
+#inputpanel.collapsed #input-bar{padding:8px 0;justify-content:center}
+#inputpanel.collapsed #input-toggle{writing-mode:vertical-rl;padding:10px 5px}
+#inputpanel.collapsed #input-hint{display:none}
 button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap}
 button:hover{background:#25405f}
 footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* The input block starts as a single button. Nothing inside it is loaded
    until that button is pressed: the picture gets the whole window first. */
-#input-bar{display:flex;gap:10px;align-items:center;padding:6px 16px;background:#0e192b;border-top:1px solid #24344d}
-#input-hint{font-size:12px;color:#7288a6}
-#inputpanel.collapsed #input-body{display:none}
+#input-bar{display:flex;gap:10px;align-items:center;padding:8px 10px;background:#0e192b;border-bottom:1px solid #24344d;flex:0 0 auto}
+#input-hint{font-size:12px;color:#7288a6;line-height:1.5}
+#input-body{flex:1 1 auto;min-height:0;overflow:auto}
 /* Below this the header, the input block and the footer no longer fit at all.
    Nothing can be scaled to make room, so the page scrolls rather than hiding
    the bottom of the keyboard. Pointer mapping survives it: the client measures
@@ -172,12 +184,19 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 #softkey .head strong{color:#e6eef8;font-size:13px;white-space:nowrap}
 #softkey .head .grow{flex:1}
 #softkey .head .hint{color:#8a94a6}
+/* In the left dock the column is only 300px, so the long hint would stack
+   one word per line. Keep the label, drop the prose. */
+#inputpanel:not(.collapsed) #softkey .head .hint{display:none}
+#inputpanel:not(.collapsed) #input-hint{display:none}
 #softkey button{font:12px/1.2 ui-monospace,Consolas,monospace}
 #sk-body.hidden{display:none}
-.skrow{display:flex;gap:4px;margin-bottom:3px}
+.skrow{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:3px}
 .skrow.macros{flex-wrap:wrap;gap:4px;margin-bottom:4px}
 .skrow.macros .sk{flex:0 0 auto;padding:4px 10px}
-.sk{flex:var(--u,1) 1 0;min-width:0;padding:4px 2px;border:1px solid #2f4568;background:#182a44;color:#dbe7f6;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center}
+/* A fixed minimum width lets keys wrap into a readable grid in the narrow
+   dock instead of being squeezed into vertical slivers; --u still widens the
+   space/shift keys, and flex-grow shares any leftover width evenly. */
+.sk{flex:var(--u,1) 1 26px;min-width:26px;padding:5px 2px;border:1px solid #2f4568;background:#182a44;color:#dbe7f6;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center}
 .sk:hover:enabled{background:#23405f}
 .sk:active:enabled{background:#2e577f}
 .sk:disabled{opacity:.4;cursor:not-allowed}
@@ -186,10 +205,13 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 .sk[data-level=known_broken]{border-color:#a2473f;color:#ffc9c4}
 #sk-status{font-size:12px;color:#8fb6e8;min-height:1.4em}
 </style>
-<header><strong id="asset-label">真机 KVM 控制台</strong><span id="status">正在连接…</span><span id="frame-age" title="最近一次从主机侧收到数据距今多久。这台固件即使在画面静止时也会持续回送小包，所以这个数字持续上涨通常说明链路出了问题；反过来，数字正常但画面不动，说明是主机自己停住了（例如卡在 POST）。"></span><span id="zoom" title="画面按这个比例显示。自适应时窗口放不下 1:1 的帧缓冲，画面会等比缩小以完整显示；缩小时鼠标坐标仍按原比例换算。"></span><span id="spacer"></span><button id="zoom-mode" title="在完整显示与 100% 原始像素之间切换。100% 时画面区可滚动，鼠标坐标会随滚动一起换算。">画面 100%</button><button id="close">结束会话</button></header>
+<div id="work">
+<header><strong id="asset-label">真机 KVM 控制台</strong><span id="status">正在连接…</span><span id="frame-age" title="最近一次从主机侧收到数据距今多久。这台固件即使在画面静止时也会持续回送小包，所以这个数字持续上涨通常说明链路出了问题；反过来，数字正常但画面不动，说明是主机自己停住了（例如卡在 POST）。"></span><span id="zoom" title="画面按这个比例显示。自适应时窗口放不下 1:1 的帧缓冲，画面会等比缩小以完整显示；缩小时鼠标坐标仍按原比例换算。"></span><span id="spacer"></span><button id="zoom-mode" title="在完整显示与 100% 原始像素之间切换。默认 100% 原始像素最清晰；窗口放不下时画面区可滚动，鼠标坐标仍随滚动换算。">画面自适应</button><button id="close">结束会话</button></header>
 <div id="stage"><canvas id="screen" width="1024" height="768" tabindex="0"></canvas><div id="nosignal" hidden><div class="card"><strong>无视频信号 · 系统可能未开机</strong><span>主机没有输出画面。这不是 VNC 链路故障；本页未接入电源状态，请到 BMC 电源管理页确认设备是否已上电。</span></div></div></div>
-<div id="inputpanel" class="collapsed">
-<div id="input-bar"><button id="input-toggle" type="button">⌨ 输入控制</button><span id="input-hint">点击展开长命令输入与软键盘（首次点击才加载键位表）</span></div>
+<footer title="画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。">画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。</footer>
+</div><!-- /work -->
+<aside id="inputpanel" class="collapsed">
+<div id="input-bar"><button id="input-toggle" type="button" title="展开长命令输入与软键盘（首次点击才加载键位表）">⌨ 输入</button><span id="input-hint">输入控制停靠在左侧，点击展开</span></div>
 <div id="input-body">
 <div id="pastebar">
 <div class="row"><strong>长命令输入</strong><span>粘贴后先预检；字符按实测可靠性着色</span><span class="grow"></span>
@@ -241,7 +263,7 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 </div>
 </div>
 </div>
-<footer title="画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。">画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。</footer>
+</aside>
 <script src="/novnc/include/util.js"></script>
 <script src="/novnc/include/webutil.js"></script>
 <script src="/novnc/include/base64.js"></script>
@@ -271,7 +293,10 @@ REAL_CONSOLE_JS = """'use strict';
   var desktopName = '';
   var noSignal = false;
   var inputOpened = false;
-  var zoomMode = 'fit';   // 'fit' or 'oneone'
+  // Open at native pixels. At 1:1 the text is crisp instead of interpolated,
+  // and the left dock no longer steals window height, so the only cost is a
+  // scrollable stage on small windows -- which the pointer path handles.
+  var zoomMode = 'oneone';   // 'fit' or 'oneone'
   var ended = false;
   var explained = false;
   // The device address is safe to show: the Worker only publishes the host
@@ -978,11 +1003,11 @@ REAL_CONSOLE_JS = """'use strict';
   // the buttons cannot be pressed before the table that defines them exists.
   inputToggle.onclick = function () {
     var collapsed = inputPanel.classList.toggle('collapsed');
-    inputToggle.textContent = collapsed ? '⌨ 输入控制' : '⌨ 收起输入';
+    inputToggle.textContent = collapsed ? '⌨ 输入' : '⌨ 收起';
     var hint = document.getElementById('input-hint');
     if (hint) hint.textContent = collapsed
-      ? '点击展开长命令输入与软键盘（首次点击才加载键位表）'
-      : '画面已自动适配；长命令输入与软键盘只发按键帧';
+      ? '停靠在左侧，点击展开（首次点击才加载键位表）'
+      : '长命令输入与软键盘只发按键帧';
     if (!collapsed && !inputOpened) {
       inputOpened = true;
       loadKeymap();
@@ -1063,16 +1088,14 @@ REAL_CONSOLE_JS = """'use strict';
     if (frameTimer === null) frameTimer = setInterval(paintFrameAge, 1000);
   }
 
-  // ---- fitting the picture to what is left -------------------------------
-  // The page used to trade height by hand: a drag handle on the input block's
-  // top edge. Both ends of that trade were wrong in ways the operator could
-  // see — pushing up squeezed and then cropped the framebuffer, pushing to the
-  // ceiling scrolled the input block so the bottom row of keys vanished.
+  // ---- fitting the picture ------------------------------------------------
+  // The input block used to sit below the picture and eat window height. A
+  // drag handle tried to trade that height by hand; it only cropped the
+  // framebuffer or scrolled the bottom row of keys out of view. The block now
+  // docks on the left, so it takes width and never height, and the picture
+  // opens at native 1:1 pixels -- crisp text instead of a blurred interpolation.
   //
-  // Now nothing is allocated by hand. The input block takes its natural height
-  // and is never scrolled or clipped; the picture takes the rest; and the
-  // framebuffer is scaled to fit that rest, so both halves are always whole.
-  // The vendor client ships the tool for exactly this: Display.autoscale()
+  // "Fit" is the optional mode: Display.autoscale()
   // writes CSS width/height only (the bitmap stays 1:1 with the BMC, so drawing
   // and dirty-rect updates are untouched) and returns the ratio, which is the
   // value Util.getEventPosition() divides by. Installing it on the mouse keeps
@@ -1137,7 +1160,7 @@ REAL_CONSOLE_JS = """'use strict';
   zoomModeBtn.onclick = function () {
     setZoomMode(zoomMode === 'fit' ? 'oneone' : 'fit');
   };
-  setZoomMode('fit');
+  setZoomMode('oneone');
   // The panel changes height when the keyboard opens, when the operator drags
   // the paste box's own resize grip, and when the window changes. One observer
   // on the picture's box catches all three, because the box is what is left

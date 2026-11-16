@@ -99,6 +99,7 @@ async function main() {
     return {
       step: stepLabel,
       keymapRequests: requests,
+      panelWidth: Math.round(panel.getBoundingClientRect().width),
       toggleVisible: tbox.width > 0 && tbox.height > 0,
       inputBodyVisible: body.getBoundingClientRect().height > 0,
       panelCollapsed: panel.classList.contains('collapsed'),
@@ -136,7 +137,7 @@ async function main() {
 
   await page.click('#zoom-mode');
   await page.waitForTimeout(150);
-  steps.push(await measure('oneone'));
+  steps.push(await measure('fit'));
 
   await page.evaluate(() => window.__rfb.options.onUpdateFps('No Signal', 'Unknown'));
   steps.push(await measure('nosignal'));
@@ -145,7 +146,7 @@ async function main() {
 
   await page.click('#zoom-mode');
   await page.waitForTimeout(150);
-  steps.push(await measure('back'));
+  steps.push(await measure('oneone'));
 
   console.log(JSON.stringify({ steps, errors }));
   await browser.close();

@@ -42,11 +42,15 @@ def test_the_height_handle_is_gone():
     assert "setPointerCapture" not in js
 
 
-def test_the_input_block_is_never_scrolled_or_capped():
+def test_the_input_dock_takes_width_not_height():
     rule = _rule(worker.REAL_CONSOLE_HTML, "#inputpanel")
-    assert "overflow" not in rule, f"the input block must not scroll: {rule}"
-    assert "max-height" not in rule, f"a cap is what clipped the keyboard: {rule}"
-    assert "flex:0 0 auto" in rule, "it takes its natural height, no shrinking"
+    html = worker.REAL_CONSOLE_HTML
+    assert "flex:0 0 44px" in rule, "the collapsed rail is a narrow left strip"
+    assert "#inputpanel:not(.collapsed){flex-basis:300px}" in html, \
+        "expansion steals width, never the picture's height"
+    body_rule = _rule(html, "#input-body")
+    assert "max-height" not in body_rule, f"a cap is what clipped the keyboard: {body_rule}"
+    assert "<aside id=\"inputpanel\"" in html, "the dock is a sibling of the picture column"
 
 
 def test_the_picture_area_does_not_scroll_either():
@@ -128,14 +132,19 @@ def test_both_halves_fit_at_every_window_size():
 
     collapsed = steps["900-keyboard-collapsed"]
     opened = steps["900-keyboard-open"]
-    assert opened["panel"]["height"] > collapsed["panel"]["height"], "the keyboard is taller"
-    assert opened["scale"] < collapsed["scale"] - 0.05, \
-        "opening the keyboard must scale the picture down, not crop it"
-    assert opened["zoom"] and opened["zoom"].endswith("%"), "the shrink is labelled"
+    assert collapsed["keyboardOpen"] is False and opened["keyboardOpen"] is True, \
+        "the soft keyboard body toggles while the dock stays put"
+    assert opened["canvas"]["bottom"] <= opened["stage"]["bottom"] + 1, \
+        "even with the keyboard open the picture stays whole"
+
+    short = steps["720-keyboard-open"]
+    assert short["scale"] < 0.995, "a short window really shrinks the picture"
+    assert short["zoom"] and short["zoom"].endswith("%"), "the shrink is labelled"
 
     short = steps["720-keyboard-open"]
     assert short["scale"] < opened["scale"], "less window means a smaller picture"
     assert short["canvas"]["cssHeight"] <= short["stage"]["height"] + 1
 
     roomy = steps["1000-keyboard-open"]
-    assert roomy["scale"] > opened["scale"], "more window means a bigger picture"
+    assert roomy["scale"] >= opened["scale"], "more window never makes the picture smaller"
+    assert roomy["scale"] <= 1.0, "downscale only: a roomy window stays at native pixels"

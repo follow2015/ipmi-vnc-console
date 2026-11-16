@@ -105,7 +105,7 @@ async function main() {
       stage: { width: sbox.width, height: sbox.height, left: sbox.left, top: sbox.top,
         right: sbox.right, bottom: sbox.bottom, clientWidth: stage.clientWidth,
         clientHeight: stage.clientHeight },
-      panel: { height: pbox.height, top: pbox.top, bottom: pbox.bottom,
+      panel: { width: pbox.width, height: pbox.height, top: pbox.top, bottom: pbox.bottom,
         scrollHeight: panel.scrollHeight, clientHeight: panel.clientHeight },
       canvas: { cssWidth: cbox.width, cssHeight: cbox.height, left: cbox.left,
         top: cbox.top, right: cbox.right, bottom: cbox.bottom,
@@ -129,6 +129,8 @@ async function main() {
 
   await page.click('#input-toggle');
   await page.waitForTimeout(150);
+  await page.click('#zoom-mode');
+  await page.waitForTimeout(200);
 
   steps.push(await measure('900-keyboard-collapsed'));
 

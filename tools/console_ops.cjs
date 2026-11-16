@@ -10,6 +10,7 @@ const HEALTH_EVERY = Math.max(1, Number(process.env.KVM_HEALTH_EVERY) || 20);
 const RECOVER_MS = Math.max(1000, Number(process.env.KVM_RECOVER_MS) || 12000);
 const ATTEMPT = Math.max(1, Number(process.env.KVM_ATTEMPT) || 1);
 const { chromium } = require(PW);
+const fs = require('fs');
 
 const MAX_ACTIONS = 2000;
 const MAX_WAIT_MS = 600000;
@@ -151,6 +152,12 @@ const shot = async (page, name) => {
     const context = await browser.newContext({
       ignoreHTTPSErrors: true, viewport: { width: 1280, height: 900 },
     });
+    if (process.env.KVM_CONSOLE_HTML) {
+      const pageHtml = fs.readFileSync(process.env.KVM_CONSOLE_HTML, 'utf8');
+      await context.route('**://w1-*.kvm.localhost:**/console**', (route) => route.fulfill({
+        status: 200, contentType: 'text/html; charset=utf-8', body: pageHtml,
+      }));
+    }
     page = await context.newPage();
     page.on('pageerror', (error) => result.console_errors.push(String(error.message).slice(0, 200)));
 
