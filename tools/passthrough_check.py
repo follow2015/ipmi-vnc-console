@@ -27,7 +27,17 @@ SETTLE_SECONDS = 5.0
 
 SECRET_PLACEHOLDER = "@secret"
 _STEP_FIELDS = {"label", "text", "keys", "enter", "wait", "delay", "hold", "shot", "shot_before",
-                "expect_change", "reload"}
+                "expect_change", "reload", "post"}
+
+FIRST_KEY_DEFAULT_ROUNDS = 3
+FIRST_KEY_MAX_ROUNDS = 20
+FIRST_KEY_ROUND_WAIT = 3000
+
+DIRECTION_KEYS = frozenset({"ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"})
+POST_PHASE_NOTE = "运行后须人工核对启动顺序"
+
+LATENCY_FIELDS = ("latency_p50_ms", "latency_p95_ms", "latency_p99_ms")
+LATENCY_NOTE = "M1 延迟直方图按评审结论不做，延迟分位数未测量"
 
 CLIENT_MODIFIERS = ("Shift", "Control", "Alt", "Meta")
 
@@ -56,6 +66,9 @@ def parse_type_script(raw: str) -> list[dict]:
         reload = item.get("reload", False)
         if not isinstance(reload, bool):
             raise ValueError(f"step {index}: reload must be true or false")
+        post = item.get("post", False)
+        if not isinstance(post, bool):
+            raise ValueError(f"step {index}: post must be true or false")
         if reload:
             if text is not None or keys is not None:
                 raise ValueError(f"step {index}: a reload step cannot type text or keys")
@@ -67,15 +80,18 @@ def parse_type_script(raw: str) -> list[dict]:
         hold = int(item.get("hold", 0))
         if hold < 0:
             raise ValueError(f"step {index}: hold must be zero or a positive number of ms")
-        steps.append({"label": label, "text": str(text or ""), "keys": str(keys or ""),
-                      "reload": reload,
-                      "enter": False if reload else bool(item.get("enter", keys is None)),
-                      "wait": int(item.get("wait", 1200)),
-                      "delay": int(item.get("delay", 55)),
-                      "hold": hold,
-                      "shot": str(item.get("shot") or ""),
-                      "shot_before": str(item.get("shot_before") or ""),
-                      "expect_change": bool(item.get("expect_change", False))})
+        step = {"label": label, "text": str(text or ""), "keys": str(keys or ""),
+                "reload": reload,
+                "enter": False if reload else bool(item.get("enter", keys is None)),
+                "wait": int(item.get("wait", 1200)),
+                "delay": int(item.get("delay", 55)),
+                "hold": hold,
+                "shot": str(item.get("shot") or ""),
+                "shot_before": str(item.get("shot_before") or ""),
+                "expect_change": bool(item.get("expect_change", False))}
+        if post:
+            step["post"] = True
+        steps.append(step)
     return steps
 
 
@@ -96,6 +112,137 @@ def describe_steps(steps: list[dict]) -> list[dict]:
         else:
             described.append({"label": step["label"], "chars": len(step["text"])})
     return described
+
+
+
+def clamp_first_key_rounds(value) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("first-key rounds must be an integer") from exc
+    if count < 0:
+        raise ValueError("first-key rounds must be non-negative")
+    return min(count, FIRST_KEY_MAX_ROUNDS)
+
+
+def first_key_rounds(count: int, prefix: str = "first_key_reload") -> list[dict]:
+    count = clamp_first_key_rounds(count)
+    return [{"label": f"{prefix}_{index}", "text": "", "keys": "", "reload": True,
+             "enter": False, "wait": FIRST_KEY_ROUND_WAIT, "delay": 55, "hold": 0,
+             "shot": "", "shot_before": "", "expect_change": False}
+            for index in range(1, count + 1)]
+
+
+def _counter_delta(before, after) -> tuple[bool, float | None]:
+    if isinstance(before, bool) or isinstance(after, bool):
+        return False, None
+    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
+        return False, None
+    return True, after - before
+
+
+def first_key_report(probes, *, rounds_requested: int | None = None) -> dict:
+    observations = [probe for probe in (probes or []) if isinstance(probe, dict)]
+    rounds = len(observations)
+    forwarded = lost = unknown = 0
+    for probe in observations:
+        usable, delta = _counter_delta(probe.get("key_events_before"),
+                                      probe.get("key_events_after"))
+        if not usable:
+            usable, delta = _counter_delta(probe.get("client_bytes_before"),
+                                           probe.get("client_bytes_after"))
+        if not usable:
+            unknown += 1
+        elif delta is not None and delta > 0:
+            forwarded += 1
+        else:
+            lost += 1
+    measured = forwarded + lost
+    loss_rate = round(lost / measured, 3) if measured else None
+    notes: list[str] = []
+    if rounds == 0:
+        conclusion = "not_run"
+    elif measured == 0:
+        conclusion = "no_usable_counter"
+        notes.append("no /_platform/stats counter could confirm forwarding")
+    elif lost == 0:
+        conclusion = "first_key_reliable"
+    else:
+        conclusion = "first_key_lossy"
+    report = {"conclusion": conclusion, "rounds": rounds,
+              "rounds_requested": rounds_requested, "forwarded": forwarded,
+              "lost": lost, "unknown": unknown, "measured_rounds": measured,
+              "first_key_loss_rate": loss_rate, "notes": notes}
+    if rounds_requested is not None and rounds < rounds_requested:
+        report["incomplete"] = True
+        notes.append("fewer rounds completed than requested")
+    return report
+
+
+
+def _chord_keys(keys: str) -> set[str]:
+    return {part.strip() for part in (keys or "").split("+") if part.strip()}
+
+
+def post_key_findings(steps) -> list[dict]:
+    findings: list[dict] = []
+    for step in steps or []:
+        if not step.get("post"):
+            continue
+        hold = int(step.get("hold", 0) or 0)
+        directions = sorted(_chord_keys(step.get("keys") or "") & DIRECTION_KEYS)
+        if hold > 0 and directions:
+            findings.append({"label": step.get("label"), "reason": "direction_long_press_in_post",
+                              "keys": directions, "hold_ms": hold, "overridable": False})
+        elif hold > 0:
+            findings.append({"label": step.get("label"), "reason": "long_press_in_post",
+                              "hold_ms": hold, "overridable": True})
+    return findings
+
+
+def post_key_blockers(steps, allow_post_keys: bool) -> list[dict]:
+    return [finding for finding in post_key_findings(steps)
+            if not finding["overridable"] or not allow_post_keys]
+
+
+
+def is_probe_step(step) -> bool:
+    return step.get("label") in (PROBE_LABEL, PROBE_CASE_LABEL)
+
+
+def step_report(step, accuracy=None) -> dict:
+    measured = isinstance(accuracy, (int, float)) and not isinstance(accuracy, bool)
+    return {"label": step.get("label"), "hold": int(step.get("hold", 0) or 0),
+            "accuracy": accuracy,
+            "accuracy_status": "measured" if measured else "not_measured",
+            "latency_p50_ms": None, "latency_p95_ms": None, "latency_p99_ms": None,
+            "latency_status": "not_measured", "latency_note": LATENCY_NOTE}
+
+
+def build_report(evidence, steps, *, allow_post_keys: bool = False) -> dict:
+    readback = evidence.get("probe_readback") if isinstance(evidence, dict) else None
+    probe_accuracy = readback.get("accuracy") if isinstance(readback, dict) else None
+    rows = [step_report(step, probe_accuracy if is_probe_step(step) else None)
+            for step in (steps or [])]
+    has_post = any(step.get("post") for step in (steps or []))
+    manual_check = bool(allow_post_keys or has_post)
+    safety = {
+        "allow_post_keys": bool(allow_post_keys),
+        "post_steps": [step.get("label") for step in (steps or []) if step.get("post")],
+        "post_key_findings": post_key_findings(steps),
+        "manual_check_required": manual_check,
+        "note": POST_PHASE_NOTE if manual_check else None,
+    }
+    return {
+        "steps": rows,
+        "latency": {"status": "not_measured", "note": LATENCY_NOTE,
+                    "quantiles": {field: None for field in LATENCY_FIELDS}},
+        "accuracy_measured_steps": sum(1 for row in rows
+                                       if row["accuracy_status"] == "measured"),
+        "first_key_probe": (evidence.get("first_key_probe")
+                             if isinstance(evidence, dict) else None),
+        "safety": safety,
+    }
 
 
 PROBE_TEXT = "AbC1"
@@ -275,8 +422,15 @@ def probe_report(probe: dict | None, case: dict | None) -> dict:
                 "accuracy": None, "case_sensitive": case_sensitive, "case": case_state,
                 "case_method": case_method, "caps_lock": caps, "notes": notes}
     accuracy = round(groups / expected, 3) if expected > 0 else None
+    widths = [cell.get("width") for cell in ((echo or {}).get("cells") or [])
+              if isinstance(cell, dict) and isinstance(cell.get("width"), int)
+              and cell["width"] > 0]
+    merged = bool(widths) and any(width > min(widths) * 1.6 for width in widths)
     if groups <= 0:
         verdict = "silent"
+    elif groups < expected and merged:
+        verdict = "unknown"
+        notes.append("glyphs_merged_not_lost")
     elif groups < expected:
         verdict = "partial"
         notes.append("fewer_glyphs_than_sent")
@@ -357,8 +511,23 @@ def wait_port(port: int, timeout: float = STARTUP_TIMEOUT) -> bool:
     return False
 
 
+def shaping_from_arg(value: str) -> dict | None:
+    from kvmhub.input_shaping import InputShapingConfig
+
+    if not value or not value.strip():
+        return None
+    try:
+        config = InputShapingConfig.parse(json.loads(value))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(str(exc)) from None
+    if config is None:
+        raise ValueError("declares no policy")
+    return config.as_dict()
+
+
 def prepare(directory: Path, host: str, fingerprint: str, username: str, password: str,
-            protocol_versions: tuple[str, ...] = ()):
+            protocol_versions: tuple[str, ...] = (), input_shaping: dict | None = None,
+            logout_path: str | None = None):
     root = generate(directory)
     key = base64.b64decode((root / "encryption.key").read_text().strip())
     target = f"https://{host}"
@@ -366,7 +535,9 @@ def prepare(directory: Path, host: str, fingerprint: str, username: str, passwor
     try:
         store.seed_passthrough(target=target, fingerprint=fingerprint, username=username,
                                password=password, approver="tools/passthrough_check.py",
-                               protocol_versions=protocol_versions)
+                               protocol_versions=protocol_versions,
+                               input_shaping=input_shaping,
+                               logout_path=logout_path)
     finally:
         store.close()
     manager_path = root / "manager.json"
@@ -389,10 +560,12 @@ def session_state(root: Path, key: bytes, target: str):
 
 def run_browser(node: str, module: str, chromium: str, base: str, token: str, asset: str,
                 screenshot: str | None = None, steps: list[dict] | None = None,
-                shot_dir: str | None = None):
+                shot_dir: str | None = None, first_key_probe: bool = False):
     env = dict(os.environ, KVM_PLAYWRIGHT=module, KVM_CHROMIUM=chromium,
                KVM_BASE=base, KVM_TOKEN=token, KVM_ASSET=asset)
     env.update(script_env(steps or []))
+    if first_key_probe:
+        env["KVM_FIRST_KEY_PROBE"] = "1"
     if screenshot:
         env["KVM_SCREENSHOT"] = screenshot
     if shot_dir:
@@ -415,6 +588,10 @@ def main() -> int:
     parser.add_argument("--protocol-versions", default="",
                         help="comma-separated RFB greetings approved for this device, "
                              "e.g. 'RFB 055.008,RFB 003.008'")
+    parser.add_argument("--input-shaping", default="",
+                        help="JSON policy for M2 input shaping on this run, e.g. "
+                             "'{\"min_hold_ms\":30,\"max_keys_per_s\":50}'. Empty means "
+                             "the gateway applies no shaping at all")
     parser.add_argument("--out")
     parser.add_argument("--screenshot", help="local PNG path; never committed")
     parser.add_argument("--shot-dir", help="directory for per-step PNGs; never committed")
@@ -427,6 +604,20 @@ def main() -> int:
     parser.add_argument("--probe-case", action="store_true",
                         help="also compare a lowercase and an uppercase probe glyph; "
                              "equal glyphs mean the host never saw the case we sent")
+    parser.add_argument("--first-key-probe", action="store_true",
+                        help="after each reload send a harmless sentinel key and confirm "
+                             "it was forwarded via /_platform/stats before real input")
+    parser.add_argument("--first-key-rounds", type=int, default=FIRST_KEY_DEFAULT_ROUNDS,
+                        help=f"reload rounds for the first-key probe (default "
+                             f"{FIRST_KEY_DEFAULT_ROUNDS}, capped at {FIRST_KEY_MAX_ROUNDS}; "
+                             "the 20-round soak is not run by default)")
+    parser.add_argument("--allow-post-keys", action="store_true",
+                        help="permit long key holds in POST-phase steps (a long-pressed "
+                             "direction key is still forbidden); report.json will require "
+                             "a manual boot-order check afterwards")
+    parser.add_argument("--report-out", default=None,
+                        help="write the per-step report.json here; defaults to a sibling "
+                             "of --out when --out is given")
     parser.add_argument("--keep", action="store_true", help="keep the fixture directory")
     parser.add_argument("--playwright", default=os.environ.get("KVM_PLAYWRIGHT"))
     parser.add_argument("--chromium", default=os.environ.get("KVM_CHROMIUM"))
@@ -446,6 +637,18 @@ def main() -> int:
         parser.error(str(exc))
     steps = apply_probe(steps, args.probe_echo)
     steps = apply_probe_case(steps, args.probe_case)
+    try:
+        rounds = clamp_first_key_rounds(args.first_key_rounds)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.first_key_probe and rounds:
+        steps = first_key_rounds(rounds) + steps
+    blockers = post_key_blockers(steps, args.allow_post_keys)
+    if blockers:
+        details = ", ".join(f"{b['label']}:{b['reason']}" for b in blockers)
+        parser.error("POST 阶段按键安全规则拒绝运行（" + details + "）；"
+                     "长按方向键一律禁止，其余长按需显式 --allow-post-keys，"
+                     "且运行后须人工核对启动顺序")
     if any(step["text"] == SECRET_PLACEHOLDER for step in steps) and not os.environ.get("KVM_SECRET"):
         parser.error("a step uses '@secret' but KVM_SECRET is not set")
     if args.shot_dir:
@@ -460,7 +663,12 @@ def main() -> int:
     directory = ROOT / args.directory
     if directory.exists():
         parser.error(f"{directory} already exists; choose a fresh --directory")
-    root, key, target = prepare(directory, args.host, fingerprint, username, password, versions)
+    try:
+        shaping = shaping_from_arg(args.input_shaping)
+    except ValueError as exc:
+        parser.error(f"--input-shaping rejected: {exc}")
+    root, key, target = prepare(directory, args.host, fingerprint, username, password, versions,
+                                input_shaping=shaping)
     token = (root / "login-token").read_text().strip()
 
     ctx = multiprocessing.get_context("spawn")
@@ -469,6 +677,7 @@ def main() -> int:
     evidence = {"target_host": args.host, "asset": args.asset,
                 "adapter": "supermicro-x10-passthrough",
                 "approved_protocol_versions": list(versions) if versions else ["RFB 055.008"],
+                "input_shaping": shaping,
                 "probe_echo": bool(args.probe_echo), "probe_case": bool(args.probe_case),
                 "steps": [], "errors": []}
     exit_code = 1
@@ -481,7 +690,8 @@ def main() -> int:
             evidence["errors"].append("services_not_ready")
             return 1
         payload, returncode, stderr = run_browser(args.node, module, chromium, UI_ORIGIN, token,
-                                                  args.asset, args.screenshot, steps, args.shot_dir)
+                                                  args.asset, args.screenshot, steps, args.shot_dir,
+                                                  args.first_key_probe)
         evidence["browser_exit"] = returncode
         if stderr:
             evidence["browser_stderr_tail"] = stderr
@@ -489,6 +699,9 @@ def main() -> int:
             evidence["errors"].append("browser_produced_no_result")
             return 1
         evidence.update(payload)
+        evidence["first_key_probe"] = first_key_report(
+            payload.get("first_key_probes"),
+            rounds_requested=rounds if args.first_key_probe else None)
         if steps:
             evidence["typed_steps"] = describe_steps(steps)
         report = probe_report(payload.get("probe"), payload.get("probe_case"))
@@ -506,13 +719,19 @@ def main() -> int:
         steps_ok = all(sample.get("state") == "normal" for sample in samples) if steps else True
         unchanged = not_changed_steps(samples, steps)
         evidence["unchanged_steps"] = unchanged
+        input_reached = payload.get("client_bytes_after", 0) > payload.get("client_bytes_before", 0)
+        evidence["input_evidence"] = "client_bytes"
+        if (not input_reached and args.first_key_probe
+                and (evidence["first_key_probe"].get("forwarded") or 0) > 0):
+            input_reached = True
+            evidence["input_evidence"] = "first_key_probe_counters"
         ok = (not payload["errors"]
               and steps_ok
               and not unchanged
               and probe_ok(report)
               and payload.get("canvas_initial", {}).get("non_black", 0) > 0
               and payload.get("state_after_input") == "normal"
-              and payload.get("client_bytes_after", 0) > payload.get("client_bytes_before", 0)
+              and input_reached
               and state is not None and state["cleanup"] == "confirmed")
         evidence["verdict"] = "pass" if ok else "fail"
         exit_code = 0 if ok else 1
@@ -525,16 +744,25 @@ def main() -> int:
             if process.is_alive():
                 process.kill()
                 process.join()
+        report = build_report(evidence, steps, allow_post_keys=args.allow_post_keys)
+        evidence["report"] = report
         if args.out:
             out = Path(args.out)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(evidence, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        report_path = args.report_out or (str(Path(args.out).with_name("report.json"))
+                                         if args.out else None)
+        if report_path:
+            target = Path(report_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                              encoding="utf-8")
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)
     print(json.dumps({k: evidence.get(k) for k in
-                      ("verdict", "services_ready", "steps", "errors", "probe_result",
-                       "unchanged_steps", "liveness", "canvas_initial",
-                       "canvas_after_input", "state_after_input", "session")},
+                      ("verdict", "input_shaping", "services_ready", "steps", "errors",
+                       "probe_result", "first_key_probe", "unchanged_steps", "liveness",
+                       "canvas_initial", "canvas_after_input", "state_after_input", "session")},
                      indent=2, ensure_ascii=False))
     return exit_code
 

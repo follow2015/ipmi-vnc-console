@@ -16,7 +16,20 @@ const SECRET = process.env.KVM_SECRET || '';
 const SHOT_DIR = process.env.KVM_SHOT_DIR || '';
 const REVOKE = process.env.KVM_REVOKE_MODE === '1';
 const REVOKE_TIMEOUT = Number(process.env.KVM_REVOKE_TIMEOUT_MS || 20000);
+const RECOVERY = process.env.KVM_RECOVERY_MODE === '1';
+const RECOVERY_TIMEOUT = Number(process.env.KVM_RECOVERY_TIMEOUT_MS || 14000);
+const HOLD_KEY = process.env.KVM_HOLD_KEY || '';
+const HOLD_MS = Number(process.env.KVM_HOLD_MS || 3000);
+const HOLD_IDLE_MS = Number(process.env.KVM_HOLD_IDLE_MS || 4000);
 const SECOND_TAB = process.env.KVM_SECOND_TAB === '1';
+const FIRST_KEY_PROBE = process.env.KVM_FIRST_KEY_PROBE === '1';
+const FIRST_KEY = process.env.KVM_FIRST_KEY || 'Shift';
+const FIRST_KEY_SETTLE_MS = 400;
+const KEY_LAYOUT_PROBE = process.env.KVM_KEY_LAYOUT_PROBE === '1';
+const PROBE_KEYS = process.env.KVM_PROBE_KEYS === '1';
+const PROBE_KEY_SEQUENCE = ['a', 'Shift+a', 'Escape', 'ArrowRight'];
+const PROBE_KEY_GAP_MS = 120;
+const LAYOUT_MAX_RECORDS = 8192;
 const MODIFIERS = (() => {
   try {
     const parsed = JSON.parse(process.env.KVM_MODIFIERS || '[]');
@@ -58,11 +71,116 @@ async function typeText(page, text, delay, hold) {
   }
 }
 
-const { chromium } = require(PW);
+const { chromium } = (require.main === module && PW) ? require(PW) : { chromium: null };
 
-(async () => {
+const sampleKeyStats = async (page) => {
+  try {
+    return await page.evaluate(async () => {
+      const stats = window.__kvm_stats ? await window.__kvm_stats() : null;
+      const session = (stats && stats.session) ? stats.session : {};
+      const num = (value) => (typeof value === 'number' && isFinite(value)) ? value : null;
+      const types = (session.client_message_types
+                     && typeof session.client_message_types === 'object')
+        ? session.client_message_types : {};
+      return {
+        key_events: num(session.key_events),
+        client_bytes: num(session.client_bytes),
+        key_message_count: num(types['4']),
+      };
+    });
+  } catch (error) {
+    return { key_events: null, client_bytes: null, key_message_count: null };
+  }
+};
+
+
+function kvmLayoutRecord(data) {
+  let bytes = data;
+  if (bytes instanceof ArrayBuffer) bytes = new Uint8Array(bytes);
+  const length = (bytes && bytes.length) || 0;
+  const at = (index) => {
+    const value = bytes ? bytes[index] : undefined;
+    return typeof value === 'number' ? value : null;
+  };
+  const type = at(0);
+  const record = { length: length, type: type };
+  if (type === 4 && length === 18) {
+    record.down = at(2);
+    record.nonzero = [];
+    record.pad_zero = true;
+    for (let index = 0; index < 18; index += 1) {
+      const value = at(index);
+      if (value === null) { record.pad_zero = false; continue; }
+      if (value !== 0) record.nonzero.push(index);
+    }
+  }
+  return record;
+}
+
+function kvmLayoutSummary(records, truncated) {
+  const all = Array.isArray(records) ? records : [];
+  const keys = all.filter((r) => r && r.type === 4 && r.length === 18);
+  const downValues = {};
+  const nonzero = new Set();
+  let padAllZero = true;
+  for (const record of keys) {
+    const label = String(record.down);
+    downValues[label] = (downValues[label] || 0) + 1;
+    for (const position of record.nonzero || []) nonzero.add(position);
+    if (record.pad_zero === false) padAllZero = false;
+  }
+  const nonzeroPositions = Array.from(nonzero).sort((a, b) => a - b);
+  const padPositions = [];
+  for (let index = 0; index < 18; index += 1) {
+    if (!nonzero.has(index)) padPositions.push(index);
+  }
+  return {
+    samples: all.length,
+    key_samples: keys.length,
+    down_values: downValues,
+    nonzero_positions: nonzeroPositions,
+    pad_positions: padPositions,
+    pad_all_zero: keys.length > 0 ? padAllZero : null,
+    truncated: !!truncated,
+  };
+}
+
+const installLayoutHook = new Function(
+  'return (' +
+  'function (options) {' +
+  '  const layoutRecord = ' + kvmLayoutRecord.toString() + ';' +
+  '  const sock = window.__kvm._sock;' +
+  '  window.__kvmSent = 0;' +
+  '  window.__kvmLayout = [];' +
+  '  window.__kvmLayoutTruncated = false;' +
+  '  if (!sock.__counted) {' +
+  '    const original = sock.send.bind(sock);' +
+  '    sock.send = function (data) {' +
+  '      window.__kvmSent += (data && data.length) || 0;' +
+  '      if (options.layout) {' +
+  '        if (window.__kvmLayout.length < options.max) {' +
+  '          window.__kvmLayout.push(layoutRecord(data));' +
+  '        } else {' +
+  '          window.__kvmLayoutTruncated = true;' +
+  '        }' +
+  '      }' +
+  '      return original(data);' +
+  '    };' +
+  '    sock.__counted = true;' +
+  '  }' +
+  '}' +
+  ')'
+)();
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { kvmLayoutRecord, kvmLayoutSummary, installLayoutHook,
+                     PROBE_KEY_SEQUENCE };
+}
+
+if (require.main === module) (async () => {
   const result = { steps: [], errors: [], console_errors: [], http_404: [] };
   let browser;
+  let consolePage;
   try {
     browser = await chromium.launch({ executablePath: CHROME, headless: true });
     const context = await browser.newContext({ ignoreHTTPSErrors: true });
@@ -78,7 +196,7 @@ const { chromium } = require(PW);
     await page.waitForSelector(`[data-open="${ASSET}"]`, { timeout: 20000 });
     result.steps.push('manager_login');
 
-    const [consolePage] = await Promise.all([
+    [consolePage] = await Promise.all([
       context.waitForEvent('page', { timeout: 20000 }),
       page.click(`[data-open="${ASSET}"]`),
     ]);
@@ -99,6 +217,10 @@ const { chromium } = require(PW);
 
     const canvasStats = () => consolePage.evaluate(() => {
       const canvas = document.getElementById('screen');
+      if (!canvas) {
+        return { width: 0, height: 0, total: 0, non_black: 0, ratio: 0,
+                 fingerprint: 0, page_missing: true };
+      }
       const context2d = canvas.getContext('2d');
       const pixels = context2d.getImageData(0, 0, canvas.width, canvas.height).data;
       let nonBlack = 0;
@@ -198,20 +320,27 @@ const { chromium } = require(PW);
     await consolePage.waitForTimeout(1500);
     result.canvas_initial = await canvasStats();
 
-    await consolePage.evaluate(() => {
-      const sock = window.__kvm._sock;
-      window.__kvmSent = 0;
-      if (!sock.__counted) {
-        const original = sock.send.bind(sock);
-        sock.send = function (data) {
-          window.__kvmSent += (data && data.length) || 0;
-          return original(data);
-        };
-        sock.__counted = true;
-      }
-    });
+    await consolePage.evaluate(installLayoutHook,
+                               { layout: KEY_LAYOUT_PROBE, max: LAYOUT_MAX_RECORDS });
     let sentBefore = await consolePage.evaluate(() => window.__kvmSent);
     let carriedBytes = 0;
+
+    if (PROBE_KEYS) {
+      await consolePage.locator('#screen').click({ position: { x: 8, y: 8 } }).catch(() => {});
+      await consolePage.evaluate(() => {
+        const canvas = document.getElementById('screen');
+        if (canvas) canvas.focus();
+      }).catch(() => {});
+      for (const combo of PROBE_KEY_SEQUENCE) {
+        const parts = combo.split('+');
+        for (const part of parts) await consolePage.keyboard.down(part).catch(() => {});
+        for (const part of parts.slice().reverse()) {
+          await consolePage.keyboard.up(part).catch(() => {});
+        }
+        await consolePage.waitForTimeout(PROBE_KEY_GAP_MS);
+      }
+      result.steps.push('layout_probe_keys_sent');
+    }
 
     const box = await consolePage.locator('#screen').boundingBox();
     if (box) {
@@ -252,6 +381,27 @@ const { chromium } = require(PW);
           await consolePage.waitForFunction(
             () => window.__kvm && window.__kvm._rfb_state === 'normal',
             null, { timeout: 25000 }).catch(() => {});
+          if (FIRST_KEY_PROBE) {
+            await consolePage.locator('#screen').click({ position: { x: 8, y: 8 } }).catch(() => {});
+            await consolePage.evaluate(() => {
+              const canvas = document.getElementById('screen');
+              if (canvas) canvas.focus();
+            }).catch(() => {});
+            const statBefore = await sampleKeyStats(consolePage);
+            await consolePage.keyboard.press(FIRST_KEY).catch(() => {});
+            await consolePage.waitForTimeout(FIRST_KEY_SETTLE_MS);
+            const statAfter = await sampleKeyStats(consolePage);
+            if (!result.first_key_probes) result.first_key_probes = [];
+            result.first_key_probes.push({
+              label: step.label, key: FIRST_KEY,
+              key_events_before: statBefore.key_events,
+              key_events_after: statAfter.key_events,
+              client_bytes_before: statBefore.client_bytes,
+              client_bytes_after: statAfter.client_bytes,
+              key_message_count_before: statBefore.key_message_count,
+              key_message_count_after: statAfter.key_message_count,
+            });
+          }
           await consolePage.waitForTimeout(step.wait || 3000);
           if (SHOT_DIR && step.shot) {
             await consolePage.screenshot({ path: `${SHOT_DIR}/${step.shot}.png` }).catch(() => {});
@@ -389,6 +539,139 @@ const { chromium } = require(PW);
       result.state_after_second_tab = await consolePage.evaluate(
         () => window.__kvm && window.__kvm._rfb_state);
       result.canvas_after_second_tab = await canvasStats();
+    } else if (RECOVERY) {
+      const consoleTraffic = [];
+      consolePage.on('request', (request) => {
+        if (request.url().includes('/console')) consoleTraffic.push(Date.now());
+      });
+      consolePage.on('websocket', (socket) => {
+        if (socket.url().includes('/console')) consoleTraffic.push(Date.now());
+      });
+      const readyAt = Date.now();
+      const readyState = await consolePage.evaluate(() => window.__kvm._rfb_state);
+      const sidMatch = consolePage.url().match(/w1-([0-9a-f]{32})\./);
+      process.stdout.write('READY ' + JSON.stringify({
+        at: readyAt, state: readyState, sid: sidMatch ? sidMatch[1] : null,
+        canvas: result.canvas_after_input, client_bytes: result.client_bytes_after,
+      }) + '\n');
+
+      const samples = [];
+      let sawFailure = false;
+      let lastEventKey = null;
+      const hold = HOLD_KEY
+        ? { base_end: readyAt + HOLD_IDLE_MS, down_at: null, up_at: null, post_end: null }
+        : null;
+      const deadline = Date.now() + RECOVERY_TIMEOUT;
+      while (Date.now() < deadline) {
+        const snap = await consolePage.evaluate(async () => {
+          const client = window.__kvm;
+          const canvas = document.getElementById('screen');
+          let server = null;
+          try {
+            const stats = window.__kvm_stats ? await window.__kvm_stats() : null;
+            if (stats && stats.session) {
+              const s = stats.session;
+              server = { state: s.state, recoveries: s.recoveries,
+                         recovery_attempts: s.recovery_attempts,
+                         server_bytes: s.server_bytes, client_bytes: s.client_bytes,
+                         replayed: s.recovery_input_replayed,
+                         input_dropped: s.recovery_input_dropped };
+            }
+          } catch (error) { server = null; }
+          let sig = 0;
+          if (canvas && canvas.width) {
+            try {
+              const data = canvas.getContext('2d')
+                .getImageData(0, 0, canvas.width, canvas.height).data;
+              let hash = 2166136261;
+              for (let i = 0, pixel = 0; i < data.length; i += 4, pixel += 1) {
+                if (pixel % 97 === 0) {
+                  hash ^= data[i] + (data[i + 1] << 8) + (data[i + 2] << 16);
+                  hash = Math.imul(hash, 16777619) >>> 0;
+                }
+              }
+              sig = hash;
+            } catch (error) { sig = 0; }
+          }
+          return { state: client ? client._rfb_state : null,
+                   canvas: canvas ? canvas.width + 'x' + canvas.height : 'none',
+                   sig, server };
+        }).catch(() => ({ state: null, canvas: 'none', sig: 0, server: null }));
+        samples.push({ at: Date.now(), state: snap.state, canvas: snap.canvas,
+                       sig: snap.sig, server: snap.server });
+        {
+          const key = [snap.state, snap.server ? snap.server.state : '-',
+                       snap.server ? snap.server.recoveries : '-'].join('/');
+          if (key !== lastEventKey) {
+            lastEventKey = key;
+            process.stdout.write('RECOVERY ' + JSON.stringify({
+              at: Date.now(), state: snap.state, server: snap.server }) + '\n');
+          }
+        }
+        if (!snap.state || snap.state !== 'normal') { sawFailure = true; break; }
+        if (hold) {
+          const now = Date.now();
+          if (hold.down_at === null && now >= hold.base_end) {
+            await consolePage.keyboard.down(HOLD_KEY);
+            hold.down_at = Date.now();
+            process.stdout.write('HOLDKEY ' + JSON.stringify(
+              { phase: 'down', key: HOLD_KEY, at: hold.down_at }) + '\n');
+          } else if (hold.down_at !== null && hold.up_at === null
+                     && now >= hold.down_at + HOLD_MS) {
+            await consolePage.keyboard.up(HOLD_KEY);
+            hold.up_at = Date.now();
+            hold.post_end = hold.up_at + HOLD_IDLE_MS;
+            process.stdout.write('HOLDKEY ' + JSON.stringify(
+              { phase: 'up', at: hold.up_at, held_ms: hold.up_at - hold.down_at }) + '\n');
+          } else if (hold.post_end !== null && now >= hold.post_end) {
+            break;
+          }
+        }
+        await consolePage.waitForTimeout(250);
+      }
+      const withServer = samples.filter((s) => s.server);
+      const firstServer = withServer.length ? withServer[0].server : null;
+      const lastServer = withServer.length ? withServer[withServer.length - 1].server : null;
+      const timeline = [];
+      let lastKey = null;
+      samples.forEach((s) => {
+        const key = [s.state, s.server ? s.server.state : '-',
+                     s.server ? s.server.recoveries : '-'].join('/');
+        if (key !== lastKey) {
+          timeline.push({ at: s.at, state: s.state, server: s.server });
+          lastKey = key;
+        }
+      });
+      result.recovery = {
+        ready_at: readyAt,
+        sample_count: samples.length,
+        state_never_failed: !sawFailure,
+        final_state: samples.length ? samples[samples.length - 1].state : null,
+        canvas_sizes: [...new Set(samples.map((s) => s.canvas))],
+        saw_recovering: samples.some((s) => s.server && s.server.state === 'recovering'),
+        max_recoveries: Math.max(0, ...samples.map((s) => (s.server && s.server.recoveries) || 0)),
+        server_bytes_first: firstServer ? firstServer.server_bytes : null,
+        server_bytes_last: lastServer ? lastServer.server_bytes : null,
+        requests_after_ready: consoleTraffic.filter((at) => at >= readyAt).length,
+        timeline,
+      };
+      if (hold) {
+        result.recovery.hold = {
+          key: HOLD_KEY,
+          down_at: hold.down_at,
+          up_at: hold.up_at,
+          held_ms: (hold.down_at !== null && hold.up_at !== null)
+            ? hold.up_at - hold.down_at : null,
+          idle_window_ms: HOLD_IDLE_MS,
+        };
+        result.recovery.samples_sig = samples.map((s) => [s.at, s.sig]);
+        result.recovery.input_counters = {
+          replayed: lastServer ? lastServer.replayed : null,
+          dropped: lastServer ? lastServer.input_dropped : null,
+        };
+      }
+      result.canvas_after_cut = await canvasStats();
+      result.steps.push('recovery_observed');
     } else if (REVOKE) {
       const consoleTraffic = [];
       consolePage.on('request', (request) => {
@@ -439,6 +722,23 @@ const { chromium } = require(PW);
   } catch (error) {
     result.errors.push(String((error && error.message) || error).slice(0, 300));
   } finally {
+    if (KEY_LAYOUT_PROBE) {
+      let records = [];
+      let truncated = false;
+      if (consolePage) {
+        try {
+          const snapshot = await consolePage.evaluate(() => ({
+            records: window.__kvmLayout || [],
+            truncated: !!window.__kvmLayoutTruncated,
+          }));
+          records = snapshot.records;
+          truncated = snapshot.truncated;
+        } catch (error) {
+          records = [];
+        }
+      }
+      result.key_layout = kvmLayoutSummary(records, truncated);
+    }
     if (browser) await browser.close().catch(() => {});
   }
   process.stdout.write('RESULT ' + JSON.stringify(result) + '\n');

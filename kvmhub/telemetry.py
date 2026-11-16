@@ -1,6 +1,7 @@
 """M1 minimum credible subset: end evidence that can be read after the fact."""
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections import deque
@@ -11,6 +12,18 @@ from typing import Any
 EVIDENCE_KEEP = 32
 
 SID_MASK_KEEP = 8
+
+AUDIT_INT_FIELDS = (
+    "duration_ms", "connections", "reconnects", "upstream_close_code",
+    "client_bytes", "server_bytes", "key_events", "peak_buffered_bytes",
+    "recoveries", "recovery_attempts", "recovery_latency_ms", "dropped_input",
+    "recovery_input_replayed", "recovery_input_dropped",
+)
+AUDIT_CLASS_FIELDS = ("exception_type",)
+AUDIT_DECIMAL_FIELDS = ("since_last_rx_s",)
+AUDIT_MAX_INT = 2 ** 31 - 1
+AUDIT_MAX_TYPES = 32
+AUDIT_MAX_DETAIL_CHARS = 1024
 
 
 def mask_sid(sid: str, keep: int = SID_MASK_KEEP) -> str:
@@ -29,6 +42,88 @@ def _code(value: Any) -> str | None:
     return None
 
 
+def _audit_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= AUDIT_MAX_INT else None
+
+
+def _audit_seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not 0 <= value <= 86400 or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return round(float(value), 1)
+
+
+def _audit_class(value: Any) -> str | None:
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", value):
+        return value
+    return None
+
+
+def _audit_json_size(data: dict[str, Any]) -> int:
+    return len(json.dumps(data, separators=(",", ":")))
+
+
+def audit_evidence(record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in AUDIT_INT_FIELDS:
+        value = _audit_int(record.get(key))
+        if value is not None:
+            out[key] = value
+    for key in AUDIT_DECIMAL_FIELDS:
+        value = _audit_seconds(record.get(key))
+        if value is not None:
+            out[key] = value
+    for key in AUDIT_CLASS_FIELDS:
+        value = _audit_class(record.get(key))
+        if value is not None:
+            out[key] = value
+    code = _code(record.get("recovery_last_error"))
+    if code is not None:
+        out["recovery_last_error"] = code
+    code = _code(record.get("cleanup_outcome"))
+    if code is not None:
+        out["cleanup_outcome"] = code
+
+    types = record.get("client_message_types")
+    if isinstance(types, dict):
+        cleaned: dict[str, int] = {}
+        for kind, count in list(types.items())[:AUDIT_MAX_TYPES]:
+            try:
+                numeric = int(kind)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(kind, (int, str)) or not str(kind).isdigit() or not 0 <= numeric <= 255:
+                continue
+            value = _audit_int(count)
+            if value is not None:
+                cleaned[str(numeric)] = value
+        if cleaned:
+            out["client_message_types"] = cleaned
+
+    denied = record.get("denied")
+    if isinstance(denied, dict):
+        kind = _audit_int(denied.get("kind"))
+        length = _audit_int(denied.get("length"))
+        if kind is not None and length is not None and kind <= 255:
+            out["denied"] = {"kind": kind, "length": length}
+
+    keep = out.get("client_message_types")
+    while keep and _audit_json_size(out) > AUDIT_MAX_DETAIL_CHARS and len(keep) > 1:
+        items = list(keep.items())
+        keep = dict(items[:max(1, len(items) // 2)])
+        out["client_message_types"] = keep
+    if _audit_json_size(out) > AUDIT_MAX_DETAIL_CHARS:
+        out.pop("client_message_types", None)
+    if _audit_json_size(out) > AUDIT_MAX_DETAIL_CHARS:
+        return {"evidence_truncated": True}
+    return out
+
+
 def upstream_shape(upstream: Any) -> dict[str, Any]:
     data: dict[str, Any] = {}
     as_dict = getattr(upstream, "as_dict", None)
@@ -44,6 +139,12 @@ def upstream_shape(upstream: Any) -> dict[str, Any]:
     types = data.get("client_message_types") or {}
     counts = {int(kind): int(count) for kind, count in types.items()}
     denied = data.get("denied")
+    clock = getattr(transport, "clock", None)
+    last_rx = getattr(getattr(transport, "stats", None), "last_event_at", 0)
+    since = None
+    if (callable(clock) and isinstance(last_rx, (int, float))
+            and not isinstance(last_rx, bool) and last_rx > 0):
+        since = _audit_seconds(max(0.0, float(clock()) - float(last_rx)))
     return {
         "upstream_close_code": close_code if isinstance(close_code, int) else None,
         "client_bytes": int(data.get("client_bytes", getattr(upstream, "client_bytes", 0)) or 0),
@@ -54,12 +155,16 @@ def upstream_shape(upstream: Any) -> dict[str, Any]:
         "denied": {"kind": int(denied["kind"]), "length": int(denied["length"])}
                   if isinstance(denied, dict) and "kind" in denied and "length" in denied else None,
         "peak_buffered_bytes": int(data.get("peak_buffered_bytes", 0) or 0),
+        "exception_type": _audit_class(data.get("exception_type")),
+        "since_last_rx_s": since,
         "recoveries": int(data.get("recoveries", 0) or 0),
         "recovery_attempts": int(data.get("recovery_attempts", 0) or 0),
         "recovery_last_error": _code(data.get("recovery_last_error")),
         "recovery_latency_ms": (int(data["recovery_latency_ms"])
                                 if isinstance(data.get("recovery_latency_ms"), int) else None),
         "dropped_input": int(data.get("dropped_input", 0) or 0),
+        "recovery_input_replayed": int(data.get("recovery_input_replayed", 0) or 0),
+        "recovery_input_dropped": int(data.get("recovery_input_dropped", 0) or 0),
     }
 
 
@@ -71,6 +176,7 @@ class SessionTelemetry:
     connections: int = 0
     reconnects: int = 0
     upstream: Any = None
+    cleanup_outcome: str | None = None
 
     def note_connection(self, upstream: Any = None) -> None:
         self.connections += 1
@@ -102,7 +208,7 @@ class SessionTelemetry:
     def evidence(self, *, sid: str, reason: str, cleanup: str, upstream: Any = None,
                  now: float | None = None) -> dict[str, Any]:
         ended = time.time() if now is None else now
-        return {
+        record = {
             "sid": sid,
             "started_at": _iso(self.started_at),
             "ended_at": _iso(ended),
@@ -113,6 +219,11 @@ class SessionTelemetry:
             "reconnects": self.reconnects,
             **upstream_shape(self.upstream if upstream is None else upstream),
         }
+        if self.cleanup_outcome is not None:
+            outcome = _code(self.cleanup_outcome)
+            if outcome is not None:
+                record["cleanup_outcome"] = outcome
+        return record
 
 
 class EvidenceLog:

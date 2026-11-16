@@ -225,3 +225,32 @@ def test_relay_connects_only_after_a_client_arrives():
         relay.stop()
         stop.set()
         listener.close()
+
+
+def test_a_finished_pair_stops_counting_as_a_live_connection():
+    listener, port, stop = _echo_server()
+    relay = _relay_to(port)
+    first = socket.create_connection(("127.0.0.1", relay.port), timeout=5)
+    try:
+        first.sendall(b"one")
+        assert first.recv(16) == b"one"
+        assert relay.connections == 1
+        first.close()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and relay.connections:
+            time.sleep(0.02)
+        assert relay.connections == 0, "a closed pair is not a live console"
+        assert relay.accepted == 1
+        second = socket.create_connection(("127.0.0.1", relay.port), timeout=5)
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and relay.connections != 1:
+                time.sleep(0.02)
+            assert (relay.connections, relay.accepted) == (1, 2)
+        finally:
+            second.close()
+    finally:
+        first.close()
+        relay.stop()
+        stop.set()
+        listener.close()

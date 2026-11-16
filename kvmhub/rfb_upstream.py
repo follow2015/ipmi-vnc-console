@@ -243,6 +243,7 @@ class RfbUpstream:
         self._closed = False
         self._logged_in = False
         self.last_logout_status: int | None = None
+        self.last_logout_outcome: str | None = None
         self._owns_session = session is None
         if session is not None:
             self.http = session
@@ -597,6 +598,7 @@ class RfbUpstream:
                 pass
             self._ws = None
         cleaned = "not_needed"
+        self.last_logout_outcome = "not_needed"
         try:
             if self._logged_in:
                 try:
@@ -607,8 +609,14 @@ class RfbUpstream:
                             await response.read()
                             self.last_logout_status = response.status
                             cleaned = "ok" if response.status in (200, 204) else "failed"
-                except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError):
+                            self.last_logout_outcome = ("ok" if cleaned == "ok"
+                                                        else f"status_{response.status}")
+                except (TimeoutError, asyncio.TimeoutError):
                     cleaned = "failed"
+                    self.last_logout_outcome = "timeout"
+                except aiohttp.ClientError as exc:
+                    cleaned = "failed"
+                    self.last_logout_outcome = f"error_{type(exc).__name__.lower()}"[:40]
         finally:
             self._logged_in = False
             self._cookies.clear()

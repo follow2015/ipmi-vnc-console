@@ -17,8 +17,23 @@ __pycache__/
 # Local secrets — never commit
 .env
 .env.*
+!.env.example
 *.pem
 *.key
+deploy/certbot/accounts/
+deploy/certbot/archive/
+deploy/certbot/live/
+deploy/certbot/renewal/
+deploy/certbot/renewal-hooks/
+
+# Front-end build output and dependencies (the lockfile IS committed)
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
 
 # 公开部署仓（sync_to_deploy.py 的目标，独立 git 仓，不进主仓）
 ipmi-vnc-console-deploy/
+
+# 评审用的候选补丁：由外部提供、按需保留在本机，不作为仓库内容
+# （上一轮评审的 d4ac0e7-fixes.patch 曾被 git add docs/review 一并带入）
+docs/review/*.patch

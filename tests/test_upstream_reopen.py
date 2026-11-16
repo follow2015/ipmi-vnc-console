@@ -106,9 +106,24 @@ async def test_logout_status_is_recorded_when_the_bmc_refuses(fake_bmc):
     upstream = await opened(fake_bmc, logout_path="/cgi/not-there")
     assert await upstream.close() == "failed"
     assert upstream.last_logout_status == 404
+    assert upstream.last_logout_outcome == "status_404"
 
 
 async def test_logout_status_is_recorded_on_success(fake_bmc):
     upstream = await opened(fake_bmc)
     assert await upstream.close() == "ok"
     assert upstream.last_logout_status == 204
+    assert upstream.last_logout_outcome == "ok"
+
+
+async def test_an_unreachable_logout_is_named_by_its_error_class(fake_bmc, monkeypatch):
+    import aiohttp
+
+    upstream = await opened(fake_bmc)
+
+    def refuse(*args, **kwargs):
+        raise aiohttp.ClientConnectionError("cannot reach the BMC")
+
+    monkeypatch.setattr(upstream.http, "post", refuse)
+    assert await upstream.close() == "failed"
+    assert upstream.last_logout_outcome == "error_clientconnectionerror"

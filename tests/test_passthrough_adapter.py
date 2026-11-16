@@ -270,12 +270,13 @@ def test_connect_greets_the_browser_with_the_negotiated_version():
 def test_connect_accepts_the_measured_insyde_client_messages():
     adapter = PassthroughAdapter(info())
     adapter.upstream = FakeUpstream(b"\x00" * 40)
+    adapter.upstream.protocol_version = "RFB 003.008"
     pointer = b"\x05\x00\x04\x00\x64\x00\xc8" + b"\x00" * 11
     key = b"\x04\x00\x01\x00\x00\x00\x00\x00\xe1" + b"\x00" * 9
 
     async def scenario():
         session = await adapter.connect(["binary"])
-        await session.send_bytes(b"RFB 055.008\n\x10" + b"A" * 48 + b"\x01")
+        await session.send_bytes(b"RFB 003.008\n\x10" + b"A" * 48 + b"\x01")
         await session.send_bytes(b"\x19")
         await session.send_bytes(pointer)
         await session.send_bytes(key)
@@ -285,3 +286,57 @@ def test_connect_accepts_the_measured_insyde_client_messages():
         await session.close()
 
     asyncio.run(scenario())
+
+
+def test_connect_accepts_the_055_firmware_client_messages():
+    adapter = PassthroughAdapter(info())
+    adapter.upstream = FakeUpstream(b"\x00" * 40)
+    adapter.upstream.protocol_version = "RFB 055.008"
+    mouse_sync = b"\x07\x07\x80"
+    cursor_pos = b"\x19"
+    key = b"\x04\x00\x01\x00\x00\x00\x00\x00\xe1" + b"\x00" * 9
+    pointer = b"\x05\x00\x04\x00\x64\x00\xc8" + b"\x00" * 11
+
+    async def scenario():
+        session = await adapter.connect(["binary"])
+        await session.send_bytes(b"RFB 055.008\n\x10" + b"A" * 48 + b"\x01")
+        await session.send_bytes(mouse_sync)
+        await session.send_bytes(cursor_pos)
+        await session.send_bytes(key)
+        await session.send_bytes(pointer)
+        await asyncio.sleep(0)
+        assert session.error is None
+        assert adapter.upstream.sent == [mouse_sync, cursor_pos, key, pointer]
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("version,greeting,extension", [
+    ("RFB 003.008", b"RFB 003.008\n", b"\x07\x07\x80"),
+    ("RFB 003.008", b"RFB 003.008\n", b"\x06"),
+    ("RFB 055.008", b"RFB 055.008\n", b"\x06"),
+])
+def test_each_profile_refuses_what_its_client_never_sends(version, greeting, extension):
+    adapter = PassthroughAdapter(info())
+    adapter.upstream = FakeUpstream(b"\x00" * 40)
+    adapter.upstream.protocol_version = version
+
+    async def scenario():
+        session = await adapter.connect(["binary"])
+        await session.send_bytes(greeting + b"\x10" + b"A" * 48 + b"\x01")
+        await session.send_bytes(extension)
+        await asyncio.sleep(0)
+        assert session.error == "client_message_denied"
+        assert adapter.upstream.sent == []
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_unapproved_greeting_keeps_the_narrow_standard_profile():
+    from kvmhub.passthrough import client_message_profile
+
+    allowed, sizes = client_message_profile("RFB 004.001")
+    assert 7 not in allowed and 25 not in allowed
+    assert sizes[4] == 8 and sizes[5] == 6

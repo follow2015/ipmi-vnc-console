@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 REQUIRED_IGNORE_RULES = (".venv/", ".local*/", ".DS_Store", ".env", ".env.*", "*.pem", "*.key")
 SECRET_NAME = re.compile(r"(^|/)\.env(\.|$)|\.pem$|\.key$|id_(rsa|ed25519)$")
 
+SAFE_ENV_TEMPLATES = frozenset({".env.example"})
+
 
 def check_gitignore(root: Path) -> list[str]:
     path = Path(root) / ".gitignore"
@@ -27,7 +29,8 @@ def tracked_secrets(root: Path) -> list[str]:
                             capture_output=True, text=True, check=False)
     if result.returncode != 0:
         return []
-    return [name for name in result.stdout.split("\0") if name and SECRET_NAME.search(name)]
+    return [name for name in result.stdout.split("\0")
+            if name and name not in SAFE_ENV_TEMPLATES and SECRET_NAME.search(name)]
 
 
 def check_error_codes() -> list[str]:

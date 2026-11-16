@@ -37,13 +37,17 @@ class Relay:
         self.listen_host = listen_host
         self._frozen = threading.Event()
         self._stopped = threading.Event()
-        self._pairs: list[tuple[socket.socket, socket.socket]] = []
+        self._pairs: dict[int, tuple[socket.socket, socket.socket]] = {}
+        self._next_pair = 0
         self._lock = threading.Lock()
         self._listener: socket.socket | None = None
         self._threads: list[threading.Thread] = []
         self._parked: set[int] = set()
         self._pumps = 0
         self._cond = threading.Condition()
+        self.bytes_up = 0
+        self.bytes_down = 0
+        self.accepts: list[float] = []
 
     @property
     def port(self) -> int:
@@ -54,6 +58,19 @@ class Relay:
     def connections(self) -> int:
         with self._lock:
             return len(self._pairs)
+
+    @property
+    def accepted(self) -> int:
+        with self._lock:
+            return len(self.accepts)
+
+    def _retire(self, key: int) -> None:
+        with self._lock:
+            pair = self._pairs.pop(key, None)
+        if pair is None:
+            return
+        for sock in pair:
+            _shutdown(sock)
 
     def start(self) -> "Relay":
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -75,13 +92,23 @@ class Relay:
     def unfreeze(self) -> None:
         self._frozen.clear()
 
+    def close_listener(self) -> bool:
+        listener, self._listener = self._listener, None
+        if listener is None:
+            return False
+        try:
+            listener.close()
+        except OSError:
+            pass
+        return True
+
     def stop(self) -> None:
         self._stopped.set()
         self._frozen.clear()
         if self._listener is not None:
             self._listener.close()
         with self._lock:
-            pairs = list(self._pairs)
+            pairs = list(self._pairs.values())
         for near, _far in pairs:
             _shutdown(near)
 
@@ -99,13 +126,18 @@ class Relay:
             for sock in (client, far):
                 sock.settimeout(0.2)
             with self._lock:
-                self._pairs.append((client, far))
-            for source, target in ((client, far), (far, client)):
-                thread = threading.Thread(target=self._pump, args=(source, target), daemon=True)
+                key = self._next_pair
+                self._next_pair += 1
+                self._pairs[key] = (client, far)
+                self.accepts.append(time.monotonic())
+            for source, target, direction in ((client, far, "up"), (far, client, "down")):
+                thread = threading.Thread(target=self._pump, args=(source, target, direction, key),
+                                          daemon=True)
                 thread.start()
                 self._threads.append(thread)
 
-    def _pump(self, source: socket.socket, target: socket.socket) -> None:
+    def _pump(self, source: socket.socket, target: socket.socket, direction: str = "up",
+              key: int = -1) -> None:
         me = threading.get_ident()
         with self._cond:
             self._pumps += 1
@@ -136,11 +168,18 @@ class Relay:
                     target.sendall(data)
                 except OSError:
                     break
+                with self._lock:
+                    if direction == "down":
+                        self.bytes_down += len(data)
+                    else:
+                        self.bytes_up += len(data)
         finally:
             with self._cond:
                 self._pumps -= 1
                 self._parked.discard(me)
                 self._cond.notify_all()
+            if key >= 0:
+                self._retire(key)
             _shutdown(source)
             _shutdown(target)
 
@@ -155,10 +194,10 @@ class Relay:
 
     def forget_closed(self) -> int:
         with self._lock:
-            alive = [(near, far) for near, far in self._pairs if _is_open(near)]
-            dropped = len(self._pairs) - len(alive)
-            self._pairs = alive
-            return dropped
+            dead = [key for key, (near, _far) in self._pairs.items() if not _is_open(near)]
+            for key in dead:
+                self._pairs.pop(key, None)
+            return len(dead)
 
 
 def _shutdown(sock: socket.socket) -> None:

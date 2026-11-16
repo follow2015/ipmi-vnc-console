@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 
 from aiohttp import web
 
@@ -56,9 +57,13 @@ class FakeBmc:
                  version: bytes = b"RFB 055.008\n", silent: bool = False,
                  drop_after_frames: int | None = None, close_code: int = 1011,
                  abort: bool = False, stall_after_frames: int | None = None,
-                 stall_seconds: float = 0.0, resize_after_frames: int | None = None,
+                 stall_seconds: float = 0.0,
+                 resize_after_frames: int | None = None,
                  resize_to: tuple[int, int] = (640, 480),
-                 drop_connections: int = 1, server_init_after: bytes | None = None):
+                 drop_connections: int = 1, server_init_after: bytes | None = None,
+                 reset_on_burst: tuple[int, float] | None = None,
+                 swallow_short_taps: float | None = None,
+                 clock=time.monotonic):
         self.ticket, self.password = ticket, password
         self.version = version
         self.client_version: bytes | None = None
@@ -82,9 +87,17 @@ class FakeBmc:
         self.stall_seconds = stall_seconds
         self.resize_after_frames = resize_after_frames
         self.resize_to = resize_to
+        self.reset_on_burst = reset_on_burst
+        self.swallow_short_taps = swallow_short_taps
+        self._clock = clock
+        self._burst_press_times: list[float] = []
+        self._open_taps: dict[int, tuple] = {}
         self._silent_stop = asyncio.Event()
         self.ws_headers: dict[str, str] = {}
         self.client_messages: list[tuple] = []
+        self.client_messages_seen = 0
+        self.swallowed_taps = 0
+        self.burst_reset_triggered = False
         self.console_opens = 0
         self.logged_out = False
         self.response_seen: bytes | None = None
@@ -164,7 +177,10 @@ class FakeBmc:
         if self.silent:
             await self._silent_stop.wait()
             return ws
-        self.client_messages.extend(parse_client_messages(await self._recv(ws)))
+        if self._record_client_messages(
+                parse_client_messages(await self._recv(ws)), ws=ws, request=request):
+            request.transport.abort()
+            return ws
         for index in range(self.send_updates):
             if self.stall_after_frames is not None and index >= self.stall_after_frames:
                 await asyncio.sleep(self.stall_seconds)
@@ -191,8 +207,49 @@ class FakeBmc:
                 break
             if not data:
                 break
-            self.client_messages.extend(parse_client_messages(data))
+            if self._record_client_messages(
+                    parse_client_messages(data), ws=ws, request=request):
+                request.transport.abort()
+                return ws
         return ws
+
+    def _record_client_messages(self, messages: list[tuple], *, ws, request) -> bool:
+        self.client_messages_seen += len(messages)
+        if self.reset_on_burst is None and self.swallow_short_taps is None:
+            self.client_messages.extend(messages)
+            return False
+        burst = self.reset_on_burst
+        swallow_ms = self.swallow_short_taps
+        for message in messages:
+            if message[0] != "KeyEvent":
+                self.client_messages.append(message)
+                continue
+            _, down, keysym = message
+            now = self._clock()
+            if burst is not None and down:
+                count, window_ms = burst
+                cutoff = now - window_ms / 1000.0
+                self._burst_press_times = [t for t in self._burst_press_times if t >= cutoff]
+                self._burst_press_times.append(now)
+                if len(self._burst_press_times) >= count:
+                    self.burst_reset_triggered = True
+                    return True
+            if swallow_ms is None:
+                self.client_messages.append(message)
+            elif down:
+                self._open_taps[keysym] = (message, now)
+            else:
+                pending = self._open_taps.pop(keysym, None)
+                if pending is None:
+                    self.client_messages.append(message)
+                else:
+                    down_message, down_at = pending
+                    if (now - down_at) * 1000.0 < swallow_ms:
+                        self.swallowed_taps += 1
+                    else:
+                        self.client_messages.append(down_message)
+                        self.client_messages.append(message)
+        return False
 
     def _framebuffer_update(self, index: int, size: tuple[int, int] | None = None) -> bytes:
         width, height = size or (1024, 768)

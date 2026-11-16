@@ -7,21 +7,46 @@ const MOCK_JS = fs.readFileSync(mockPath, 'utf8');
 const REAL_JS = fs.readFileSync(realPath, 'utf8');
 
 function makeElement(id) {
-  return {
+  const element = {
     id,
     textContent: '',
     title: '',
+    disabled: false,
     width: 1024,
     height: 768,
     listeners: {},
     focused: false,
+    children: [],
+    attributes: {},
+    classes: new Set(),
+    style: {},
+    getBoundingClientRect() {
+      return { x: 0, y: 0, width: 1024, height: 320, top: 0, left: 0, right: 1024, bottom: 320 };
+    },
     addEventListener(type, fn) { this.listeners[type] = fn; },
     focus() { this.focused = true; },
     getContext() {
       return { fillRect() {}, fillText() {}, set fillStyle(v) {}, set font(v) {} };
     },
     cloneNode() { return makeElement(this.id); },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name)
+        ? this.attributes[name] : null;
+    },
+    appendChild(child) { this.children.push(child); return child; },
+    closest() { return null; },
   };
+  element.classList = {
+    add(name) { element.classes.add(name); },
+    remove(name) { element.classes.delete(name); },
+    contains(name) { return element.classes.has(name); },
+    toggle(name) {
+      if (element.classes.has(name)) { element.classes.delete(name); return false; }
+      element.classes.add(name); return true;
+    },
+  };
+  return element;
 }
 
 function makeStorage() {
@@ -50,7 +75,13 @@ function makeSandbox(extra, options) {
     reloads: 0,
     fetches: 0,
     fetch_urls: [],
+    notices: [],
     fetchMode: settings.fetchMode || 'ok',
+    statsBody: 'statsBody' in settings ? settings.statsBody : {
+      session: { state: 'recovering' },
+      machine: { phase: 'reconnecting' },
+      recovery: { state: 'recovering', attempts: 1, recoveries: 0, limit: 2, max_total: 3 },
+    },
     rfbs: [],
     listeners: {},
   };
@@ -59,8 +90,16 @@ function makeSandbox(extra, options) {
     TextDecoder: class { decode() { return 'ok'; } },
     TextEncoder: class { encode() { return new Uint8Array(0); } },
     fetch: (url) => {
+      const target = String(url);
+      if (target === '/_platform/meta') {
+        return Promise.resolve({ ok: true, status: 200,
+          json: async () => ({ address: '192.0.2.11' }) });
+      }
       state.fetches += 1;
-      state.fetch_urls.push(String(url));
+      state.fetch_urls.push(target);
+      if (target === '/_platform/stats') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => state.statsBody || {} });
+      }
       if (state.fetchMode === 'unauthorized') {
         return Promise.resolve({ ok: false, status: 401, json: async () => ({}) });
       }
@@ -76,6 +115,8 @@ function makeSandbox(extra, options) {
         if (sel === '#close') return closeButton;
         return makeElement(sel);
       },
+      querySelectorAll() { return []; },
+      createElement(tag) { return makeElement(tag); },
       getElementById(id) { return elements[id] || makeElement(id); },
       title: '',
     },
@@ -88,6 +129,8 @@ function makeSandbox(extra, options) {
     sessionStorage: storage,
     setTimeout(fn, ms) { timers.push({ fn, ms, cancelled: false, fired: false }); return timers.length; },
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cancelled = true; },
+    setInterval() { return 0; },
+    clearInterval() {},
     addEventListener(type, fn) { state.listeners[type] = fn; },
   };
   Object.assign(sandbox, extra);
@@ -97,11 +140,27 @@ function makeSandbox(extra, options) {
 }
 
 function firePendingTimer(state) {
-  const timer = state.timers.find((entry) => !entry.cancelled && !entry.fired);
-  if (!timer) return null;
+  const pending = state.timers.filter((entry) => !entry.cancelled && !entry.fired);
+  if (!pending.length) return null;
+  pending.sort((a, b) => a.ms - b.ms);
+  const timer = pending[0];
   timer.fired = true;
   timer.fn();
   return timer.ms;
+}
+
+function drainUntilReload(state, limit) {
+  const maximum = limit || 20;
+  for (let i = 0; i < maximum; i += 1) {
+    const before = state.reloads;
+    const delay = firePendingTimer(state);
+    if (delay === null) return null;
+    if (state.notices && String(state.status.textContent).includes('重建')) {
+      state.notices.push(state.status.textContent);
+    }
+    if (state.reloads > before) return delay;
+  }
+  return null;
 }
 
 function wsClass(sockets) {
@@ -194,15 +253,20 @@ async function runReal() {
     rfb.emit('failed');
     rfb.emit('disconnected');
     healthStates.push(sandbox.__kvm_health.state);
-    const delay = firePendingTimer(state);
+    const delay = drainUntilReload(state);
     if (delay === null) break;
     delays.push(delay);
     load(); // the reload produced a new document with the same sessionStorage
     await flush();
+    if (String(state.status.textContent).includes('重建')) {
+      state.notices.push(state.status.textContent);
+    }
   }
   const last = state.rfbs[state.rfbs.length - 1];
   return {
     delays,
+    notices: state.notices,
+    stats_polls: state.fetch_urls.filter((url) => url === '/_platform/stats').length,
     health_states: healthStates,
     reloads: state.reloads,
     total_rfbs: state.rfbs.length,

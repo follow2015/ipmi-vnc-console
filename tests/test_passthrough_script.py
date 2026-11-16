@@ -467,3 +467,27 @@ def test_caps_state_is_off_when_the_plain_key_stays_short():
 
 def test_caps_state_is_unknown_without_a_calibration():
     assert probe_report({"changed": True}, None)["caps_lock"] == "unknown"
+
+
+def test_a_merged_glyph_run_is_not_reported_as_lost_keystrokes():
+    probe = {"changed": True, "expected_chars": 4,
+             "echo": {"groups": 2, "cells": [
+                 {"x": 10, "width": 9, "top": 2, "bottom": 12, "ink": 30},
+                 {"x": 19, "width": 26, "top": 2, "bottom": 12, "ink": 70},
+             ]}}
+    report = probe_report(probe, None)
+    assert report["verdict"] == "unknown"
+    assert "glyphs_merged_not_lost" in report["notes"]
+    assert probe_ok(report) is False, "an unmeasurable frame must not pass as correct"
+
+
+def test_evenly_spaced_glyphs_with_one_missing_still_read_as_partial():
+    probe = {"changed": True, "expected_chars": 4,
+             "echo": {"groups": 3, "cells": [
+                 {"x": 10, "width": 10, "top": 2, "bottom": 12, "ink": 30},
+                 {"x": 20, "width": 10, "top": 2, "bottom": 12, "ink": 30},
+                 {"x": 30, "width": 10, "top": 2, "bottom": 12, "ink": 30},
+             ]}}
+    report = probe_report(probe, None)
+    assert report["verdict"] == "partial"
+    assert "fewer_glyphs_than_sent" in report["notes"]

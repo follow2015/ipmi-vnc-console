@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes
 
 from kvmhub.adapter import MockAdapter
 from kvmhub.common import Problem, server_tls
+from kvmhub.telemetry import audit_evidence
 from kvmhub.worker import Gateway, Runtime
 from tools.bootstrap import generate
 
@@ -113,4 +114,9 @@ async def test_reconnect_grace_really_finishes_and_reports(local):
     task = sess.idle_task
     await asyncio.wait_for(task, 1)
     assert cleaned and sess.sid not in gateway.sessions
-    assert reports == [("finish", {"cleanup": "confirmed", "reason": "client_closed"})]
+    assert len(reports) == 1
+    operation, body = reports[0]
+    assert operation == "finish"
+    assert body["cleanup"] == "confirmed" and body["reason"] == "client_closed"
+    assert body["evidence"] == audit_evidence(body["evidence"])
+    assert "sid" not in body["evidence"] and "started_at" not in body["evidence"]

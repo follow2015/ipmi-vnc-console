@@ -14,6 +14,20 @@ const { chromium } = require(PW);
 const MAX_ACTIONS = 2000;
 const MAX_WAIT_MS = 600000;
 
+const ensureInputOpen = async (page) => {
+  await page.evaluate(() => {
+    const panel = document.getElementById('inputpanel');
+    if (panel && panel.classList.contains('collapsed')) {
+      const toggle = document.getElementById('input-toggle');
+      if (toggle) toggle.click();
+    }
+  });
+  await page.waitForFunction(() => {
+    const key = document.querySelector('#softkey [data-send]');
+    return !!key && !key.disabled;
+  }, null, { timeout: 20000 });
+};
+
 const shot = async (page, name) => {
   if (!SHOTS) return;
   const file = (ATTEMPT > 1 ? 'a' + ATTEMPT + '-' : '') + name;
@@ -203,8 +217,53 @@ const shot = async (page, name) => {
         note({ action: label, held_ms: ms });
       } else if (action.click !== undefined) {
         const [x, y] = action.click.map(Number);
-        await consolePage.locator('#screen').click({ position: { x, y } });
-        note({ action: label });
+        const target = await consolePage.evaluate(([fx, fy]) => {
+          const screen = document.getElementById('screen');
+          const box = screen.getBoundingClientRect();
+          return {
+            x: box.left + ((fx + 0.5) * box.width) / screen.width,
+            y: box.top + ((fy + 0.5) * box.height) / screen.height,
+            scale: box.width / screen.width,
+          };
+        }, [x, y]);
+        await consolePage.mouse.click(target.x, target.y);
+        note({ action: label, framebuffer: [x, y], scale: Number(target.scale.toFixed(3)) });
+      } else if (action.softkey !== undefined) {
+        await ensureInputOpen(consolePage);
+        const tokens = Array.isArray(action.softkey) ? action.softkey : [action.softkey];
+        const outcome = await consolePage.evaluate(async (wanted) => {
+          const buttons = Array.from(document.querySelectorAll('#softkey [data-send]'));
+          const missing = [];
+          for (const token of wanted) {
+            const button = buttons.find((item) => item.getAttribute('data-send') === token);
+            if (!button) { missing.push('missing:' + token); continue; }
+            if (button.disabled) { missing.push('disabled:' + token); continue; }
+            button.click();
+            await new Promise((resolve) => setTimeout(resolve, 60));
+          }
+          const status = document.getElementById('sk-status');
+          return {
+            clicked: wanted.length - missing.length,
+            problems: missing,
+            status: status ? String(status.textContent) : '',
+          };
+        }, tokens.map(String));
+        note({ action: label, clicked: outcome.clicked, problems: outcome.problems,
+               sk_status: outcome.status });
+      } else if (action.macro !== undefined) {
+        await ensureInputOpen(consolePage);
+        const wanted = String(action.macro);
+        const outcome = await consolePage.evaluate(async (wantedLabel) => {
+          const buttons = Array.from(document.querySelectorAll('#sk-macros button'));
+          const button = buttons.find((item) => item.textContent.trim() === wantedLabel);
+          if (!button) return { clicked: false, status: 'macro not found' };
+          if (button.disabled) return { clicked: false, status: 'macro disabled' };
+          button.click();
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          const status = document.getElementById('sk-status');
+          return { clicked: true, status: status ? String(status.textContent) : '' };
+        }, wanted);
+        note({ action: label, clicked: outcome.clicked, sk_status: outcome.status });
       } else if (action.shot !== undefined) {
         await shot(consolePage, String(action.shot));
         const size = await consolePage.evaluate(() => {

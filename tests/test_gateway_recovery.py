@@ -95,7 +95,33 @@ async def test_the_rebuild_is_bounded_by_the_session_budget(server):
     assert session.closed is False
     assert session.recovery.recoveries == 2, "the budget, not the attempts, is the limit"
     assert server.console_opens == 3, "initial console plus two rebuilds"
-    assert session.error in ("upstream_closed", "upstream_unavailable")
+    assert session.recovery.state == "given_up"
+    assert session.error == "upstream_reconnect_failed"
+    await session.close()
+    await upstream.close()
+
+
+def test_the_budget_reason_is_only_used_when_a_budget_ran_out():
+    spent = RecoveryState(RecoveryPolicy(attempts=2, max_total=1))
+    assert spent.budget_spent() is False, "nothing rebuilt yet"
+    spent.begin()
+    spent.succeed(640)
+    assert spent.budget_spent() is True
+    assert RecoveryState(RecoveryPolicy(attempts=0)).budget_spent() is False, \
+        "recovery disabled is not the same as the budget being spent"
+    unretryable = RecoveryState(RecoveryPolicy(attempts=2, max_total=3))
+    assert unretryable.may_try("bmc_auth_failed") is False
+    assert unretryable.budget_spent() is False, "dead web session, budget untouched"
+
+
+async def test_a_session_with_no_recovery_policy_keeps_the_transport_reason(server):
+    policy = RecoveryPolicy(attempts=0, max_total=0)
+    upstream, session, version = await session_on(server, policy)
+    await complete_browser_side(session, version)
+
+    await read_until(session, lambda messages: False)
+    assert session.error != "upstream_reconnect_failed"
+    assert session.recovery.state == "relaying"
     await session.close()
     await upstream.close()
 

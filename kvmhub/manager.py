@@ -10,8 +10,10 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .common import (INTERNAL_PORT, TRACE_ID, UI_PORT, WORKER_PORT, Problem,
-                     digest, end_reason_message, issue, secret_matches, user_message, verify)
+from .common import (TRACE_ID, UI_PORT, WORKER_FORM_ACTION, Problem, digest,
+                     end_reason_message, issue, secret_matches, user_message,
+                     worker_accept_url)
+from .internal_api import create_app as create_internal_app
 from .store import Store
 
 LOGIN = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>KVM Hub</title>
@@ -53,7 +55,6 @@ def build_apps(cfg, store=None):
             store.close()
 
     ui = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-    internal = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
     def install(app, expected_host):
         @app.middleware("http")
@@ -66,7 +67,7 @@ def build_apps(cfg, store=None):
             response = await call_next(request)
             response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "strict-origin",
                                      "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
-                                     "Content-Security-Policy": f"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action https://*.kvm.localhost:{WORKER_PORT}",
+                                     "Content-Security-Policy": f"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action {WORKER_FORM_ACTION}",
                                      "X-Trace-ID": request.state.trace})
             return response
 
@@ -76,7 +77,6 @@ def build_apps(cfg, store=None):
                                  "trace_id": request.state.trace}, status_code=exc.status)
 
     install(ui, f"localhost:{UI_PORT}")
-    install(internal, f"localhost:{INTERNAL_PORT}")
 
     def user(request, mutate=False):
         cookie = request.cookies.get("__Host-manager_sid", "")
@@ -87,10 +87,6 @@ def build_apps(cfg, store=None):
                        or not secrets.compare_digest(request.headers.get("x-csrf-token", ""), auth["csrf"])):
             raise Problem("csrf_rejected", 403)
         return auth
-
-    def worker_auth(request):
-        if not secret_matches(request.headers.get("x-worker-proof", ""), cfg["worker_proof_hash"]):
-            raise Problem("worker_authentication_failed", 403)
 
     async def payload(request):
         if request.headers.get("content-length", "0").isdigit() and int(request.headers.get("content-length", "0")) > 16384:
@@ -187,7 +183,7 @@ def build_apps(cfg, store=None):
                 store.event(auth["user"], "request_denied", detail={"code": exc.code}, trace=request.state.trace)
             raise
         return {"id": row["id"], "ticket": issue(private, row, store.clock(), trace=request.state.trace),
-                "accept_url": f'https://w1-{row["id"]}.kvm.localhost:{WORKER_PORT}/_platform/accept'}
+                "accept_url": worker_accept_url(cfg["worker_id"], row["id"])}
 
     @ui.get("/api/sessions/{sid}")
     async def status(sid: str, request: Request):
@@ -208,21 +204,6 @@ def build_apps(cfg, store=None):
         user(request)
         return [dict(r) for r in store.db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 100")]
 
-    @internal.post("/internal/v1/sessions/{sid}/{operation}")
-    async def worker_api(sid: str, operation: str, request: Request):
-        worker_auth(request)
-        body = await payload(request)
-        if operation == "exchange":
-            claims = verify(public, body.get("ticket", ""), cfg["worker_id"], cfg["instance_id"])
-            if claims["sid"] != sid:
-                raise Problem("invalid_ticket", 403)
-            return store.exchange(claims, request.state.trace)
-        if operation in ("active", "renew"):
-            return store.renew(sid, cfg["worker_id"], cfg["instance_id"], operation == "active", trace=request.state.trace)
-        if operation == "finish":
-            store.finish(sid, cfg["worker_id"], cfg["instance_id"], body.get("cleanup"), body.get("reason"), trace=request.state.trace)
-            return {"ok": True}
-        raise Problem("unknown_operation", 404)
-
+    internal = create_internal_app(cfg, store)
     ui.state.store = store
     return ui, internal

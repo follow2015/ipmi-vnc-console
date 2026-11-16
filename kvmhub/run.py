@@ -12,6 +12,8 @@ from .common import (BMC_PORT, INTERNAL_PORT, UI_ORIGIN, UI_PORT, WORKER_PORT,
 
 
 def manager_process(path):
+    from aiohttp import web
+
     from .manager import build_apps
     cfg = config(path)
     ui, internal = build_apps(cfg)
@@ -20,10 +22,15 @@ def manager_process(path):
         common = dict(host="127.0.0.1", ssl_certfile=cfg["server_cert"], ssl_keyfile=cfg["server_key"],
                       access_log=False, log_level="warning", proxy_headers=False)
         public = uvicorn.Server(uvicorn.Config(ui, port=UI_PORT, **common))
-        import ssl
-        private = uvicorn.Server(uvicorn.Config(internal, port=INTERNAL_PORT, ssl_ca_certs=cfg["ca"],
-                                               ssl_cert_reqs=ssl.CERT_REQUIRED, **common))
-        await asyncio.gather(public.serve(), private.serve())
+        runner = web.AppRunner(internal, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", INTERNAL_PORT,
+                           ssl_context=server_tls(cfg["server_cert"], cfg["server_key"], cfg["ca"]))
+        await site.start()
+        try:
+            await public.serve()
+        finally:
+            await runner.cleanup()
     asyncio.run(serve())
 
 

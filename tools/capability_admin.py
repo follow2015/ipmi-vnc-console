@@ -76,7 +76,8 @@ def cmd_register(store, args) -> int:
              "firmware_min": args.firmware_min or "", "firmware_max": args.firmware_max or "",
              "models": [item for item in (args.models or "").split(",") if item.strip()],
              "protocol_versions": [item.strip() for item in
-                                   (args.protocol_versions or "").split(",") if item.strip()]}
+                                   (args.protocol_versions or "").split(",") if item.strip()],
+             "input_shaping": args.input_shaping or None}
     row = store.register_capability(entry, args.actor, args.why or "")
     print(f"registered {row['id']} as draft; it cannot be exchanged until approved")
     return 0
@@ -143,6 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--models", default="", help="comma separated accepted model strings")
     register.add_argument("--protocol-versions", default="",
                           help="comma separated RFB greetings approved for this firmware family")
+    register.add_argument("--input-shaping", default="",
+                          help='optional JSON policy, e.g. \'{"min_hold_ms":50,"max_keys_per_s":50}\'')
     register.add_argument("--actor", required=True)
     register.add_argument("--why", default="")
 

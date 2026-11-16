@@ -81,6 +81,27 @@ def parse_protocol_versions(raw) -> tuple[str, ...] | None:
     return tuple(parsed)
 
 
+def parse_input_shaping(raw) -> dict | None:
+    from .input_shaping import InputShapingConfig
+
+    config = InputShapingConfig.parse(raw)
+    return config.as_dict() if config is not None else None
+
+
+def parse_logout_path(raw) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("logout_path must be a string")
+    value = raw.strip()
+    if not value:
+        return None
+    if (len(value) > 128 or not value.startswith("/") or "?" in value or "#" in value
+            or "//" in value or any(part in (".", "..") for part in value.split("/"))):
+        raise ValueError("logout_path must be an absolute path without query, fragment or dot segments")
+    return value
+
+
 def window_parses(entry) -> bool:
     low = str(entry.get("firmware_min") or "").strip()
     high = str(entry.get("firmware_max") or "").strip()

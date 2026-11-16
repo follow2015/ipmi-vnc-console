@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
 from .common import PASSTHROUGH_ADAPTER_ID, Problem
+from .telemetry import audit_evidence
 
 
 SCHEMA = """
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS adapter_capability (
  approved_at REAL NOT NULL DEFAULT 0, effective_from REAL NOT NULL DEFAULT 0,
  review_due REAL NOT NULL DEFAULT 0, status_reason TEXT NOT NULL DEFAULT '',
  revision INTEGER NOT NULL DEFAULT 0,
- protocol_versions TEXT NOT NULL DEFAULT '[]');
+ protocol_versions TEXT NOT NULL DEFAULT '[]',
+ input_shaping TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS asset (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, vendor TEXT NOT NULL, model TEXT NOT NULL,
  firmware TEXT NOT NULL, capability_id TEXT NOT NULL REFERENCES adapter_capability(id),
@@ -62,12 +64,17 @@ CAPABILITY_COLUMNS = {
     "status_reason": "TEXT NOT NULL DEFAULT ''",
     "revision": "INTEGER NOT NULL DEFAULT 0",
     "protocol_versions": "TEXT NOT NULL DEFAULT '[]'",
+    "input_shaping": "TEXT NOT NULL DEFAULT '{}'",
+    "logout_path": "TEXT NOT NULL DEFAULT ''",
 }
+
+SESSION_COLUMNS = {"end_evidence": "TEXT"}
 
 END_REASONS = ("client_closed", "revoked", "capability_withdrawn", "upstream_error",
                "upstream_unresponsive", "lease_expired", "login_failed", "worker_shutdown",
                "exchange_failed",
                "client_message_denied", "client_message_malformed",
+               "input_overflow",
                "upstream_reconnect_failed")
 
 
@@ -87,10 +94,12 @@ class Store:
         self.passthrough_targets = frozenset(passthrough_targets)
 
     def _migrate(self):
-        present = {row["name"] for row in self.db.execute("PRAGMA table_info(adapter_capability)")}
-        for name, ddl in CAPABILITY_COLUMNS.items():
-            if name not in present:
-                self.db.execute(f"ALTER TABLE adapter_capability ADD COLUMN {name} {ddl}")
+        for table, columns in (("adapter_capability", CAPABILITY_COLUMNS),
+                               ("session", SESSION_COLUMNS)):
+            present = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in columns.items():
+                if name not in present:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def close(self):
         self.db.close()
@@ -141,6 +150,16 @@ class Store:
         if declared is None:
             raise Problem("capability_incomplete", 400)
         values["protocol_versions"] = json.dumps(list(declared))
+        try:
+            shaping = capability.parse_input_shaping(entry.get("input_shaping"))
+        except ValueError:
+            raise Problem("capability_incomplete", 400) from None
+        values["input_shaping"] = json.dumps(shaping) if shaping else "{}"
+        try:
+            logout_path = capability.parse_logout_path(entry.get("logout_path"))
+        except ValueError:
+            raise Problem("capability_incomplete", 400) from None
+        values["logout_path"] = logout_path or ""
         if not cid or not all((values["vendor"], values["model"], values["adapter"])):
             raise Problem("capability_incomplete", 400)
         if not capability.window_parses(values):
@@ -150,11 +169,12 @@ class Store:
         self.db.execute(
             "INSERT INTO adapter_capability(id,vendor,model,firmware,adapter,status,expires,evidence,"
             "approver,console_impl,licence,concurrency_limit,models,firmware_min,firmware_max,"
-            "protocol_versions,approved_at,effective_from,review_due,status_reason,revision) "
-            "VALUES(?,?,?,?,?,'draft',0,'','','','',1,?,?,?,?,0,0,0,'',0)",
+            "protocol_versions,input_shaping,logout_path,approved_at,effective_from,review_due,"
+            "status_reason,revision) "
+            "VALUES(?,?,?,?,?,'draft',0,'','','','',1,?,?,?,?,?,?,0,0,0,'',0)",
             (values["id"], values["vendor"], values["model"], values["firmware"], values["adapter"],
              values["models"], values["firmware_min"], values["firmware_max"],
-             values["protocol_versions"]))
+             values["protocol_versions"], values["input_shaping"], values["logout_path"]))
         self.event(actor, "capability_registered",
                    detail={"capability": cid, "adapter": values["adapter"], "rationale": rationale})
 
@@ -271,9 +291,19 @@ class Store:
         if reason is None and not self._adapter_allowed(asset | {"adapter": cap["adapter"]}):
             reason = "adapter_not_enabled"
         declared = capability.parse_protocol_versions(cap["protocol_versions"]) if cap else ()
+        try:
+            shaping = capability.parse_input_shaping(cap["input_shaping"]) if cap else None
+        except (ValueError, KeyError):
+            shaping = None
+        try:
+            logout_path = capability.parse_logout_path(cap["logout_path"]) if cap else None
+        except (ValueError, KeyError):
+            logout_path = None
         allowed = asset | {"adapter": cap["adapter"] if cap else "",
                            "cap_expires": cap["expires"] if cap else 0.0,
-                           "protocol_versions": declared or ()}
+                           "protocol_versions": declared or (),
+                           "logout_path": logout_path,
+                           "input_shaping": shaping}
         return allowed, reason
 
     def seed_mock(self, target: str, fingerprint: str, username: str, password: str):
@@ -303,13 +333,17 @@ class Store:
                          model: str = "X10DRT-PS / SA5248M4", firmware: str = "8.78",
                          capability_id: str = "supermicro-x10-passthrough",
                          protocol_versions: tuple[str, ...] = (),
+                         input_shaping: dict | None = None,
+                         logout_path: str | None = None,
                          evidence: str = "docs/implementation/evidence/real-bmc-kvm-phase2-20261111.json") -> None:
         assert self.cipher is not None, "seeding credentials requires the encryption key"
         with self.tx():
             if not self.db.execute("SELECT 1 FROM adapter_capability WHERE id=?", (capability_id,)).fetchone():
                 self._register({"id": capability_id, "vendor": vendor, "model": model,
                                 "firmware": firmware, "adapter": PASSTHROUGH_ADAPTER_ID,
-                                "protocol_versions": list(protocol_versions)},
+                                "protocol_versions": list(protocol_versions),
+                                **({"input_shaping": input_shaping} if input_shaping else {}),
+                                **({"logout_path": logout_path} if logout_path else {})},
                                "local-bootstrap")
             self._approve(capability_id, actor="local-bootstrap", approver=approver,
                           evidence=evidence, licence="未取得厂商书面许可；仅同源代理转发，不分发",
@@ -323,6 +357,34 @@ class Store:
                              fingerprint, encrypted))
             self.db.execute("INSERT OR REPLACE INTO access_grant VALUES(?,?,?)",
                             ("local-admin", asset_id, self.clock() + 86400))
+
+    def register_asset(self, *, asset_id: str, name: str, vendor: str, model: str,
+                       firmware: str, capability_id: str, target: str, fingerprint: str,
+                       username: str, password: str, user_id: str,
+                       grant_ttl: float = 86400 * 30, actor: str = "platform-sync") -> None:
+        if self.cipher is None:
+            raise Problem("credential_unavailable", 503)
+        if not all((asset_id, name, capability_id, target, user_id)):
+            raise Problem("capability_incomplete", 400)
+        digest = str(fingerprint or "").replace(":", "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise Problem("fingerprint_invalid", 400)
+        if self.db.execute("SELECT 1 FROM adapter_capability WHERE id=? AND status='verified'",
+                           (capability_id,)).fetchone() is None:
+            raise Problem("adapter_not_verified", 403)
+        nonce = secrets.token_bytes(12)
+        encrypted = nonce + self.cipher.encrypt(
+            nonce, json.dumps({"username": username, "password": password}).encode(),
+            asset_id.encode())
+        with self.tx():
+            self.db.execute("INSERT OR REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
+                            (asset_id, name, vendor, model, firmware, capability_id,
+                             target, digest, encrypted))
+            self.db.execute("INSERT OR REPLACE INTO access_grant VALUES(?,?,?)",
+                            (user_id, asset_id, self.clock() + grant_ttl))
+            self.event(actor, "data_plane_asset_imported",
+                       detail={"asset": asset_id, "capability": capability_id,
+                               "user": user_id, "target": target})
 
     def assets(self, user):
         return [dict(r) for r in self.db.execute(
@@ -392,6 +454,23 @@ class Store:
             self.event(user, "session_requested", sid, trace=trace)
         return self.get(sid)
 
+    def pending_cleanups(self, now=None, *, threshold=300.0) -> list[dict]:
+        current = self.clock() if now is None else now
+        rows = self.db.execute(
+            "SELECT s.id, s.worker_id, s.asset_id, s.reason, s.created, "
+            "  (SELECT MAX(a.ts) FROM audit a WHERE a.session_id=s.id "
+            "   AND a.action='session_finished') AS ended "
+            "FROM session s WHERE s.cleanup='pending' "
+            "AND s.status IN ('closed','failed','lost')").fetchall()
+        out = []
+        for row in rows:
+            since = row["ended"] if row["ended"] is not None else row["created"]
+            age = max(0.0, current - since)
+            out.append({"sid": row["id"], "worker_id": row["worker_id"],
+                        "asset_id": row["asset_id"], "reason": row["reason"],
+                        "age_s": round(age, 1), "overdue": age >= threshold})
+        return sorted(out, key=lambda item: item["age_s"], reverse=True)
+
     def release_confirmed(self, sid):
         row = self.get(sid)
         if row["status"] in ("closed", "failed", "lost") and row["cleanup"] in ("confirmed", "not_needed"):
@@ -417,7 +496,9 @@ class Store:
             result = {"target": asset["target"], "fingerprint": asset["fingerprint"],
                       "adapter": asset["adapter"], "lease_seconds": lease-now,
                       "hard_until": row["hard_until"],
-                      "protocol_versions": list(asset["protocol_versions"])}
+                      "protocol_versions": list(asset["protocol_versions"]),
+                      "input_shaping": asset.get("input_shaping"),
+                      "logout_path": asset.get("logout_path")}
         try:
             if self.cipher is None:
                 raise ValueError("this store was opened without the credential key")
@@ -474,9 +555,11 @@ class Store:
                 self.event(worker, "session_active", sid, trace=trace)
         return {"lease_seconds": until - now}
 
-    def finish(self, sid, worker, instance, cleanup, reason, trace=None):
+    def finish(self, sid, worker, instance, cleanup, reason, trace=None, evidence=None):
         if cleanup not in ("confirmed", "pending", "not_needed") or reason not in END_REASONS:
             raise Problem("invalid_report", 400)
+        summary = audit_evidence(evidence)
+        stored = json.dumps(summary, separators=(",", ":")) if summary else None
         with self.tx():
             row = self.worker_row(sid, worker, instance)
             if cleanup == "not_needed" and (reason != "exchange_failed" or row["status"] in ("active", "closing")):
@@ -485,19 +568,25 @@ class Store:
             effective = "confirmed" if row["cleanup"] == "confirmed" else cleanup
             if row["reason"] == "capability_withdrawn" and reason == "revoked":
                 reason = "capability_withdrawn"
-            self.db.execute("UPDATE session SET status=?,cleanup=?,reason=?,version=version+1 WHERE id=?",
-                            (status, effective, reason, sid))
-            self.event(worker, "session_finished", sid, {"cleanup": effective, "reason": reason}, trace=trace)
+            self.db.execute("UPDATE session SET status=?,cleanup=?,reason=?,"
+                            "end_evidence=COALESCE(end_evidence,?),version=version+1 WHERE id=?",
+                            (status, effective, reason, stored, sid))
+            detail = {"cleanup": effective, "reason": reason}
+            if summary:
+                detail["evidence"] = summary
+            self.event(worker, "session_finished", sid, detail, trace=trace)
             self.release_confirmed(sid)
 
-    def confirm_cleanup(self, sid, user, trace):
+    def confirm_cleanup(self, sid, user, trace, *, manage=False):
         with self.tx():
-            row = self.owned(sid, user)
+            row = self.get(sid) if manage else self.owned(sid, user)
             if row["cleanup"] != "pending" or row["status"] not in ("closed", "failed", "lost"):
                 raise Problem("cleanup_not_pending", 409)
             self.db.execute("UPDATE session SET cleanup='confirmed',reason='manual_release',"
                             "version=version+1 WHERE id=?", (sid,))
-            self.event(user, "manual_slot_release", sid, {"previous": "pending"}, trace=trace)
+            self.event(user, "manual_slot_release", sid,
+                       {"previous": "pending", "scope": "manage" if manage else "owner"},
+                       trace=trace)
             self.release_confirmed(sid)
 
     def revoke(self, sid, user, trace):
@@ -527,4 +616,6 @@ class Store:
 
     def public(self, sid, user):
         row = self.owned(sid, user)
-        return {k: row[k] for k in ("id", "asset_id", "status", "cleanup", "reason", "created", "hard_until")}
+        result = {k: row[k] for k in ("id", "asset_id", "status", "cleanup", "reason", "created", "hard_until")}
+        result["end_evidence"] = json.loads(row["end_evidence"]) if row["end_evidence"] else None
+        return result

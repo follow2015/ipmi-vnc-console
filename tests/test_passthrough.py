@@ -7,6 +7,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
+from kvmhub.telemetry import audit_evidence, upstream_shape
 from kvmhub.passthrough import (
     CHALLENGE_BYTES,
     INSYDE_CLIENT_MESSAGES,
@@ -18,6 +19,7 @@ from kvmhub.passthrough import (
     ClientMessageError,
     ClientMessageFramer,
     RfbPassthroughSession,
+    client_message_profile,
 )
 
 VERSION = b"RFB 055.008\n"
@@ -463,6 +465,33 @@ def test_forwarded_types_are_counted_and_payloads_are_not_kept():
     assert framer.key_events == 2
 
 
+def test_message_profile_follows_the_negotiated_greeting():
+    insyde, insyde_sizes = client_message_profile("RFB 003.008")
+    assert 25 in insyde and 7 not in insyde
+    assert (insyde_sizes[4], insyde_sizes[5], insyde_sizes[25]) == (18, 18, 1)
+    smc, smc_sizes = client_message_profile("RFB 055.008")
+    assert 7 in smc and 25 in smc
+    assert (smc_sizes[4], smc_sizes[5], smc_sizes[7], smc_sizes[25]) == (18, 18, 3, 1)
+    standard, standard_sizes = client_message_profile(None)
+    assert 7 not in standard and 25 not in standard
+    assert standard_sizes[4] == 8
+    assert client_message_profile("RFB 004.001") == (standard, standard_sizes)
+    smc_sizes[7] = 99
+    assert client_message_profile("RFB 055.008")[1][7] == 3
+
+
+def test_smc_profile_reframes_a_whole_client_sequence_without_drift():
+    allowed, sizes = client_message_profile("RFB 055.008")
+    framer = ClientMessageFramer(allowed, sizes=sizes)
+    sequence = (b"\x03\x00" + b"\x00" * 8
+                + b"\x07\x07\x80" + b"\x19"
+                + b"\x04\x00\x01\x00\x00\x00\x00\x00\xe1" + b"\x00" * 9
+                + b"\x05\x00\x04\x00\x64\x00\xc8" + b"\x00" * 11)
+    assert framer.feed(sequence) == sequence
+    assert framer.client_types == {3: 1, 7: 1, 25: 1, 4: 1, 5: 1}
+    assert framer.key_events == 1
+
+
 def test_the_type_summary_survives_a_session_surface_check():
     session = RfbPassthroughSession(FakeUpstream(), BrowserHandshake(server_init_bytes()))
     session._framer.feed(fb_request())
@@ -482,6 +511,11 @@ def test_session_ends_and_forwards_nothing_on_a_denied_client_message():
         await session.send_bytes(KEY + b"\x06\x00\x00\x00\x00\x00\x00\x01x")
         assert session.error == "client_message_denied"
         assert session.denied == {"kind": 6, "length": 9}
+        assert session.as_dict()["denied"] == {"kind": 6, "length": 9}
+        shape = upstream_shape(session)
+        assert shape["denied"] == {"kind": 6, "length": 9}
+        assert audit_evidence(shape)["denied"] == {"kind": 6, "length": 9}
+        assert "x" not in json.dumps(audit_evidence(shape))
         assert session.client_key_events == 1
         assert session.closed
         assert upstream.sent == []

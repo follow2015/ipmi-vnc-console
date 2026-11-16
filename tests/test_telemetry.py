@@ -60,8 +60,10 @@ def test_evidence_never_copies_a_payload_even_when_the_relay_offers_one():
                            "cleanup", "connections", "reconnects", "upstream_close_code",
                            "client_bytes", "server_bytes", "key_events", "client_message_types",
                            "client_message_summary", "denied", "peak_buffered_bytes",
+                           "exception_type", "since_last_rx_s",
                            "recoveries", "recovery_attempts", "recovery_last_error",
-                           "recovery_latency_ms", "dropped_input"}
+                           "recovery_latency_ms", "dropped_input",
+                           "recovery_input_replayed", "recovery_input_dropped"}
 
 
 def test_a_relay_that_cannot_describe_itself_still_produces_a_record():
@@ -142,7 +144,7 @@ class _Recovering(_Relay):
     def as_dict(self):
         return dict(super().as_dict(), recoveries=2, recovery_attempts=3,
                     recovery_last_error="upstream_closed", recovery_latency_ms=650,
-                    dropped_input=4)
+                    dropped_input=4, recovery_input_replayed=1, recovery_input_dropped=0)
 
 
 def test_a_rebuilt_session_records_how_often_it_was_rebuilt():
@@ -153,6 +155,33 @@ def test_a_rebuilt_session_records_how_often_it_was_rebuilt():
     assert record["recovery_last_error"] == "upstream_closed"
     assert record["recovery_latency_ms"] == 650
     assert record["dropped_input"] == 4
+
+
+def test_a_key_release_held_across_a_rebuild_is_counted_apart_from_drops():
+    telemetry = SessionTelemetry()
+    telemetry.note_connection(_Recovering())
+    record = telemetry.evidence(sid="2" * 32, reason="client_closed", cleanup="confirmed")
+    assert record["recovery_input_replayed"] == 1
+    assert record["recovery_input_dropped"] == 0
+
+
+def test_a_pending_cleanup_carries_the_reason_it_stayed_pending():
+    telemetry = SessionTelemetry()
+    telemetry.note_connection(_Recovering())
+    telemetry.cleanup_outcome = "status_401"
+    record = telemetry.evidence(sid="3" * 32, reason="upstream_reconnect_failed",
+                                cleanup="pending")
+    assert record["cleanup_outcome"] == "status_401"
+    assert "cleanup_outcome" not in SessionTelemetry().evidence(
+        sid="4" * 32, reason="lease_expired", cleanup="confirmed")
+
+
+def test_a_cleanup_reason_that_is_prose_is_dropped_not_stored():
+    telemetry = SessionTelemetry()
+    telemetry.note_connection(_Recovering())
+    telemetry.cleanup_outcome = "logout refused: session 12345 expired at 10.0.0.1"
+    record = telemetry.evidence(sid="5" * 32, reason="upstream_error", cleanup="pending")
+    assert "cleanup_outcome" not in record
 
 
 def test_a_relay_cannot_smuggle_text_through_the_recovery_error_field():

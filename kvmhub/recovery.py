@@ -85,6 +85,9 @@ class RecoveryState:
             return False
         return retryable(error, close_code)
 
+    def budget_spent(self) -> bool:
+        return self.policy.attempts > 0 and self.recoveries >= self.policy.max_total
+
     def begin(self) -> None:
         self.episodes += 1
         self.state = "recovering"

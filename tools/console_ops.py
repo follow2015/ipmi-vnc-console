@@ -6,6 +6,7 @@ import base64
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,15 +23,25 @@ from tools.browser_e2e import _find_chromium, _find_playwright  # noqa: E402
 from tools.passthrough_check import wait_port  # noqa: E402
 
 
+def parse_versions(raw: str) -> tuple[str, ...]:
+    versions = tuple(part.strip() for part in raw.split(",") if part.strip())
+    for version in versions:
+        if not re.fullmatch(r"RFB \d{3}\.\d{3}", version):
+            raise SystemExit(f"--protocol-versions expects 'RFB 003.008', got {version!r}")
+    return versions
+
+
 def prepare(directory: Path, host: str, fingerprint: str, username: str, password: str,
-            reconnect_grace: float | None = None):
+            reconnect_grace: float | None = None,
+            protocol_versions: tuple[str, ...] = ()):
     root = generate(directory)
     key = base64.b64decode((root / "encryption.key").read_text().strip())
     target = f"https://{host}"
     store = Store(root / "manager.sqlite3", key, passthrough_targets=(target,))
     try:
         store.seed_passthrough(target=target, fingerprint=fingerprint, username=username,
-                               password=password, approver="tools/console_ops.py")
+                               password=password, approver="tools/console_ops.py",
+                               protocol_versions=protocol_versions)
     finally:
         store.close()
     manager_path = root / "manager.json"
@@ -111,6 +122,9 @@ def main() -> int:
                         help="how long the driver waits for the in-page reconnect")
     parser.add_argument("--reconnect-grace", type=float, default=None,
                         help="override the Worker's reconnect grace window in seconds")
+    parser.add_argument("--protocol-versions", default="",
+                        help="RFB greetings this firmware sends, comma separated "
+                             "(e.g. 'RFB 003.008'); empty keeps the measured default")
     parser.add_argument("--playwright", default=os.environ.get("KVM_PLAYWRIGHT"))
     parser.add_argument("--chromium", default=os.environ.get("KVM_CHROMIUM"))
     parser.add_argument("--node", default="node")
@@ -142,7 +156,7 @@ def main() -> int:
     shots.mkdir(parents=True, exist_ok=True)
 
     root, _key, _target = prepare(directory, args.host, fingerprint, username, password,
-                                  args.reconnect_grace)
+                                  args.reconnect_grace, parse_versions(args.protocol_versions))
     token = (root / "login-token").read_text().strip()
 
     ctx = multiprocessing.get_context("spawn")

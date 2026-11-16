@@ -22,6 +22,20 @@ def test_repository_gate_is_clean():
     assert gate.check_collection(ROOT) == []
 
 
+def test_gate_allows_only_the_value_free_env_template(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    names = [".env.example", ".env.local", "deploy/.env", "keys/id_rsa", "README.md"]
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 0, stdout="\0".join(names) + "\0", stderr="")
+
+    monkeypatch.setattr(gate, "subprocess", SimpleNamespace(run=fake_run))
+    assert gate.tracked_secrets(ROOT) == [".env.local", "deploy/.env", "keys/id_rsa"]
+
+
 def test_gate_catches_tests_pytest_cannot_collect(tmp_path):
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_broken.py").write_text(

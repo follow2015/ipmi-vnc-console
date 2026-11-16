@@ -12,8 +12,13 @@ import jwt
 ISSUER = "kvmhub-local-manager"
 AUDIENCE = "kvm-worker"
 CLAIMS = ["iss", "aud", "iat", "exp", "jti", "sub", "aid", "sid", "wid", "iid", "trc"]
-HOST_LABEL = re.compile(r"^w1-([0-9a-f]{32})\.kvm\.localhost$")
 TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
+
+WORKER_DOMAIN = os.environ.get("KVMHUB_WORKER_DOMAIN", "")
+if WORKER_DOMAIN:
+    HOST_LABEL = re.compile(r"^w[0-9a-z-]{1,32}-([0-9a-f]{32})\." + re.escape(WORKER_DOMAIN) + r"$")
+else:
+    HOST_LABEL = re.compile(r"^w1-([0-9a-f]{32})\.kvm\.localhost$")
 
 PASSTHROUGH_ADAPTER_ID = "supermicro-x10-passthrough"
 
@@ -39,7 +44,14 @@ BMC_PORT = _env_port("KVMHUB_BMC_PORT", 10443)
 UI_ORIGIN = f"https://localhost:{UI_PORT}"
 INTERNAL_ORIGIN = f"https://localhost:{INTERNAL_PORT}"
 BMC_BASE_URL = f"https://127.0.0.1:{BMC_PORT}"
-WORKER_HOST_SUFFIX = f":{WORKER_PORT}"
+WORKER_HOST_SUFFIX = "" if WORKER_DOMAIN else f":{WORKER_PORT}"
+WORKER_FORM_ACTION = ("https://*." + WORKER_DOMAIN + WORKER_HOST_SUFFIX) if WORKER_DOMAIN \
+    else f"https://*.kvm.localhost:{WORKER_PORT}"
+
+
+def worker_accept_url(worker_id: str, sid: str) -> str:
+    domain = WORKER_DOMAIN or "kvm.localhost"
+    return f"https://{worker_id}-{sid}.{domain}{WORKER_HOST_SUFFIX}/_platform/accept"
 
 ERROR_STATUS = {
     "invalid_host": 421, "authentication_required": 401, "authentication_failed": 401,
@@ -58,6 +70,8 @@ ERROR_STATUS = {
     "credential_unavailable": 503, "subprotocol_required": 400,
     "internal_error": 500, "unknown_operation": 404, "session_not_found": 404,
     "worker_authentication_failed": 403, "instance_mismatch": 403,
+    "worker_certificate_missing": 403, "worker_certificate_mismatch": 403,
+    "assembly_missing": 502,
     "asset_not_found": 404, "fingerprint_invalid": 400,
     "fingerprint_unchanged": 409, "rotation_incomplete": 400,
 }
@@ -79,6 +93,32 @@ def user_message(code: str) -> str | None:
     return USER_MESSAGES.get(code)
 
 
+def peer_certificate(transport) -> dict | None:
+    if transport is None:
+        return None
+    try:
+        ssl_object = transport.get_extra_info("ssl_object")
+        cert = ssl_object.getpeercert() if ssl_object is not None else None
+    except (AttributeError, ValueError, OSError):
+        return None
+    return cert if isinstance(cert, dict) and cert else None
+
+
+def certificate_common_name(cert) -> str | None:
+    for rdn in (cert or {}).get("subject", ()):
+        for key, value in rdn:
+            if key == "commonName" and value:
+                return value
+    return None
+
+
+def expected_worker_cert_cn(cfg) -> str:
+    declared = cfg.get("worker_cert_cn")
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip()
+    return f"{cfg['worker_id']}-{cfg['instance_id']}"
+
+
 END_REASON_MESSAGES = {
     "client_closed": "操作员结束了会话。",
     "revoked": "会话已被撤销。",
@@ -92,6 +132,7 @@ END_REASON_MESSAGES = {
     "exchange_failed": "与 Manager 的票据交换失败，会话未能建立。",
     "client_message_denied": "浏览器发来了白名单之外的消息，为安全起见结束了会话。",
     "client_message_malformed": "浏览器发来的消息格式非法，会话已结束。",
+    "input_overflow": "按键输入过快，整形队列已满；为避免卡键，会话已明确结束。",
     "manual_release": "管理员核对上游已清理后人工放行。",
     "deadline": "到达硬性截止时间，平台结束了会话。",
     "credential_unavailable": "BMC 凭据不可用，会话已结束。",

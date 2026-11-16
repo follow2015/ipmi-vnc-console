@@ -33,7 +33,8 @@ class LoopbackResolver(AbstractResolver):
 @pytest.fixture(scope="module")
 def services(tmp_path_factory):
     folder = tmp_path_factory.mktemp("flow") / "local"
-    subprocess.run([sys.executable, str(ROOT/"tools/bootstrap.py"), "--directory", str(folder)],
+    subprocess.run([sys.executable, str(ROOT/"tools/bootstrap.py"), "--directory", str(folder),
+                    "--impostor"],
                    cwd=ROOT, check=True, capture_output=True)
     log = (folder/"services.log").open("w+")
     popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
@@ -179,6 +180,19 @@ async def test_internal_socket_requires_client_certificate(services):
     async with httpx.AsyncClient(verify=client_tls(str(folder/"ca.pem")), trust_env=False) as client:
         with pytest.raises(httpx.HTTPError):
             await client.post(f"{INTERNAL_ORIGIN}/internal/v1/sessions/nope/exchange", json={})
+
+
+async def test_a_certificate_from_our_ca_with_another_workers_name_is_refused(services):
+    folder, _ = services
+    impostor = json.loads((folder/"impostor.json").read_text())
+    cfg = json.loads((folder/"worker.json").read_text())
+    ctx = client_tls(cfg["ca"], impostor["cert"], impostor["key"])
+    proof = Path(cfg["worker_proof"]).read_text().strip()
+    async with httpx.AsyncClient(verify=ctx, trust_env=False) as client:
+        r = await client.post(f"{INTERNAL_ORIGIN}/internal/v1/sessions/nope/active", json={},
+                              headers={"X-Worker-Proof": proof})
+        assert r.status_code == 403, r.text
+        assert r.json()["error"] == "worker_certificate_mismatch"
 
 
 async def test_mtls_identity_also_requires_instance_proof(services):

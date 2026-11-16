@@ -21,7 +21,7 @@ from kvmhub.common import BMC_BASE_URL, INTERNAL_ORIGIN, UI_ORIGIN, digest
 from kvmhub.store import Store
 
 
-def generate(root):
+def generate(root, *, impostor=False):
     root = Path(root).resolve()
     if root.exists():
         raise SystemExit(f"Refusing to overwrite {root}; choose a fresh --directory")
@@ -72,6 +72,11 @@ def generate(root):
 
     server_cert, server_key, _ = identity("server")
     client_cert, client_key, _ = identity("w1-"+instance, True)
+    impostor_entry = None
+    if impostor:
+        impostor_name = "w1-" + uuid.uuid4().hex
+        impostor_cert, impostor_key, _ = identity(impostor_name, True)
+        impostor_entry = {"common_name": impostor_name, "cert": impostor_cert, "key": impostor_key}
     mock_cert, mock_key, mock = identity("mock")
     signing = ed25519.Ed25519PrivateKey.generate()
     signing_path = save("signing.key", key_bytes(signing))
@@ -91,6 +96,7 @@ def generate(root):
     os.chmod(database, 0o600)
     manager = {"database": database, "encryption_key": encryption_path, "signing_key": signing_path,
                "worker_id": "w1", "instance_id": instance, "login_hash": digest(login),
+               "worker_cert_cn": "w1-" + instance,
                "worker_proof_hash": digest(proof), "manager_origin": UI_ORIGIN,
                "ca": ca_path, "server_cert": server_cert, "server_key": server_key}
     worker = {"worker_id": "w1", "instance_id": instance, "public_key": public,
@@ -100,6 +106,8 @@ def generate(root):
     mock_cfg = {"username": mock_user, "password": mock_password, "cert": mock_cert, "key": mock_key}
     for name, value in (("manager.json", manager), ("worker.json", worker), ("mock.json", mock_cfg)):
         save(name, json.dumps(value, indent=2)+"\n")
+    if impostor_entry:
+        save("impostor.json", json.dumps(impostor_entry, indent=2)+"\n")
     save(".gitignore", "*\n!.gitignore\n")
     return root
 
@@ -107,6 +115,9 @@ def generate(root):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", default=".local")
+    parser.add_argument("--impostor", action="store_true",
+                        help="also mint a second client identity from the same CA, for the "
+                             "H2 impersonation test; never used by a real session")
     args = parser.parse_args()
-    generated = generate(args.directory)
+    generated = generate(args.directory, impostor=args.impostor)
     print(f"Local synthetic fixtures created: {generated}\nStart: .venv/bin/python -m kvmhub.run --directory {generated}\nLogin token file: {generated / 'login-token'}")

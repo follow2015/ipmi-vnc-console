@@ -21,6 +21,8 @@ from .ast2100_protocol import (
     SECURITY_TYPE_INSYDE,
 )
 from .common import Problem
+from .input_shaping import InputOverflow, InputShaper, InputShapingConfig
+from .insyde_messages import is_key_release
 from .recovery import RecoveryPolicy, RecoveryState, retryable
 
 SECURITY_TYPES_FRAME = bytes([1, SECURITY_TYPE_INSYDE])
@@ -50,7 +52,20 @@ INSYDE_MESSAGE_SIZES = {
     CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ: 1,
 }
 INSYDE_CLIENT_MESSAGES = ALLOWED_CLIENT_MESSAGES | {CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ}
+
+CLIENT_MSG_SMC_MOUSE_SYNC = 7
+SMC_CLIENT_MESSAGES = ALLOWED_CLIENT_MESSAGES | {
+    CLIENT_MSG_SMC_MOUSE_SYNC, CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ}
+SMC_MESSAGE_SIZES = {**INSYDE_MESSAGE_SIZES, CLIENT_MSG_SMC_MOUSE_SYNC: 3}
 MAX_SET_ENCODINGS = 32
+
+
+def client_message_profile(version: str | None) -> tuple[frozenset[int], dict[int, int]]:
+    if version == "RFB 003.008":
+        return INSYDE_CLIENT_MESSAGES, dict(INSYDE_MESSAGE_SIZES)
+    if version == "RFB 055.008":
+        return SMC_CLIENT_MESSAGES, dict(SMC_MESSAGE_SIZES)
+    return ALLOWED_CLIENT_MESSAGES, dict(_FIXED_CLIENT_MESSAGE_BYTES)
 
 
 class BrowserHandshakeError(ValueError):
@@ -93,20 +108,24 @@ class ClientMessageFramer:
             raise ClientMessageError("client_message_denied", kind=kind, length=buffered)
         return size
 
-    def feed(self, data: bytes) -> bytes:
+    def feed_messages(self, data: bytes) -> list[bytes]:
         self._buf.extend(data)
-        ready = bytearray()
+        messages: list[bytes] = []
         while self._buf:
             size = self._next_size()
             if size is None or len(self._buf) < size:
                 break
-            ready += self._buf[:size]
-            kind = self._buf[0]
+            message = bytes(self._buf[:size])
+            kind = message[0]
             if kind == CLIENT_MSG_KEY_EVENT:
                 self.key_events += 1
             self.client_types[kind] = self.client_types.get(kind, 0) + 1
             del self._buf[:size]
-        return bytes(ready)
+            messages.append(message)
+        return messages
+
+    def feed(self, data: bytes) -> bytes:
+        return b"".join(self.feed_messages(data))
 
     def type_summary(self) -> str:
         return ",".join(f"{kind}:{count}" for kind, count in sorted(self.client_types.items()))
@@ -197,7 +216,8 @@ class RfbPassthroughSession:
                  queue_bytes: int = MAX_BUFFERED_BYTES,
                  allowed_client_messages=ALLOWED_CLIENT_MESSAGES,
                  message_sizes: dict[int, int] | None = None,
-                 recovery: RecoveryPolicy | None = None) -> None:
+                 recovery: RecoveryPolicy | None = None,
+                 input_shaping: InputShapingConfig | None = None) -> None:
         self.upstream = upstream
         self.handshake = handshake
         self.recovery: RecoveryState | None = RecoveryState(recovery) if recovery else None
@@ -213,6 +233,13 @@ class RfbPassthroughSession:
         self.started = False
         self.error: str | None = None
         self.denied: dict[str, int] | None = None
+        self._exception_type: str | None = None
+        self._shaper = (InputShaper(input_shaping)
+                        if input_shaping is not None and input_shaping.enabled else None)
+        self._flush_task: asyncio.Task | None = None
+        self._recovery_input: list[bytes] = []
+        self.recovery_input_replayed = 0
+        self.recovery_input_dropped = 0
         self.client_bytes = 0
         self.server_bytes = 0
 
@@ -256,20 +283,79 @@ class RfbPassthroughSession:
 
     async def _forward(self, data: bytes) -> bool:
         try:
-            ready = self._framer.feed(data)
+            messages = self._framer.feed_messages(data)
         except ClientMessageError as exc:
             self.error = exc.code
             self.denied = {"kind": exc.kind, "length": exc.length}
             await self.close(code=1008)
             return False
-        if ready:
+        for message in messages:
             try:
-                await self.upstream.send_raw(ready)
-            except Problem:
-                if self.recovery is None or self.recovery.state != "recovering":
-                    raise
-                self.recovery.dropped_input += 1
+                outgoing = ([message] if self._shaper is None
+                            else self._shaper.feed(message))
+            except InputOverflow as exc:
+                self.error = exc.code
+                await self.close(code=1008)
+                return False
+            for payload in outgoing:
+                try:
+                    await self.upstream.send_raw(payload)
+                except Problem:
+                    if self.recovery is None or self.recovery.state != "recovering":
+                        raise
+                    self._hold_during_recovery(payload)
+        if self._shaper is not None:
+            self._schedule_shaper_flush()
         return True
+
+    RECOVERY_INPUT_LIMIT = 64
+
+    def _hold_during_recovery(self, payload: bytes) -> None:
+        if is_key_release(payload) and len(self._recovery_input) < self.RECOVERY_INPUT_LIMIT:
+            self._recovery_input.append(payload)
+            return
+        self.recovery_input_dropped += 1
+        if self.recovery is not None:
+            self.recovery.dropped_input += 1
+
+    async def _replay_recovery_input(self) -> None:
+        held, self._recovery_input = self._recovery_input, []
+        for payload in held:
+            try:
+                await self.upstream.send_raw(payload)
+                self.recovery_input_replayed += 1
+            except Problem:
+                self.recovery_input_dropped += 1
+                if self.recovery is not None:
+                    self.recovery.dropped_input += 1
+
+    def _schedule_shaper_flush(self) -> None:
+        if self._shaper is None or self._closed or self._flush_task is not None:
+            return
+        due = self._shaper.next_due()
+        if due is None:
+            return
+        self._flush_task = asyncio.create_task(self._flush_shaper(due))
+
+    async def _flush_shaper(self, due: float) -> None:
+        try:
+            await asyncio.sleep(max(0.0, due - time.monotonic()))
+            if not self._closed:
+                for payload in self._shaper.drain():
+                    with contextlib.suppress(Problem):
+                        await self.upstream.send_raw(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._flush_task = None
+            self._schedule_shaper_flush()
+
+    async def _release_held_keys(self) -> None:
+        if self._shaper is None:
+            return
+        for payload in self._shaper.release_all():
+            with contextlib.suppress(Exception):
+                await self.upstream.send_raw(payload)
 
     async def send_str(self, data: str) -> None:
         self.error = "unexpected_text_frame"
@@ -285,9 +371,16 @@ class RfbPassthroughSession:
                 error = await self._relay_once()
                 if self._closed:
                     break
-                if self.recovery is None or not self.recovery.may_try(
-                        error, getattr(self.upstream, "upstream_close_code", None)):
+                if self.recovery is None:
                     self.error = error or self.error
+                    break
+                if not self.recovery.may_try(
+                        error, getattr(self.upstream, "upstream_close_code", None)):
+                    if self.recovery.budget_spent():
+                        self.recovery.give_up(error)
+                        self.error = "upstream_reconnect_failed"
+                    else:
+                        self.error = error or self.error
                     break
                 if not await self._recover(error):
                     self.error = self.recovery.last_error or error or self.error
@@ -301,13 +394,16 @@ class RfbPassthroughSession:
                 self._out.put_nowait(None)
 
     async def _relay_once(self) -> str | None:
+        self._exception_type = None
         try:
             await self.upstream.relay(self._emit)
         except asyncio.CancelledError:
             raise
         except Problem as exc:
+            self._exception_type = type(exc).__name__
             return exc.code
         except Exception as exc:  # noqa: BLE001
+            self._exception_type = type(exc).__name__
             return getattr(exc, "code", None) or type(exc).__name__
         return "upstream_closed"
 
@@ -353,6 +449,7 @@ class RfbPassthroughSession:
                 state.fail("upstream_unavailable")
                 continue
             state.succeed(int((time.monotonic() - attempt_started) * 1000))
+            await self._replay_recovery_input()
             return True
         state.give_up(state.last_error or error)
         return False
@@ -374,8 +471,13 @@ class RfbPassthroughSession:
     async def close(self, code: int = 1000) -> None:
         if self._closed:
             return
+        await self._release_held_keys()
         self._closed = True
         self._room.set()
+        if self._flush_task is not None and not self._flush_task.done():
+            self._flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._flush_task
         if self._relay_task is not None and not self._relay_task.done():
             self._relay_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -403,8 +505,16 @@ class RfbPassthroughSession:
                 "shared": self.handshake.shared, "client_bytes": self.client_bytes,
                 "server_bytes": self.server_bytes, "buffered_bytes": self._buffered,
                 "peak_buffered_bytes": self.peak_buffered_bytes, "error": self.error,
+                "exception_type": self._exception_type,
+                "recovery_input_replayed": self.recovery_input_replayed,
+                "recovery_input_dropped": self.recovery_input_dropped,
                 "client_message_types": {str(kind): count
                                          for kind, count in self._framer.client_types.items()}}
         if self.recovery is not None:
             data.update(self.recovery.counters())
+        if (isinstance(self.denied, dict)
+                and isinstance(self.denied.get("kind"), int)
+                and isinstance(self.denied.get("length"), int)):
+            data["denied"] = {"kind": self.denied["kind"],
+                              "length": self.denied["length"]}
         return data

@@ -61,8 +61,12 @@ def test_console_scripts_reconnect_bounded(harness_result):
     assert data["real"]["exhausted"] is True
     assert data["real"]["status"].startswith("连接已断开，自动重连已用尽")
     assert "重连已用尽" in REAL_CONSOLE_JS
-    assert data["real"]["fetch_urls"] == ["/_platform/limits"] * 2
+    assert [url for url in data["real"]["fetch_urls"] if url == "/_platform/limits"] == [
+        "/_platform/limits"] * 2
     assert data["real"]["last_connected"] == 1
+    assert data["real"]["stats_polls"] >= 1
+    assert any("网关正在重建上游控制台" in notice for notice in data["real"]["notices"]), \
+        data["real"]["notices"]
 
 
 def test_explicit_close_never_reconnects(harness_result):
