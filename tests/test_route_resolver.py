@@ -72,7 +72,7 @@ async def test_proxy_relays_http_without_rewriting_the_path():
 
 async def test_proxy_relays_websocket_cookie_and_frames():
     async def upstream_ws(request):
-        if request.cookies.get("session") != "secret":
+        if request.cookies.get("session") != "unit-test-token":
             return web.Response(status=401)
         socket = web.WebSocketResponse(protocols=("binary",))
         await socket.prepare(request)
@@ -93,7 +93,7 @@ async def test_proxy_relays_websocket_cookie_and_frames():
         async with await _client(bus) as resolver:
             async with resolver.ws_connect(
                     f"/s/{SID}/console", protocols=("binary",),
-                    headers={"Cookie": "session=secret", "Origin": "https://example.test"}) as ws:
+                    headers={"Cookie": "session=unit-test-token", "Origin": "https://example.test"}) as ws:
                 await ws.send_bytes(b"ping")
                 message = await ws.receive()
                 assert message.type is WSMsgType.BINARY

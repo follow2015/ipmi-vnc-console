@@ -50,7 +50,7 @@ async def test_websocket_relays_the_browser_origin_untouched():
         async with await _resolver(bus) as resolver:
             async with resolver.ws_connect(
                     f"/s/{SID}/console", protocols=("binary",),
-                    headers={"Cookie": "session=secret", "Origin": "https://kvm.example",
+                    headers={"Cookie": "session=unit-test-token", "Origin": "https://kvm.example",
                              "X-Forwarded-Host": "kvm.example",
                              "X-Forwarded-Proto": "https"}) as ws:
                 await ws.send_bytes(b"x")
