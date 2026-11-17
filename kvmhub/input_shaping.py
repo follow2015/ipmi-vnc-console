@@ -90,6 +90,7 @@ class InputShaper:
         self.clock = clock
         self._queue: list[_Queued] = []
         self._pressed: dict[int, float] = {}
+        self._emitted_pressed: set[int] = set()
         self._next_key_at = 0.0
 
     @property
@@ -114,6 +115,15 @@ class InputShaper:
             raise InputOverflow()
         self._queue.append(_Queued(message, due_at))
 
+    def _emitted(self, message: bytes) -> bytes:
+        event = parse_key_event(message)
+        if event is not None:
+            if event.down:
+                self._emitted_pressed.add(event.key)
+            else:
+                self._emitted_pressed.discard(event.key)
+        return message
+
     def feed(self, message: bytes) -> list[bytes]:
         now = self.clock()
         out = self.drain(now)
@@ -126,7 +136,6 @@ class InputShaper:
             return out
 
         if event.down:
-            self._pressed[event.key] = now
             earliest = now
         else:
             press_at = self._pressed.pop(event.key, None)
@@ -134,11 +143,13 @@ class InputShaper:
                         if press_at is not None else now)
 
         due = max(now, earliest, self._next_key_at)
+        if event.down:
+            self._pressed[event.key] = due
         if self._queue or due > now + 1e-9:
             self._enqueue(message, due)
             self._next_key_at = due + self._gap()
         else:
-            out.append(message)
+            out.append(self._emitted(message))
             self._next_key_at = now + self._gap()
         return out
 
@@ -146,12 +157,15 @@ class InputShaper:
         current = self.clock() if now is None else now
         out: list[bytes] = []
         while self._queue and self._queue[0].due_at <= current:
-            out.append(self._queue.pop(0).message)
+            out.append(self._emitted(self._queue.pop(0).message))
         return out
 
     def release_all(self) -> list[bytes]:
         if not self.cfg.release_on_close:
             return []
-        out = [build_key_event(key, False) for key in sorted(self._pressed)]
+        out = [build_key_event(key, False)
+               for key in sorted(set(self._pressed) | self._emitted_pressed)]
         self._pressed.clear()
+        self._emitted_pressed.clear()
+        self._queue.clear()
         return out

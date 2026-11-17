@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.serialization import (Encoding, NoEncryption
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from kvmhub import common as common_module
 from kvmhub.adapters.passthrough import PassthroughAdapter
 from kvmhub.common import PASSTHROUGH_ADAPTER_ID, Problem, verify
 from kvmhub.platform import connection, data_plane, services, vendor_registry
@@ -21,7 +22,7 @@ from kvmhub.platform.bus import AssemblyBus, BusError
 from kvmhub.platform.config import Settings
 from kvmhub.platform.console import ConsolePlane
 from kvmhub.platform.db import init_schema, seed_roles, session_factory, transaction
-from kvmhub.platform.models import Capability, VendorProfile
+from kvmhub.platform.models import DEFAULT_TENANT_ID, Capability, VendorProfile
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher
 from kvmhub.store import Store
@@ -270,6 +271,23 @@ def test_proxy_route_follows_ticket_worker_and_keeps_draining_sessions_routable(
                                       metadata={'address': '192.0.2.8', 'port': 9443})
         with pytest.raises(services.PlatformError):
             await rig.plane.route(host)
+    asyncio.run(run())
+
+
+def test_path_mode_publishes_and_clears_entry_route(rig, monkeypatch):
+    monkeypatch.setattr(common_module, "SESSION_MODE", "path", raising=True)
+
+    async def run():
+        await rig.bus.register_worker('w1', instance_id='i1', capacity=2,
+                                      metadata={'address': '192.0.2.7', 'port': 9443})
+        out = await rig.plane.open(rig.assembly, user_id=rig.ids['admin'])
+        assert await rig.bus.get_route(out['sid']) == {
+            'worker_id': 'w1', 'instance_id': 'i1',
+            'upstream': '192.0.2.7:9443', 'asset_id': rig.ids['asset'],
+            'tenant_id': DEFAULT_TENANT_ID}
+        await rig.plane.close_session(out['sid'], user_id=rig.ids['admin'])
+        assert await rig.bus.get_route(out['sid']) is None
+
     asyncio.run(run())
 
 

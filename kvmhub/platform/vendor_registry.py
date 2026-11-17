@@ -140,7 +140,7 @@ class Match:
                 "usable": self.usable, "reason": self.reason, "candidates": self.candidates}
 
 
-def identify(session: Session, detection: dict) -> Match:
+def identify(session: Session, detection: dict, *, tenant_id: str | None = None) -> Match:
     vendor = normalize_vendor(detection.get("vendor") or detection.get("Manufacturer"))
     model = str(detection.get("model") or "")
     firmware = str(detection.get("firmware") or "")
@@ -149,6 +149,8 @@ def identify(session: Session, detection: dict) -> Match:
 
     scored: list[tuple[int, VendorProfile, list[str]]] = []
     for profile in session.scalars(select(VendorProfile)).all():
+        if tenant_id is not None and profile.tenant_id not in (None, tenant_id):
+            continue
         reasons: list[str] = []
         aliases = [normalize_vendor(a) for a in parse_json(profile.vendor_aliases, [])]
         aliases.append(normalize_vendor(profile.vendor))
@@ -170,6 +172,8 @@ def identify(session: Session, detection: dict) -> Match:
             continue
         reasons.append("firmware_window")
         score = len(reasons) * 1000 + (1000 if profile.status == PROFILE_APPROVED else 0) - int(profile.priority)
+        if tenant_id is not None and profile.tenant_id == tenant_id:
+            score += 500
         scored.append((score, profile, reasons))
 
     if not scored:

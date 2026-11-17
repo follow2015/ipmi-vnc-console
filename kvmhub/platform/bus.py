@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import AsyncIterator
 
-from .redis_state import State
+from .redis_state import QUOTA_PREFIX, State, quota_key
 
 ASSEMBLY_PREFIX = "kvmhub:assembly:"
 LOAD_PREFIX = "kvmhub:load:"
 DRAIN_PREFIX = "kvmhub:drain:"
+ROUTE_PREFIX = "kvmhub:route:"
 DEFAULT_CAPACITY = 4
 DEFAULT_WORKER_TTL = 45
 ASSEMBLY_TTL = 120
@@ -48,8 +50,50 @@ class AssemblyBus:
     async def delete_assembly(self, sid: str) -> None:
         await self.state.delete(ASSEMBLY_PREFIX + sid)
 
+
+    async def put_route(self, sid: str, payload: dict, ttl: int) -> None:
+        await self.state.put(ROUTE_PREFIX + sid, payload, max(1, int(ttl)))
+
+    async def get_route(self, sid: str) -> dict | None:
+        return await self.state.get(ROUTE_PREFIX + sid)
+
+    async def delete_route(self, sid: str) -> None:
+        await self.state.delete(ROUTE_PREFIX + sid)
+
     async def publish_revoke(self, sid: str) -> None:
         await self.state.publish_revoke(sid)
+
+    async def revocations(self) -> AsyncIterator[str]:
+        async for sid in self.state.subscribe_revocations():
+            yield sid
+
+
+    async def reserve_tenant_quota(self, tenant_id: str, sid: str,
+                                   limit: int | None, ttl: int) -> bool:
+        if not tenant_id:
+            return True
+        return await self.state.reserve_quota(quota_key(tenant_id), sid, limit, ttl)
+
+    async def release_tenant_quota(self, tenant_id: str, sid: str) -> None:
+        if not tenant_id:
+            return
+        await self.state.release_quota(quota_key(tenant_id), sid)
+
+    async def tenant_quota_usage(self, tenant_id: str) -> int:
+        if not tenant_id:
+            return 0
+        return await self.state.quota_usage(quota_key(tenant_id))
+
+    async def reclaim_quota(self, sids: set[str]) -> int:
+        if not sids:
+            return 0
+        dropped = 0
+        for key in await self.state.keys(QUOTA_PREFIX):
+            before = await self.state.quota_usage(key)
+            for sid in sids:
+                await self.state.release_quota(key, sid)
+            dropped += max(0, before - await self.state.quota_usage(key))
+        return dropped
 
     async def register_worker(self, worker_id: str, *, instance_id: str,
                               capacity: int = DEFAULT_CAPACITY,

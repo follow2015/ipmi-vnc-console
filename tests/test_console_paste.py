@@ -63,6 +63,7 @@ def test_worker_serves_the_keymap_route_from_the_single_source():
     source = worker.__file__
     with open(source, encoding="utf-8") as handle:
         text = handle.read()
-    assert 'request.path == "/_platform/keymap"' in text
+    assert ('request.path == "/_platform/keymap"' in text
+            or 'path == "/_platform/keymap"' in text)
     assert "web.json_response(keymap_document())" in text
     assert "from .platform.text_input import keymap_document" in text

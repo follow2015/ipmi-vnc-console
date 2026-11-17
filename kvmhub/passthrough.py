@@ -342,8 +342,11 @@ class RfbPassthroughSession:
             await asyncio.sleep(max(0.0, due - time.monotonic()))
             if not self._closed:
                 for payload in self._shaper.drain():
-                    with contextlib.suppress(Problem):
+                    try:
                         await self.upstream.send_raw(payload)
+                    except Problem:
+                        if self.recovery is not None and self.recovery.state == "recovering":
+                            self._hold_during_recovery(payload)
         except asyncio.CancelledError:
             raise
         finally:

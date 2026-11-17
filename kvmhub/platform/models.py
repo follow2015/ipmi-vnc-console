@@ -12,24 +12,42 @@ PROFILE_APPROVED = "approved"
 PROFILE_SUSPENDED = "suspended"
 PROFILE_RETIRED = "retired"
 
-CAPABILITY_STATUSES = ("draft", "verified", "suspended", "retired")
+CAPABILITY_DRAFT = "draft"
+CAPABILITY_VERIFIED = "verified"
+CAPABILITY_STATUSES = (CAPABILITY_DRAFT, CAPABILITY_VERIFIED, "suspended", "retired")
 PROFILE_STATUSES = (PROFILE_DRAFT, PROFILE_APPROVED, PROFILE_SUSPENDED, PROFILE_RETIRED)
 
 ROLE_ADMIN = "admin"
 ROLE_OPERATOR = "operator"
 ROLE_VIEWER = "viewer"
+ROLE_PLATFORM_ADMIN = "platform_admin"
+
+DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+DEFAULT_TENANT_CODE = "default"
+TENANT_ACTIVE = "active"
+TENANT_SUSPENDED = "suspended"
 
 PERMISSIONS = (
     "asset.read", "asset.write", "console.open", "console.close",
     "credential.write", "vendor.read", "vendor.approve",
     "user.read", "user.write", "grant.write", "audit.read",
+    "session.read", "session.revoke",
 )
 ROLE_PERMISSIONS = {
     ROLE_ADMIN: PERMISSIONS,
     ROLE_OPERATOR: ("asset.read", "asset.write", "console.open", "console.close",
-                    "credential.write", "vendor.read", "audit.read"),
+                    "credential.write", "vendor.read", "audit.read", "session.read"),
     ROLE_VIEWER: ("asset.read", "vendor.read", "audit.read"),
 }
+
+PLATFORM_PERMISSIONS = (
+    "platform.tenant.read", "platform.tenant.write",
+    "platform.session.read", "platform.session.revoke",
+    "platform.audit.read", "platform.asset.read",
+    "platform.worker.read", "platform.worker.manage",
+    "platform.vendor.read",
+)
+ROLE_PERMISSIONS[ROLE_PLATFORM_ADMIN] = PLATFORM_PERMISSIONS
 
 
 class Base(DeclarativeBase):
@@ -77,10 +95,27 @@ class UserRole(Base):
     role_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_role.id"), primary_key=True)
 
 
+class Tenant(Base):
+    __tablename__ = "kvm_tenant"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(32), default=TENANT_ACTIVE)
+    plan: Mapped[str] = mapped_column(String(64), default="standard")
+    quotas_json: Mapped[str] = mapped_column(Text, default="{}")
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+
+    def public(self) -> dict:
+        return {"id": self.id, "code": self.code, "name": self.name,
+                "status": self.status, "plan": self.plan,
+                "quotas": parse_json(self.quotas_json, {}), "created": self.created}
+
+
 class User(Base):
     __tablename__ = "kvm_user"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), default="")
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -88,9 +123,10 @@ class User(Base):
     locked_until: Mapped[float] = mapped_column(Float, default=0.0)
     created: Mapped[float] = mapped_column(Float, nullable=False)
     last_login: Mapped[float | None] = mapped_column(Float, nullable=True)
+    __table_args__ = (UniqueConstraint("tenant_id", "username", name="uq_kvm_user_tenant_username"),)
 
     def public(self) -> dict:
-        return {"id": self.id, "username": self.username,
+        return {"id": self.id, "tenant_id": self.tenant_id, "username": self.username,
                 "display_name": self.display_name, "is_active": bool(self.is_active),
                 "created": self.created, "last_login": self.last_login}
 
@@ -98,6 +134,7 @@ class User(Base):
 class VendorProfile(Base):
     __tablename__ = "kvm_vendor_profile"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
     vendor: Mapped[str] = mapped_column(String(128), nullable=False)
     vendor_aliases: Mapped[str] = mapped_column(Text, default="[]")
@@ -123,7 +160,8 @@ class VendorProfile(Base):
     created: Mapped[float] = mapped_column(Float, nullable=False)
 
     def public(self) -> dict:
-        return {"id": self.id, "code": self.code, "vendor": self.vendor,
+        return {"id": self.id, "tenant_id": self.tenant_id, "code": self.code,
+                "vendor": self.vendor,
                 "vendor_aliases": parse_json(self.vendor_aliases, []),
                 "model_pattern": self.model_pattern, "firmware_min": self.firmware_min,
                 "firmware_max": self.firmware_max, "rfb_version": self.rfb_version,
@@ -142,6 +180,7 @@ class VendorProfile(Base):
 class Capability(Base):
     __tablename__ = "kvm_capability"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     vendor: Mapped[str] = mapped_column(String(128), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     firmware: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -168,6 +207,7 @@ class Capability(Base):
 class Credential(Base):
     __tablename__ = "kvm_credential"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     label: Mapped[str] = mapped_column(String(128), nullable=False)
     username_cipher: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     password_cipher: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
@@ -184,6 +224,7 @@ class Credential(Base):
 class Asset(Base):
     __tablename__ = "kvm_asset"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     address: Mapped[str] = mapped_column(String(256), nullable=False)
     vendor: Mapped[str] = mapped_column(String(128), default="")
@@ -198,10 +239,11 @@ class Asset(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
     created: Mapped[float] = mapped_column(Float, nullable=False)
     updated: Mapped[float] = mapped_column(Float, nullable=False)
-    __table_args__ = (Index("ix_kvm_asset_address", "address"),)
+    __table_args__ = (Index("ix_kvm_asset_tenant_address", "tenant_id", "address"),)
 
     def public(self) -> dict:
-        return {"id": self.id, "name": self.name, "address": self.address,
+        return {"id": self.id, "tenant_id": self.tenant_id, "name": self.name,
+                "address": self.address,
                 "vendor": self.vendor, "model": self.model, "firmware": self.firmware,
                 "fingerprint_prefix": self.fingerprint[:12],
                 "profile_id": self.profile_id, "capability_id": self.capability_id,
@@ -211,6 +253,7 @@ class Asset(Base):
 
 class AccessGrant(Base):
     __tablename__ = "kvm_access_grant"
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_user.id"), primary_key=True)
     asset_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_asset.id"), primary_key=True)
     expires: Mapped[float] = mapped_column(Float, nullable=False)
@@ -222,10 +265,14 @@ class AuditLog(Base):
     __tablename__ = "kvm_audit_log"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[float] = mapped_column(Float, nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     trace_id: Mapped[str] = mapped_column(String(64), default="")
     actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(16), default="user")
+    actor_tenant: Mapped[str | None] = mapped_column(String(36), nullable=True)
     action: Mapped[str] = mapped_column(String(96), nullable=False)
     asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     detail: Mapped[str] = mapped_column(Text, default="{}")
     __table_args__ = (Index("ix_kvm_audit_ts", "ts"),
+                      Index("ix_kvm_audit_tenant_ts", "tenant_id", "ts"),
                       UniqueConstraint("id", name="uq_kvm_audit_id"))

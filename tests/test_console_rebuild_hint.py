@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -9,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from kvmhub.recovery import RecoveryPolicy, RecoveryState
 from kvmhub.session_state import Phase
-from kvmhub.worker import REAL_CONSOLE_JS, Gateway, Runtime
+from kvmhub.worker import REAL_CONSOLE_JS, Gateway, Runtime, wire_recovery
 
 
 @pytest.fixture(scope="module")
@@ -24,11 +25,15 @@ def cfg(tmp_path_factory):
 
 class RebuildingAdapter:
 
+    supports_upstream_recovery = True
+
     def __init__(self, attempts: int = 1, recoveries: int = 0) -> None:
-        self.recovery = RecoveryState(policy=RecoveryPolicy())
-        self.recovery.state = "recovering"
-        self.recovery.attempts = attempts
-        self.recovery.recoveries = recoveries
+        self.recovery = RecoveryPolicy()
+        state = RecoveryState(self.recovery)
+        state.state = "recovering"
+        state.attempts = attempts
+        state.recoveries = recoveries
+        self.session = SimpleNamespace(recovery=state)
 
 
 def live_session(cfg, adapter, sid="a" * 32):
@@ -54,7 +59,7 @@ def test_stats_describes_the_rebuild_with_its_budget(cfg):
 
 def test_the_rebuild_block_carries_no_text_a_scrape_could_use(cfg):
     adapter = RebuildingAdapter()
-    adapter.recovery.last_error = "upstream_unresponsive"
+    adapter.session.recovery.last_error = "upstream_unresponsive"
     gateway, sess = live_session(cfg, adapter, sid="b" * 32)
 
     body = gateway.stats(sess)
@@ -62,6 +67,30 @@ def test_the_rebuild_block_carries_no_text_a_scrape_could_use(cfg):
     assert "upstream_unresponsive" not in repr(body["recovery"])
     assert all(not isinstance(value, str) or value == "recovering"
                for value in body["recovery"].values())
+
+
+def test_the_budget_comes_from_the_wired_policy(cfg):
+    adapter = RebuildingAdapter()
+    policy = RecoveryPolicy(attempts=4, max_total=9)
+    wire_recovery(adapter, policy)
+    adapter.session.recovery = RecoveryState(policy)
+    adapter.session.recovery.state = "recovering"
+    adapter.session.recovery.attempts = 1
+    gateway, sess = live_session(cfg, adapter, sid="d" * 32)
+
+    body = gateway.stats(sess)
+
+    assert body["recovery"] == {"state": "recovering", "attempts": 1, "recoveries": 0,
+                                "limit": 4, "max_total": 9}
+
+
+def test_an_unwired_adapter_recovers_nothing(cfg):
+    adapter = RebuildingAdapter()
+    adapter.recovery = None
+    adapter.session.recovery = None
+    gateway, sess = live_session(cfg, adapter, sid="e" * 32)
+
+    assert gateway.stats(sess)["recovery"] is None
 
 
 def test_a_session_without_recovery_reports_none_instead_of_zeroes(cfg):

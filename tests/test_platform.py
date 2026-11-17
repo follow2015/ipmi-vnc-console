@@ -81,6 +81,18 @@ def test_bad_credential_key_length_is_rejected():
         cfg.validate()
 
 
+def test_iframe_mode_defaults_to_off_and_rejects_typos(monkeypatch, tmp_path):
+    monkeypatch.setenv("KVMHUB_ENV", "dev")
+    monkeypatch.setenv("KVMHUB_DB_URL", f"sqlite:///{tmp_path}/iframe.db")
+    monkeypatch.delenv("KVMHUB_IFRAME_MODE", raising=False)
+    assert settings().iframe_mode == "off"
+    monkeypatch.setenv("KVMHUB_IFRAME_MODE", "OFF")
+    assert settings().iframe_mode == "off"
+    monkeypatch.setenv("KVMHUB_IFRAME_MODE", "maybe")
+    with pytest.raises(ValueError, match="off\\|on"):
+        settings()
+
+
 
 def test_password_hash_roundtrip_and_long_passphrase():
     password = P4 + " " * 6
@@ -121,11 +133,11 @@ def test_seed_roles_is_idempotent(ctx):
         second = seed_roles(db)
         third = seed_roles(db)
         roles = {r.code for r in db.scalars(select(Role)).all()}
-    assert first["roles"] == 3
-    assert first["permissions"] == len(PERMISSIONS)
+    assert first["roles"] == 4
+    assert first["permissions"] == len({code for codes in ROLE_PERMISSIONS.values() for code in codes})
     assert first["links"] == sum(len(codes) for codes in ROLE_PERMISSIONS.values())
     assert second == third == {"roles": 0, "permissions": 0, "links": 0}
-    assert roles == {"admin", "operator", "viewer"}
+    assert roles == {"admin", "operator", "viewer", "platform_admin"}
     fresh.dispose()
 
 

@@ -20,6 +20,43 @@ if WORKER_DOMAIN:
 else:
     HOST_LABEL = re.compile(r"^w1-([0-9a-f]{32})\.kvm\.localhost$")
 
+SESSION_MODE = os.environ.get("KVMHUB_WORKER_SESSION_MODE", "host")
+if SESSION_MODE not in ("host", "path"):
+    raise RuntimeError(f"KVMHUB_WORKER_SESSION_MODE must be host|path, got {SESSION_MODE!r}")
+BASE_PATH = os.environ.get("KVMHUB_BASE_PATH", "").rstrip("/")
+if BASE_PATH and not BASE_PATH.startswith("/"):
+    BASE_PATH = "/" + BASE_PATH
+
+PATH_SESSION = re.compile(r"^/s/([0-9a-f]{32})(/.*)?$")
+_PATH_TRAVERSAL = re.compile(r"(?:\.\.|\\|\x00)")
+
+
+def cookie_name_for(sid: str) -> str:
+    if SESSION_MODE == "path":
+        return f"__Secure-kvm_{sid}"
+    return "__Host-kvm_sid"
+
+
+def cookie_path_for(sid: str) -> str:
+    if SESSION_MODE == "path":
+        return f"{BASE_PATH}/s/{sid}/"
+    return "/"
+
+
+def route_prefix_for(sid: str) -> str:
+    return f"{BASE_PATH}/s/{sid}"
+
+
+def accept_redirect_location(sid: str) -> str:
+    return "../"
+
+
+def path_segment_is_safe(path: str) -> bool:
+    if _PATH_TRAVERSAL.search(path):
+        return False
+    stripped = path[:-1] if len(path) > 1 and path.endswith("/") else path
+    return "//" not in stripped
+
 PASSTHROUGH_ADAPTER_ID = "supermicro-x10-passthrough"
 
 
@@ -54,7 +91,8 @@ def worker_accept_url(worker_id: str, sid: str) -> str:
     return f"https://{worker_id}-{sid}.{domain}{WORKER_HOST_SUFFIX}/_platform/accept"
 
 ERROR_STATUS = {
-    "invalid_host": 421, "authentication_required": 401, "authentication_failed": 401,
+    "invalid_host": 421, "invalid_session_path": 421,
+    "authentication_required": 401, "authentication_failed": 401,
     "invalid_ticket": 401, "ticket_expired": 401, "invalid_request": 400,
     "csrf_rejected": 403, "route_denied": 403, "worker_request_rejected": 403, "permission_denied": 403,
     "adapter_not_verified": 403, "asset_busy": 409, "ticket_consumed_or_expired": 409,
@@ -161,14 +199,18 @@ def secret_matches(value: str, expected_hash: str) -> bool:
     return hmac.compare_digest(digest(value), expected_hash)
 
 
-def issue(private_key, row: dict, now: float, ttl: float = 60, trace: str | None = None) -> str:
-    return jwt.encode({"iss": ISSUER, "aud": AUDIENCE, "iat": int(now),
-                       "exp": int(min(now + ttl, row["hard_until"])),
-                       "jti": row["jti"], "sub": row["user_id"],
-                       "aid": row["asset_id"], "sid": row["id"],
-                       "wid": row["worker_id"], "iid": row["instance_id"],
-                       "trc": trace if TRACE_ID.fullmatch(trace or "") else uuid.uuid4().hex},
-                      private_key, algorithm="EdDSA", headers={"kid": "local-v1"})
+def issue(private_key, row: dict, now: float, ttl: float = 60, trace: str | None = None,
+          tenant_id: str = "") -> str:
+    claims = {"iss": ISSUER, "aud": AUDIENCE, "iat": int(now),
+              "exp": int(min(now + ttl, row["hard_until"])),
+              "jti": row["jti"], "sub": row["user_id"],
+              "aid": row["asset_id"], "sid": row["id"],
+              "wid": row["worker_id"], "iid": row["instance_id"],
+              "trc": trace if TRACE_ID.fullmatch(trace or "") else uuid.uuid4().hex}
+    if tenant_id:
+        claims["tid"] = tenant_id
+    return jwt.encode(claims, private_key, algorithm="EdDSA",
+                      headers={"kid": "local-v1"})
 
 
 def verify(public_key, token: str, worker: str, instance: str) -> dict:
@@ -185,6 +227,8 @@ def verify(public_key, token: str, worker: str, instance: str) -> dict:
         if not TRACE_ID.fullmatch(claims["trc"]):
             raise ValueError()
         if claims["exp"] - claims["iat"] > 60 or claims["wid"] != worker or claims["iid"] != instance:
+            raise ValueError()
+        if "tid" in claims and (not isinstance(claims["tid"], str) or not claims["tid"]):
             raise ValueError()
         return claims
     except jwt.ExpiredSignatureError:

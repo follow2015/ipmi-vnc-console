@@ -41,5 +41,6 @@ sqlalchemy==2.0.50
 starlette==1.10.0
 typing-inspection==0.4.5
 typing_extensions==4.16.0
+uvloop==0.23.0
 uvicorn==0.54.0
 yarl==1.25.1

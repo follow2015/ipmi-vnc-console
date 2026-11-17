@@ -6,7 +6,8 @@ import pytest
 
 from kvmhub.common import Problem
 from kvmhub.insyde_messages import build_key_event
-from kvmhub.passthrough import RfbPassthroughSession
+from kvmhub.input_shaping import InputShapingConfig
+from kvmhub.passthrough import RfbPassthroughSession, client_message_profile
 from kvmhub.recovery import RecoveryPolicy
 
 
@@ -103,3 +104,30 @@ def test_without_a_policy_a_press_is_still_dropped_and_counted():
     sess._hold_during_recovery(build_key_event(0x61, True))
     assert sess._recovery_input == []
     assert sess.recovery_input_dropped == 1
+
+
+def test_shaper_flush_keeps_a_release_during_recovery_and_counts_dropped_presses():
+    async def scenario():
+        sink = Sink()
+        allowed, sizes = client_message_profile("RFB 055.008")
+        sess = RfbPassthroughSession(
+            sink, SimpleNamespace(completed=True, shared=False),
+            allowed_client_messages=allowed, message_sizes=sizes,
+            input_shaping=InputShapingConfig.parse({"min_hold_ms": 40}),
+            recovery=RecoveryPolicy())
+        down, up = build_key_event(0xE1, True), build_key_event(0xE1, False)
+        await sess._forward(down + up + build_key_event(0x61, True))
+        assert sink.sent == [down]
+        rebuild(sess)
+        sink.fail = True
+        await asyncio.sleep(0.08)
+        assert sess._recovery_input == [up]
+        assert sess.recovery_input_dropped == sess.recovery.dropped_input == 1
+        sink.fail = False
+        sess.recovery.succeed(10)
+        await sess._replay_recovery_input()
+        assert sink.sent == [down, up]
+        assert sess.recovery_input_replayed == 1
+        await sess.close()
+
+    asyncio.run(scenario())

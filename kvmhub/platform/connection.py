@@ -10,10 +10,9 @@ from sqlalchemy.orm import Session
 from .. import capability as poc_capability
 from ..common import PASSTHROUGH_ADAPTER_ID
 from . import services, vendor_registry
-from .models import (PROFILE_APPROVED, Asset, Capability, VendorProfile,
+from .models import (CAPABILITY_VERIFIED, DEFAULT_TENANT_ID, PROFILE_APPROVED,
+                     TENANT_ACTIVE, Asset, Capability, Tenant, VendorProfile,
                      parse_json)
-
-CAPABILITY_VERIFIED = "verified"
 
 
 class ConnectionRefused(ValueError):
@@ -83,18 +82,25 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
 
 
 def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
-             now: float | None = None) -> dict:
+             now: float | None = None,
+             tenant_id: str = DEFAULT_TENANT_ID) -> dict:
     stamp = time.time() if now is None else now
-    visible = {row["id"] for row in services.assets_for_user(session, user_id, now=stamp)}
+    tenant = session.get(Tenant, tenant_id)
+    if tenant is None or tenant.status != TENANT_ACTIVE:
+        raise ConnectionRefused("tenant_suspended", "租户已停用，无法开启新的控制台")
+    visible = {row["id"] for row in
+               services.assets_for_user(session, user_id, now=stamp, tenant_id=tenant_id)}
     if asset_id not in visible:
         raise ConnectionRefused("asset_not_granted", "资产不存在或当前用户未被授权")
 
     asset = session.get(Asset, asset_id)
-    if asset is None:
+    if asset is None or asset.tenant_id != tenant_id:
         raise ConnectionRefused("asset_not_found", "资产不存在")
 
     checks: dict[str, str] = {}
     profile = session.get(VendorProfile, asset.profile_id) if asset.profile_id else None
+    if profile is not None and profile.tenant_id not in (None, tenant_id):
+        profile = None
     if profile is None:
         raise ConnectionRefused("profile_missing", "资产未绑定品牌档案；请先做 Redfish 自动匹配")
     if profile.status != PROFILE_APPROVED:
@@ -104,6 +110,8 @@ def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
     checks["profile"] = "approved"
 
     capability = session.get(Capability, asset.capability_id) if asset.capability_id else None
+    if capability is not None and capability.tenant_id not in (None, tenant_id):
+        capability = None
     if capability is None or capability.status != CAPABILITY_VERIFIED:
         raise ConnectionRefused("capability_not_verified", "兼容矩阵行尚未带外验证")
     if not capability.expires or capability.expires <= stamp:
@@ -121,12 +129,14 @@ def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
     entry = capability_entry(profile, detection=detection, asset=asset)
     plan = vendor_registry.connection_plan(profile)
     services.audit(session, actor, "console_assembly_built", asset_id=asset_id,
+                   tenant_id=tenant_id,
                    detail={"profile": profile.code, "capability": capability.id,
                            "capability_entry": entry["id"], "rfb_version": profile.rfb_version},
                    now=stamp)
     return {
         "ready": True,
         "delivery": "worker_bridge",
+        "tenant_id": tenant_id,
         "asset_id": asset.id,
         "address": asset.address,
         "profile": {"id": profile.id, "code": profile.code, "status": profile.status,

@@ -13,19 +13,24 @@ import aiohttp
 from aiohttp import WSMsgType, web
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
+from . import common
 from .adapter import MockAdapter
 from .adapters.passthrough import ASSET_PATH as PASSTHROUGH_ASSET_PATH
 from .adapters.passthrough import PassthroughAdapter
-from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, SESSION_END_CODES,
-                     WORKER_HOST_SUFFIX, Problem, client_tls, digest, user_message,
-                     verify)
-from .platform.data_plane import assembled_info
+from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, PATH_SESSION,
+                     SESSION_END_CODES, WORKER_HOST_SUFFIX, Problem,
+                     accept_redirect_location, client_tls,
+                     cookie_name_for, digest, path_segment_is_safe,
+                     route_prefix_for, user_message, verify)
+from .platform.data_plane import assembled_info, verify_tenant
 from .platform.text_input import keymap_document
-from .recovery import RecoveryPolicy
+from .recovery import RecoveryPolicy, live_state
 from .session_state import Phase, SessionMachine
 from .telemetry import EvidenceLog, SessionTelemetry, audit_evidence
 
 SESSION_KEY = web.RequestKey("session_id", str)
+ROUTE_PREFIX_KEY = web.RequestKey("route_prefix", str)
+RESOLVED_PATH_KEY = web.RequestKey("resolved_path", str)
 
 log = logging.getLogger("kvmhub.worker")
 
@@ -54,6 +59,26 @@ class ManagerRejected(Problem):
 
 def cookie_max_age(hard_until: float, now: float) -> int:
     return max(1, min(14400, int(hard_until - now)))
+
+
+def localize_console(text: str, request) -> str:
+    if common.SESSION_MODE != "path":
+        return text
+    prefix = request.get(ROUTE_PREFIX_KEY) or ""
+    if not prefix:
+        return text
+    text = text.replace('"/novnc/', f'"{prefix}/novnc/')
+    text = text.replace("'/novnc/", f"'{prefix}/novnc/")
+    text = text.replace('"/_platform/', f'"{prefix}/_platform/')
+    text = text.replace("'/_platform/", f"'{prefix}/_platform/")
+    if common.BASE_PATH:
+        text = text.replace('"/api/v2/', f'"{common.BASE_PATH}/api/v2/')
+        text = text.replace("'/api/v2/", f"'{common.BASE_PATH}/api/v2/")
+    ws_path = prefix.lstrip("/") + "/console"
+    text = text.replace(", 'console');", f", '{ws_path}');")
+    text = text.replace("var routeProbeEnabled = false;",
+                        "var routeProbeEnabled = true;")
+    return text
 
 
 CLIENT_SIDE_END_REASONS = frozenset({"client_message_denied", "client_message_malformed",
@@ -385,6 +410,10 @@ REAL_CONSOLE_JS = """'use strict';
   }
   var rec = readRecovery();
   var stopped = false;
+  // localize_console() flips this on only under /s/{sid}/. Host mode keeps
+  // the historical reload-only path and its existing behavioural harness.
+  var routeProbeEnabled = false;
+  var renewing = false;
   var reloadTimer = null;
   var health = {
     state: rec.closed ? 'closed' : 'connecting',
@@ -449,29 +478,96 @@ REAL_CONSOLE_JS = """'use strict';
   if (rec.attempts > 0 && !rec.closed && !rec.exhausted) health.state = 'reconnecting';
   if (rec.exhausted) health.state = 'exhausted';
 
-  function exhaust(message) {
+  // Fixed-Host path mode: a 404 here means the entry route is gone, so a
+  // reload would only land on the same 404. Ask the control plane for a fresh
+  // ticket instead, then POST it exactly like the Manager's console page does.
+  function probeRoute() {
+    return fetch('/_platform/limits', { cache: 'no-store' }).then(function (response) {
+      if (response.status === 404 || response.status === 410) return 'gone';
+      if (response.status === 401) return 'revoked';
+      return 'live';
+    }).catch(function () { return 'unknown'; });
+  }
+  function requestNewConsole() {
+    if (renewing) return;
+    renewing = true;
+    stopped = true;
+    stopGatewayWatch();
+    setStatus('正在重新申请会话…');
+    Promise.all([
+      fetch('/api/v2/me', { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (response) { return response.ok ? response.json() : null; }),
+      fetch('/_platform/meta', { cache: 'no-store' })
+        .then(function (response) { return response.ok ? response.json() : null; })
+    ]).then(function (parts) {
+      var me = parts[0] || {};
+      var meta = parts[1] || {};
+      if (!me.csrf || !meta.asset_id) throw new Error('renew-context-missing');
+      return fetch('/api/v2/consoles/open', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': me.csrf },
+        body: JSON.stringify({ asset_id: meta.asset_id })
+      }).then(function (response) {
+        if (!response.ok) throw new Error('open-' + response.status);
+        return response.json();
+      });
+    }).then(function (ticket) {
+      if (!ticket || !ticket.accept_url || !ticket.ticket) throw new Error('ticket-missing');
+      var form = document.createElement('form');
+      form.method = 'POST';
+      form.action = ticket.accept_url;
+      var input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'ticket';
+      input.value = ticket.ticket;
+      form.appendChild(input);
+      document.body.appendChild(form);
+      form.submit();
+    }).catch(function () {
+      renewing = false;
+      health.exhausted = true; health.state = 'exhausted';
+      explain(EXHAUSTED_TEXT);
+    });
+  }
+  function exhaust(message, renew) {
     rec.exhausted = true; writeRecovery(rec);
     health.exhausted = true; health.state = 'exhausted';
     health.last_message = message;
     stopGatewayWatch();
+    if (renew && routeProbeEnabled) { requestNewConsole(); return; }
     setStatus(EXHAUSTED_TEXT);
     // When the session is gone (revoked, lease expired) "retry later" is the
     // wrong advice; ask once and let the 401 branch say what actually happened.
     recheck();
   }
   function retry(state) {
-    if (stopped || rec.closed || health.exhausted || reloadTimer !== null) return;
+    if (stopped || rec.closed || health.exhausted || reloadTimer !== null || renewing) return;
     if (explained) { exhaust('客户端状态：' + state); return; }
     var n = (rec.attempts || 0) + 1;
     var total = (rec.total || 0) + 1;
     rec.attempts = n; rec.total = total; writeRecovery(rec);
     health.attempts = n; health.total_attempts = total;
     if (state === 'fatal' || n > DELAYS.length || total > MAX_TOTAL) {
-      exhaust('客户端状态：' + state); return;
+      exhaust('客户端状态：' + state, true); return;
     }
     health.state = 'reconnecting';
     setStatus('连接中断（' + state + '），正在重连 ' + n + '/' + DELAYS.length + '…');
-    reloadTimer = setTimeout(function () { location.reload(); }, DELAYS[n - 1]);
+    if (routeProbeEnabled) {
+      reloadTimer = setTimeout(function () {
+        reloadTimer = null;
+        probeRoute().then(function (route) {
+          if (route === 'gone') { requestNewConsole(); return; }
+          if (route === 'revoked') {
+            explain('会话已结束或已失效（可能被撤销、租约到期或凭据过期）。请返回 Manager 查看状态后重新申请。');
+            return;
+          }
+          location.reload();
+        });
+      }, DELAYS[n - 1]);
+    } else {
+      reloadTimer = setTimeout(function () { location.reload(); }, DELAYS[n - 1]);
+    }
   }
 
   var rfb;
@@ -1210,6 +1306,7 @@ class Runtime:
     cookie_hash: str
     adapter: object
     lease_end: float
+    asset_id: str = ""
     ws: set = field(default_factory=set)
     closing: bool = False
     close_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -1232,6 +1329,7 @@ class Gateway:
     def __init__(self, cfg, *, assembly_bus=None):
         self.cfg = cfg
         self.assembly_bus = assembly_bus
+        self.revoke_task: asyncio.Task | None = None
         try:
             grace = float(cfg.get("reconnect_grace_seconds", self.DEFAULT_RECONNECT_GRACE))
         except (TypeError, ValueError):
@@ -1249,12 +1347,13 @@ class Gateway:
         self.watchdogs = set()
         self.accepting = set()
 
-    async def apply_assembly(self, sid: str, info: dict) -> dict:
+    async def apply_assembly(self, sid: str, info: dict, *, tenant_id: str = "") -> dict:
         if self.assembly_bus is None:
             return info
         assembly = await self.assembly_bus.take_assembly(sid)
         if assembly is None:
             raise Problem("assembly_missing", 502)
+        verify_tenant(assembly, tenant_id)
         return assembled_info(info, assembly)
 
     def trace_for(self, sid):
@@ -1289,12 +1388,39 @@ class Gateway:
                                              headers={"X-Worker-Proof": Path(self.cfg["worker_proof"]).read_text().strip()},
                                              timeout=aiohttp.ClientTimeout(total=2), trust_env=False)
         self.task = asyncio.create_task(self.supervise())
+        if self.assembly_bus is not None:
+            self.revoke_task = asyncio.create_task(self.watch_revocations())
+
+    async def watch_revocations(self):
+        while True:
+            try:
+                async for sid in self.assembly_bus.revocations():
+                    session = self.sessions.get(sid)
+                    if session is None:
+                        continue
+                    task = asyncio.create_task(self.finish(session, "revoked"))
+                    self.watchdogs.add(task)
+                    task.add_done_callback(self.watchdogs.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self.revoke_task is not None and self.revoke_task.cancelling():
+                    return
+                log.warning("revocation watcher interrupted (%s); retrying",
+                            type(exc).__name__)
+                log.debug("revocation watcher failure detail", exc_info=True)
+                await asyncio.sleep(1.0)
 
     async def stop(self, app):
         if self.task:
             self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.task
+        revoke_task = getattr(self, "revoke_task", None)
+        if revoke_task is not None:
+            revoke_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await revoke_task
         await asyncio.gather(*(self.finish(s, "worker_shutdown") for s in list(self.sessions.values())))
         for task in list(self.watchdogs):
             task.cancel()
@@ -1375,6 +1501,13 @@ class Gateway:
             sess.telemetry.cleanup_outcome = getattr(sess.adapter, "cleanup_outcome", None)
             record = self.record_end(sess, reason, cleanup)
             await self.report(sess.sid, cleanup, reason, evidence=audit_evidence(record))
+            if self.assembly_bus is not None:
+                with contextlib.suppress(Exception):
+                    route = await self.assembly_bus.get_route(sess.sid)
+                    await self.assembly_bus.delete_route(sess.sid)
+                    if route and route.get("tenant_id"):
+                        await self.assembly_bus.release_tenant_quota(
+                            str(route["tenant_id"]), sess.sid)
             self.sessions.pop(sess.sid, None)
             self.traces.pop(sess.sid, None)
 
@@ -1395,20 +1528,19 @@ class Gateway:
         return record
 
     def stats(self, sess):
-        recovery = getattr(sess.adapter, "recovery", None)
+        recovery = live_state(sess.adapter)
         if recovery is not None and getattr(recovery, "state", None) == "recovering":
             sess.machine.to(Phase.RECONNECTING, "upstream_lost")
         elif sess.phase is Phase.RECONNECTING and not sess.closing:
             sess.machine.to(Phase.LIVE, "upstream_rebuilt")
-        policy = getattr(recovery, "policy", None)
         rebuild = None
         if recovery is not None:
             rebuild = {
                 "state": getattr(recovery, "state", "relaying"),
                 "attempts": int(getattr(recovery, "attempts", 0) or 0),
                 "recoveries": int(getattr(recovery, "recoveries", 0) or 0),
-                "limit": int(getattr(policy, "attempts", 0) or 0),
-                "max_total": int(getattr(policy, "max_total", 0) or 0),
+                "limit": int(getattr(getattr(recovery, "policy", None), "attempts", 0) or 0),
+                "max_total": int(getattr(getattr(recovery, "policy", None), "max_total", 0) or 0),
             }
         return {"session": sess.telemetry.live(ws_open=len(sess.ws), opening=sess.opening,
                                                lease_remaining=sess.lease_end - time.monotonic(),
@@ -1464,8 +1596,9 @@ class Gateway:
     def authenticated(self, request):
         sid = request[SESSION_KEY]
         sess = self.sessions.get(sid)
+        cookie = request.cookies.get(cookie_name_for(sid), "")
         if (not sess or sess.closing or time.monotonic() >= sess.lease_end
-                or not secrets.compare_digest(digest(request.cookies.get("__Host-kvm_sid", "")), sess.cookie_hash)):
+                or not secrets.compare_digest(digest(cookie), sess.cookie_hash)):
             raise Problem("authentication_required", 401)
         return sess
 
@@ -1491,7 +1624,8 @@ class Gateway:
         adapter = None
         try:
             info = await self.call(claims["sid"], "exchange", {"ticket": tokens[0]})
-            info = await self.apply_assembly(claims["sid"], info)
+            info = await self.apply_assembly(claims["sid"], info,
+                                             tenant_id=str(claims.get("tid") or ""))
             hard_until = info["hard_until"]
             adapter = wire_recovery(make_adapter(info), self.recovery)
             deadline = started + info["lease_seconds"]
@@ -1500,7 +1634,8 @@ class Gateway:
                 sent = time.monotonic()
                 result = await self.call(claims["sid"], "active")
             cookie = secrets.token_urlsafe(32)
-            sess = Runtime(claims["sid"], digest(cookie), adapter, sent + result["lease_seconds"])
+            sess = Runtime(claims["sid"], digest(cookie), adapter, sent + result["lease_seconds"],
+                           asset_id=str(claims.get("aid") or info.get("asset_id") or ""))
             sess.machine.to(Phase.LIVE, "activated")
             self.sessions[sess.sid] = sess
             task = asyncio.create_task(self.lease_watchdog(sess))
@@ -1519,6 +1654,15 @@ class Gateway:
             self.accepting.discard(claims["sid"])
             if info is not None:
                 info.clear()
+        if common.SESSION_MODE == "path":
+            ticket_sid = claims["sid"]
+            response = web.Response(status=303,
+                                    headers={"Location": accept_redirect_location(ticket_sid)})
+            response.set_cookie(cookie_name_for(ticket_sid), cookie, secure=True,
+                                httponly=True, samesite="Strict",
+                                path=common.cookie_path_for(ticket_sid),
+                                max_age=cookie_max_age(hard_until, time.time()))
+            return response
         response = web.Response(text='<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>接入成功</title><p>正在打开控制台。<a href="/">继续</a></p><script src="/_platform/continue.js"></script></html>', content_type="text/html")
         response.set_cookie("__Host-kvm_sid", cookie, secure=True, httponly=True, samesite="Strict",
                             path="/", max_age=cookie_max_age(hard_until, time.time()))
@@ -1591,45 +1735,49 @@ class Gateway:
         return client
 
     async def handle(self, request):
-        if request.path == "/_platform/accept":
+        path = request.get(RESOLVED_PATH_KEY, request.path)
+        if path == "/_platform/accept":
             return await self.accept(request)
-        if request.path == "/_platform/continue.js" and request.method == "GET" and not request.query_string:
-            return web.Response(text="location.replace('/');", content_type="application/javascript")
+        if path == "/_platform/continue.js" and request.method == "GET" and not request.query_string:
+            target = "../" if common.SESSION_MODE == "path" else "/"
+            return web.Response(text=f"location.replace('{target}');",
+                                content_type="application/javascript")
         sess = self.authenticated(request)
         origin = "https://" + request.host
-        if request.path == "/_platform/close" and request.method == "POST":
+        if path == "/_platform/close" and request.method == "POST":
             if request.headers.get("Origin") != origin:
                 raise Problem("csrf_rejected", 403)
             await self.finish(sess, "client_closed")
             return web.json_response({"ok": True})
-        if request.path == "/_platform/limits" and request.method == "GET":
+        if path == "/_platform/limits" and request.method == "GET":
             return web.json_response({"limit": connection_limit(sess.adapter),
                                       "connections": len(sess.ws),
                                       "opening": sess.opening,
                                       "closing": sess.closing})
-        if request.path == "/_platform/stats" and request.method == "GET":
+        if path == "/_platform/stats" and request.method == "GET":
             return web.json_response(self.stats(sess))
-        if request.path == "/_platform/keymap" and request.method == "GET":
+        if path == "/_platform/keymap" and request.method == "GET":
             return web.json_response(keymap_document())
-        if request.path == "/_platform/meta" and request.method == "GET":
+        if path == "/_platform/meta" and request.method == "GET":
             cfg = getattr(sess.adapter, "cfg", None)
             host = getattr(cfg, "host", "") if cfg is not None else ""
-            return web.json_response({"address": host or "未接入"})
+            return web.json_response({"address": host or "未接入",
+                                      "asset_id": getattr(sess, "asset_id", "")})
         if request.method != "GET" or request.query_string:
             raise Problem("route_denied", 403)
         real = isinstance(sess.adapter, PassthroughAdapter)
         asset_pattern = getattr(sess.adapter, "asset_pattern", PASSTHROUGH_ASSET_PATH)
-        if real and asset_pattern.fullmatch(request.path):
-            content_type, body = await sess.adapter.fetch_asset(request.path)
+        if real and asset_pattern.fullmatch(path):
+            content_type, body = await sess.adapter.fetch_asset(path)
             return web.Response(body=body, content_type=content_type)
-        if request.path == "/":
-            if real:
-                return web.Response(text=REAL_CONSOLE_HTML, content_type="text/html")
-            return web.Response(text=CONSOLE_HTML, content_type="text/html")
-        if request.path == "/_platform/console.js":
+        if path == "/":
+            page = REAL_CONSOLE_HTML if real else CONSOLE_HTML
+            return web.Response(text=localize_console(page, request), content_type="text/html")
+        if path == "/_platform/console.js":
             script = REAL_CONSOLE_JS if real else CONSOLE_JS
-            return web.Response(text=script, content_type="application/javascript")
-        if request.path == "/console":
+            return web.Response(text=localize_console(script, request),
+                                content_type="application/javascript")
+        if path == "/console":
             if request.headers.get("Origin") != origin or request.headers.get("Upgrade", "").lower() != "websocket":
                 raise Problem("csrf_rejected", 403)
             return await self.proxy_ws(request, sess)
@@ -1652,17 +1800,42 @@ def create_worker(cfg, *, assembly_bus=None):
 
     @web.middleware
     async def guards(request, handler):
-        host = request.host.removesuffix(WORKER_HOST_SUFFIX)
-        match = HOST_LABEL.fullmatch(host) if request.host.endswith(WORKER_HOST_SUFFIX) else None
-        sid = match[1] if match else None
-        if sid:
-            request[SESSION_KEY] = sid
+        sid = None
+        path_error = None
+        if common.SESSION_MODE == "path":
+            raw = request.path
+            base = common.BASE_PATH
+            if base and raw.startswith(base + "/"):
+                raw = raw[len(base):]
+            elif base and not raw.startswith(base + "/"):
+                path_error = "invalid_session_path"
+            match = PATH_SESSION.fullmatch(raw) if path_error is None else None
+            if match is None:
+                path_error = path_error or "invalid_session_path"
+            else:
+                candidate = match.group(1)
+                resolved = match.group(2) or "/"
+                if not path_segment_is_safe(resolved):
+                    path_error = "route_denied"
+                else:
+                    sid = candidate
+                    request[SESSION_KEY] = sid
+                    request[ROUTE_PREFIX_KEY] = route_prefix_for(sid)
+                    request[RESOLVED_PATH_KEY] = resolved
+        else:
+            host = request.host.removesuffix(WORKER_HOST_SUFFIX)
+            match = HOST_LABEL.fullmatch(host) if request.host.endswith(WORKER_HOST_SUFFIX) else None
+            sid = match[1] if match else None
+            if sid:
+                request[SESSION_KEY] = sid
         fallback = gateway.trace_of(sid)
 
         def linked():
             return gateway.traces.get(sid, fallback) if sid else fallback
 
         try:
+            if path_error is not None:
+                raise Problem(path_error)
             if sid is None:
                 raise Problem("invalid_host")
             response = await handler(request)
@@ -1671,6 +1844,7 @@ def create_worker(cfg, *, assembly_bus=None):
         except (aiohttp.ClientError, TimeoutError):
             response = error_response(request, "upstream_unavailable", linked(), 502)
         except Exception:
+            log.exception("unhandled request error sid=%s path=%s", sid, request.path)
             response = error_response(request, "internal_error", linked(), 500)
         response.headers["X-Trace-ID"] = linked()
         return response

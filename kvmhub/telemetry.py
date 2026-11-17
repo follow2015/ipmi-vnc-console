@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from .recovery import live_state
+
 EVIDENCE_KEEP = 32
 
 SID_MASK_KEEP = 8
@@ -200,8 +202,8 @@ class SessionTelemetry:
         }
 
     def phase(self) -> str:
-        recovery = getattr(self.upstream, "recovery", None)
-        if recovery is not None and getattr(recovery, "state", None) == "recovering":
+        recovery = live_state(self.upstream)
+        if recovery is not None and recovery.state == "recovering":
             return "recovering"
         return "live"
 

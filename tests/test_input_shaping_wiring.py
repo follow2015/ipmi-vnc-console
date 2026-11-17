@@ -155,6 +155,20 @@ def test_closing_the_browser_releases_keys_still_held():
     asyncio.run(scenario())
 
 
+def test_closing_before_a_delayed_release_still_releases_the_upstream_key():
+    async def scenario():
+        session, sink = running_session(InputShapingConfig.parse({"min_hold_ms": 500}))
+        down, up = build_key_event(0xE1, True), build_key_event(0xE1, False)
+        await session.send_bytes(down + up)
+        assert sink.sent == [down]
+        await session.close()
+        assert sink.sent == [down, up], "closing must not cancel the only key-up"
+        await asyncio.sleep(0.01)
+        assert sink.sent == [down, up]
+
+    asyncio.run(scenario())
+
+
 def test_an_overflowed_queue_ends_the_session_with_its_own_reason():
     async def scenario():
         session, _ = running_session(InputShapingConfig.parse(

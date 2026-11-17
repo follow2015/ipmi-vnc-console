@@ -83,6 +83,12 @@ def compile_asset_paths(templates) -> re.Pattern[str]:
     return re.compile("(?:" + "|".join(branches) + ")")
 
 
+def verify_tenant(assembly: dict | None, tenant_id: str) -> None:
+    declared = str((assembly or {}).get("tenant_id") or "")
+    if declared and declared != tenant_id:
+        raise Problem("invalid_target_policy", 502)
+
+
 def assembled_info(info: dict, assembly: dict | None) -> dict:
     if assembly is None:
         return info

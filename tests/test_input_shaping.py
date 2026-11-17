@@ -72,6 +72,30 @@ def test_a_short_tap_waits_for_min_hold_without_losing_the_release():
     assert shp.drain() == [up]
 
 
+def test_a_burst_holds_each_key_from_when_it_actually_goes_out():
+    shp, clock = shaper(min_hold_ms=40, min_gap_ms=5)
+    a_down, a_up = build_key_event(0x61, True), build_key_event(0x61, False)
+    b_down, b_up = build_key_event(0x62, True), build_key_event(0x62, False)
+
+    assert shp.feed(a_down) == [a_down]
+    clock.advance(0.001)
+    assert shp.feed(a_up) == []
+    clock.advance(0.001)
+    assert shp.feed(b_down) == []
+    clock.advance(0.001)
+    assert shp.feed(b_up) == []
+
+    assert shp.next_due() == pytest.approx(100.040)
+    clock.advance(0.037)
+    assert shp.drain() == [a_up]
+    assert shp.next_due() == pytest.approx(100.045)
+    clock.advance(0.005)
+    assert shp.drain() == [b_down]
+    assert shp.next_due() == pytest.approx(100.085)
+    clock.advance(0.040)
+    assert shp.drain() == [b_up]
+
+
 def test_a_long_tap_is_not_delayed():
     shp, clock = shaper(min_hold_ms=50, min_gap_ms=0)
     down, up = build_key_event(0x61, True), build_key_event(0x61, False)

@@ -15,12 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select  # noqa: E402
 from kvmhub.platform.config import settings  # noqa: E402
-from kvmhub.platform.db import (bootstrap_admin, init_schema, make_engine,  # noqa: E402
-                                seed_roles, session_factory, transaction)
+from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,  # noqa: E402
+                                init_schema, make_engine, seed_roles,
+                                session_factory, transaction)
 from kvmhub.platform.models import (AccessGrant, Asset as PlatformAsset,  # noqa: E402
-                                    Capability, Credential, User, VendorProfile)
+                                    PROFILE_APPROVED, Capability, Credential, User,
+                                    VendorProfile)
 from kvmhub.platform.security import CredentialCipher  # noqa: E402
-from kvmhub.platform import connection, services, vendor_registry  # noqa: E402
+from kvmhub.platform import connection, governance, services, vendor_registry  # noqa: E402
 from kvmhub.platform.bus import AssemblyBus  # noqa: E402
 from kvmhub.platform.redis_state import create_state  # noqa: E402
 from kvmhub.store import Store  # noqa: E402
@@ -59,9 +61,22 @@ def cmd_create_user(args):
     _, _, factory, _ = _context(args)
     password = _required_env("KVMHUB_NEW_PASSWORD")
     with transaction(factory) as db:
+        tenant = services.resolve_tenant(db, args.tenant)
         user = services.create_user(db, args.username, password, args.role,
-                                    actor=args.actor, display_name=args.display_name or "")
+                                    actor=args.actor, display_name=args.display_name or "",
+                                    tenant_id=tenant.id)
         print(json.dumps(user.public(), ensure_ascii=False))
+
+
+def cmd_create_platform_admin(args):
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        seed_roles(db)
+        created = bootstrap_platform_admin(db, args.username,
+                                           _required_env("KVMHUB_NEW_PASSWORD"))
+    if created is None:
+        raise SystemExit("a platform account already exists")
+    print(json.dumps(created.public(), ensure_ascii=False))
 
 
 def cmd_add_credential(args):
@@ -89,15 +104,23 @@ def cmd_add_asset(args):
 def cmd_grant(args):
     _, _, factory, _ = _context(args)
     with transaction(factory) as db:
+        user = db.get(User, args.user)
+        if user is None:
+            raise SystemExit(f"user not found: {args.user}")
         services.grant_asset(db, user_id=args.user, asset_id=args.asset,
-                             actor=args.actor, ttl_seconds=args.ttl)
-    print(json.dumps({"ok": True, "user_id": args.user, "asset_id": args.asset}))
+                             actor=args.actor, ttl_seconds=args.ttl,
+                             tenant_id=user.tenant_id)
+    print(json.dumps({"ok": True, "user_id": args.user, "asset_id": args.asset,
+                      "tenant_id": user.tenant_id}))
 
 
 def cmd_profiles(args):
     _, _, factory, _ = _context(args)
+    stamp = time.time()
     with transaction(factory) as db:
-        rows = [r.public() for r in db.scalars(select(VendorProfile).order_by(VendorProfile.priority)).all()]
+        rows = [governance.profile_view(row.public(), now=stamp, approver=args.actor)
+                for row in db.scalars(select(VendorProfile)
+                                      .order_by(VendorProfile.priority)).all()]
     print(json.dumps(rows, ensure_ascii=False, indent=1))
 
 
@@ -109,29 +132,38 @@ def cmd_approve_profile(args):
         profile = db.get(VendorProfile, args.id)
         if profile is None:
             raise SystemExit("profile not found")
-        if profile.status == "approved":
-            raise SystemExit("profile is already approved")
+        renewing = profile.status == PROFILE_APPROVED
+        if renewing and not args.renew:
+            raise SystemExit("profile is already approved; pass --renew to record a new review")
         stamp = time.time()
-        profile.status = "approved"
+        profile.status = PROFILE_APPROVED
         profile.approver = args.approver
         profile.evidence = str(args.evidence)
         profile.approved_at = stamp
         profile.review_due = stamp + args.review_days * 86400
         profile.revision = int(profile.revision or 0) + 1
-        services.audit(db, args.approver, "vendor_profile_approved",
+        services.audit(db, args.approver,
+                       "vendor_profile_reapproved" if renewing else "vendor_profile_approved",
                        detail={"profile_id": profile.id, "code": profile.code,
-                               "evidence": str(args.evidence), "review_due": profile.review_due}, now=stamp)
+                               "evidence": str(args.evidence), "review_due": profile.review_due,
+                               "revision": profile.revision}, now=stamp)
         print(json.dumps({"ok": True, "code": profile.code, "approver": args.approver,
-                          "review_due": profile.review_due}, ensure_ascii=False))
+                          "renewed": renewing, "review_due": profile.review_due},
+                         ensure_ascii=False))
 
 
 def cmd_capabilities(args):
     _, _, factory, _ = _context(args)
+    stamp = time.time()
     with transaction(factory) as db:
-        rows = [{"id": r.id, "vendor": r.vendor, "model": r.model,
-                 "firmware": r.firmware, "status": r.status,
-                 "profile_id": r.profile_id, "evidence": r.evidence}
-                for r in db.scalars(select(Capability)).all()]
+        rows = [governance.capability_view(
+                    {"id": row.id, "tenant_id": row.tenant_id, "vendor": row.vendor,
+                     "model": row.model, "firmware": row.firmware, "adapter": row.adapter,
+                     "status": row.status, "profile_id": row.profile_id,
+                     "evidence": row.evidence, "expires": row.expires,
+                     "review_due": row.review_due, "approver": row.approver},
+                    now=stamp, approver=args.actor)
+                for row in db.scalars(select(Capability)).all()]
     print(json.dumps(rows, ensure_ascii=False, indent=1))
 
 
@@ -197,7 +229,15 @@ def cmd_worker_drain(args):
 def cmd_users(args):
     _, _, factory, _ = _context(args)
     with transaction(factory) as db:
-        print(json.dumps(services.list_users(db), ensure_ascii=False, indent=1))
+        if args.tenant:
+            rows = services.list_users(db, tenant_id=services.resolve_tenant(db, args.tenant).id)
+        else:
+            rows = []
+            for user in db.scalars(select(User).order_by(User.created)).all():
+                item = user.public()
+                item["roles"] = services.roles_of(db, user.id)
+                rows.append(item)
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
 
 
 def cmd_audit(args):
@@ -249,10 +289,12 @@ def cmd_sync_data_plane(args):
                          "vendor": asset.vendor, "model": asset.model,
                          "firmware": asset.firmware, "fingerprint": asset.fingerprint,
                          "target": target, "entry": entry, "users": users,
-                         "secret": services.read_credential(db, cipher, asset.credential_id),
+                         "secret": services.read_credential(db, cipher, asset.credential_id,
+                                                            tenant_id=asset.tenant_id),
                          "licence": profile.licence,
                          "console_impl": profile.console_impl or "passthrough"})
             services.audit(db, args.actor, "data_plane_sync_planned", asset_id=asset.id,
+                           tenant_id=asset.tenant_id,
                            detail={"capability_entry": entry["id"], "users": users}, now=stamp)
     summary = {"dry_run": bool(args.dry_run), "store": str(args.store),
                "synced": [{"asset": p["asset_id"], "capability": p["entry"]["id"],
@@ -316,7 +358,9 @@ def parser():
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init-db", help="create schema, RBAC, first admin, measured profiles").set_defaults(fn=cmd_init_db)
-    q = sub.add_parser("create-user"); q.add_argument("--username", required=True); q.add_argument("--role", default="viewer"); q.add_argument("--display-name"); q.set_defaults(fn=cmd_create_user)
+    q = sub.add_parser("create-user"); q.add_argument("--username", required=True); q.add_argument("--role", default="viewer"); q.add_argument("--display-name"); q.add_argument("--tenant", default="default"); q.set_defaults(fn=cmd_create_user)
+    q = sub.add_parser("create-platform-admin", help="create the cross-tenant operator (tenant_id NULL)")
+    q.add_argument("--username", required=True); q.set_defaults(fn=cmd_create_platform_admin)
     q = sub.add_parser("add-credential"); q.add_argument("--label", required=True); q.set_defaults(fn=cmd_add_credential)
     q = sub.add_parser("add-asset")
     for name in ("name", "address"):
@@ -326,11 +370,11 @@ def parser():
     q.set_defaults(fn=cmd_add_asset)
     q = sub.add_parser("grant"); q.add_argument("--user", required=True); q.add_argument("--asset", required=True); q.add_argument("--ttl", type=int, default=86400 * 30); q.set_defaults(fn=cmd_grant)
     sub.add_parser("profiles").set_defaults(fn=cmd_profiles)
-    q = sub.add_parser("approve-profile"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.set_defaults(fn=cmd_approve_profile)
+    q = sub.add_parser("approve-profile"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--renew", action="store_true", help="record a new review of an already-approved profile"); q.set_defaults(fn=cmd_approve_profile)
     sub.add_parser("capabilities").set_defaults(fn=cmd_capabilities)
     q = sub.add_parser("approve-capability"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--valid-days", type=int, default=365); q.set_defaults(fn=cmd_approve_capability)
     q = sub.add_parser("detect"); q.add_argument("--inventory", required=True); q.add_argument("--make-draft", action="store_true"); q.set_defaults(fn=cmd_detect)
-    sub.add_parser("users").set_defaults(fn=cmd_users)
+    q = sub.add_parser("users"); q.add_argument("--tenant", help="filter by tenant code"); q.set_defaults(fn=cmd_users)
     q = sub.add_parser("audit"); q.add_argument("--limit", type=int, default=50); q.set_defaults(fn=cmd_audit)
     q = sub.add_parser("sync-data-plane", help="import approved assets into the Worker's SQLite store")
     q.add_argument("--store", required=True, help="path to the PoC data-plane SQLite file")

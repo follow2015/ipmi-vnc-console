@@ -71,6 +71,7 @@ class Settings:
     signing_key_path: str = ""
     worker_url_template: str = ""
     passthrough_targets: str = ""
+    iframe_mode: str = "off"
 
     @property
     def is_prod(self) -> bool:
@@ -95,6 +96,8 @@ class Settings:
                 raise ValueError("production configuration incomplete: " + ", ".join(missing))
         if self.session_ttl < 60 or self.session_ttl > 86400:
             raise ValueError("KVMHUB_SESSION_TTL must be between 60 and 86400 seconds")
+        if self.iframe_mode not in ("off", "on"):
+            raise ValueError("KVMHUB_IFRAME_MODE must be off|on")
         if self.data_plane_store:
             if not self.signing_key_path:
                 raise ValueError("KVMHUB_SIGNING_KEY is required when KVMHUB_DATA_PLANE_STORE is set")
@@ -135,6 +138,7 @@ def settings(env_path: str | os.PathLike[str] | None = None) -> Settings:
         signing_key_path=os.getenv("KVMHUB_SIGNING_KEY", ""),
         worker_url_template=os.getenv("KVMHUB_WORKER_URL_TEMPLATE", ""),
         passthrough_targets=os.getenv("KVMHUB_PASSTHROUGH_TARGETS", ""),
+        iframe_mode=os.getenv("KVMHUB_IFRAME_MODE", "off").strip().lower(),
     )
     cfg.validate()
     return cfg

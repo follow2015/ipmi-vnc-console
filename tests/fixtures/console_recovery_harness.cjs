@@ -73,6 +73,9 @@ function makeSandbox(extra, options) {
     canvas,
     closeButton,
     reloads: 0,
+    renews: 0,
+    renew_action: '',
+    routeMode: settings.routeMode || 'live',
     fetches: 0,
     fetch_urls: [],
     notices: [],
@@ -90,13 +93,26 @@ function makeSandbox(extra, options) {
     TextDecoder: class { decode() { return 'ok'; } },
     TextEncoder: class { encode() { return new Uint8Array(0); } },
     fetch: (url) => {
-      const target = String(url);
+      const target = String(url).replace(/^\/s\/[0-9a-f]{32}\//, '/');
       if (target === '/_platform/meta') {
         return Promise.resolve({ ok: true, status: 200,
-          json: async () => ({ address: '192.0.2.11' }) });
+          json: async () => ({ address: '192.0.2.11', asset_id: 'asset-1' }) });
       }
       state.fetches += 1;
       state.fetch_urls.push(target);
+      if (target === '/_platform/limits' && state.routeMode === 'gone') {
+        return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
+      }
+      if (target === '/api/v2/me' && state.routeMode === 'gone') {
+        return Promise.resolve({ ok: true, status: 200,
+          json: async () => ({ csrf: 'csrf-token' }) });
+      }
+      if (target === '/api/v2/consoles/open' && state.routeMode === 'gone') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({
+          ticket: 'new-ticket',
+          accept_url: 'https://192.0.2.10/s/new123/_platform/accept',
+        }) });
+      }
       if (target === '/_platform/stats') {
         return Promise.resolve({ ok: true, status: 200, json: async () => state.statsBody || {} });
       }
@@ -118,6 +134,7 @@ function makeSandbox(extra, options) {
       querySelectorAll() { return []; },
       createElement(tag) { return makeElement(tag); },
       getElementById(id) { return elements[id] || makeElement(id); },
+      body: makeElement('body'),
       title: '',
     },
     location: {
@@ -238,6 +255,16 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 function newReal(options) {
   const { sandbox, state } = makeSandbox({}, options);
   sandbox.RFB = makeRfbClass(state);
+  sandbox.document.createElement = (tag) => {
+    const element = makeElement(tag);
+    element.submit = () => {
+      if (tag === 'form') {
+        state.renews += 1;
+        state.renew_action = String(element.action || '');
+      }
+    };
+    return element;
+  };
   return { sandbox, state, load: () => vm.runInContext(REAL_JS, sandbox) };
 }
 
@@ -342,6 +369,23 @@ async function runRealAtLimit() {
   };
 }
 
+async function runRealRouteProbe(routeMode) {
+  const { sandbox, state, load } = newReal({ routeMode });
+  load();
+  await flush();
+  state.rfbs[0].emit('failed');
+  firePendingTimer(state); // retry timer -> probeRoute()
+  for (let i = 0; i < 8; i += 1) await flush();
+  return {
+    reloads: state.reloads,
+    renews: state.renews,
+    renew_action: state.renew_action,
+    fetch_urls: state.fetch_urls,
+    status: state.status.textContent,
+    health_state: sandbox.__kvm_health && sandbox.__kvm_health.state,
+  };
+}
+
 async function main() {
   const mockClose = await runMockCloseGuard();
   process.stdout.write(JSON.stringify({
@@ -352,6 +396,8 @@ async function main() {
     real_close: await runRealCloseGuard(),
     real_signed_out: await runRealSignedOut(),
     real_at_limit: await runRealAtLimit(),
+    real_route_gone: await runRealRouteProbe('gone'),
+    real_route_live: await runRealRouteProbe('live'),
   }) + '\n');
 }
 

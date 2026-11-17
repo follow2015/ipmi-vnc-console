@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from kvmhub import common as common_module
+from kvmhub import worker as worker_module
 from kvmhub.worker import CONSOLE_JS, REAL_CONSOLE_JS, Gateway
 from tools import console_ops
 from tools.bootstrap import generate
@@ -41,7 +43,26 @@ def harness_result(tmp_path_factory):
     real_path.write_text(real_js, encoding="utf-8")
     completed = subprocess.run([node, str(HARNESS), str(mock_path), str(real_path)],
                                capture_output=True, text=True, timeout=30, check=True)
-    return json.loads(completed.stdout)
+    result = json.loads(completed.stdout)
+
+    previous_mode = common_module.SESSION_MODE
+    common_module.SESSION_MODE = "path"
+    try:
+        class _Request:
+            def get(self, key, default=None):
+                if key is worker_module.ROUTE_PREFIX_KEY:
+                    return "/s/" + "a" * 32
+                return default
+
+        localized = worker_module.localize_console(real_js, _Request())
+    finally:
+        common_module.SESSION_MODE = previous_mode
+    path_path = directory / "real-path.js"
+    path_path.write_text(localized, encoding="utf-8")
+    path_completed = subprocess.run([node, str(HARNESS), str(mock_path), str(path_path)],
+                                    capture_output=True, text=True, timeout=30, check=True)
+    result["path"] = json.loads(path_completed.stdout)
+    return result
 
 
 def test_console_scripts_reconnect_bounded(harness_result):
@@ -67,6 +88,22 @@ def test_console_scripts_reconnect_bounded(harness_result):
     assert data["real"]["stats_polls"] >= 1
     assert any("网关正在重建上游控制台" in notice for notice in data["real"]["notices"]), \
         data["real"]["notices"]
+
+
+def test_fixed_host_gone_route_renews_ticket(harness_result):
+    data = harness_result["path"]["real_route_gone"]
+    assert data["reloads"] == 0, "reloading a dead route would loop on 404"
+    assert data["renews"] == 1
+    assert data["renew_action"] == "https://192.0.2.10/s/new123/_platform/accept"
+    assert "/api/v2/consoles/open" in data["fetch_urls"]
+    assert "重新申请" in data["status"]
+
+
+def test_fixed_host_live_route_keeps_reload(harness_result):
+    data = harness_result["path"]["real_route_live"]
+    assert data["reloads"] == 1
+    assert data["renews"] == 0
+    assert "/api/v2/consoles/open" not in data["fetch_urls"]
 
 
 def test_explicit_close_never_reconnects(harness_result):

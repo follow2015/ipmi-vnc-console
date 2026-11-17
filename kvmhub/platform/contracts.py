@@ -32,6 +32,7 @@ class Readyz(Contract):
 
 class UserPublic(Contract):
     id: str
+    tenant_id: str | None = None
     username: str
     display_name: str
     is_active: bool
@@ -44,11 +45,13 @@ class LoginResult(Contract):
     user: UserPublic
     roles: list[str]
     csrf: str
+    tenant_id: str | None = None
 
 
 class Me(Contract):
     user_id: str
     username: str
+    tenant_id: str | None = None
     roles: list[str]
     permissions: list[str]
     csrf: str
@@ -69,6 +72,7 @@ class AssetOccupancy(Contract):
 
 class Asset(Contract):
     id: str
+    tenant_id: str | None = None
     name: str
     address: str
     vendor: str
@@ -95,6 +99,7 @@ class CredentialCreated(Contract):
 
 class VendorProfile(Contract):
     id: str
+    tenant_id: str | None = None
     code: str
     vendor: str
     vendor_aliases: list[str]
@@ -111,6 +116,32 @@ class VendorProfile(Contract):
     approver: str
     review_due: float
     priority: int
+
+
+class VendorProfileView(VendorProfile):
+    scope: str
+    state: str
+    approve_command: str | None = None
+
+
+class CapabilityView(Contract):
+    id: str
+    tenant_id: str | None = None
+    scope: str
+    vendor: str
+    model: str
+    firmware: str
+    adapter: str
+    profile_id: str | None = None
+    status: str
+    state: str
+    evidence: str = ""
+    approver: str = ""
+    expires: float = 0
+    review_due: float = 0
+    models: list[str] = Field(default_factory=list)
+    protocol_versions: list[str] = Field(default_factory=list)
+    approve_command: str | None = None
 
 
 class TextWarning(Contract):
@@ -225,6 +256,48 @@ class ConnectionAssembly(Contract):
     note: str
 
 
+class Tenant(Contract):
+    id: str
+    code: str
+    name: str
+    status: str
+    plan: str
+    quotas: dict[str, Any]
+    created: float
+    assets: int = 0
+    users: int = 0
+    active_sessions: int = 0
+
+
+class SessionView(Contract):
+    sid: str
+    tenant_id: str | None = None
+    tenant_code: str | None = None
+    user_id: str
+    username: str | None = None
+    asset_id: str
+    asset_name: str | None = None
+    asset_address: str | None = None
+    worker_id: str
+    status: str
+    cleanup: str
+    created: float
+    duration_seconds: int
+    remaining_seconds: int
+    route_active: bool
+    lease_active: bool
+
+
+class SessionRevoked(Contract):
+    ok: bool
+    sid: str
+    status: str
+    asset_id: str | None = None
+    was_live: bool
+    tenant_id: str | None = None
+    trace_id: str
+
+
 class ConsoleTicket(Contract):
     sid: str
     ticket: str
@@ -235,6 +308,7 @@ class ConsoleTicket(Contract):
     delivery: str
     hard_until: float
     asset_id: str
+    tenant_id: str | None = None
     note: str
 
 
@@ -273,8 +347,11 @@ class WorkerInfo(Contract):
 class AuditRow(Contract):
     id: int
     ts: float
+    tenant_id: str | None = None
     trace_id: str
     actor: str
+    actor_type: str = "user"
+    actor_tenant: str | None = None
     action: str
     asset_id: str | None = None
     detail: dict[str, Any]
@@ -315,10 +392,23 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/consoles/{sid}": {"get": "ConsoleStatus"},
     "/api/v2/consoles/{sid}/close": {"post": "ConsoleCloseResult"},
     "/api/v2/consoles/{sid}/cleanup": {"post": "ConsoleCleanupResult"},
+    "/api/v2/sessions": {"get": "list:SessionView"},
+    "/api/v2/sessions/{sid}/revoke": {"post": "SessionRevoked"},
     "/api/v2/text-input/matrix": {"get": "TextInputMatrix"},
     "/api/v2/text-plan": {"post": "TextPlan"},
     "/api/v2/workers": {"get": "map:WorkerInfo"},
     "/api/v2/audit": {"get": "list:AuditRow"},
+    "/api/v2/platform/tenants": {"get": "list:Tenant", "post": "Tenant"},
+    "/api/v2/platform/tenants/{tenant_id}": {"patch": "Tenant"},
+    "/api/v2/platform/tenants/{tenant_id}/status": {"post": "Tenant"},
+    "/api/v2/platform/workers": {"get": "map:WorkerInfo"},
+    "/api/v2/platform/workers/{worker_id}/drain": {"post": "WorkerInfo"},
+    "/api/v2/platform/vendor-profiles": {"get": "list:VendorProfileView"},
+    "/api/v2/platform/capabilities": {"get": "list:CapabilityView"},
+    "/api/v2/platform/assets": {"get": "list:Asset"},
+    "/api/v2/platform/audit": {"get": "list:AuditRow"},
+    "/api/v2/platform/sessions": {"get": "list:SessionView"},
+    "/api/v2/platform/sessions/{sid}/revoke": {"post": "SessionRevoked"},
 }
 
 

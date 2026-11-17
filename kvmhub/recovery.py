@@ -120,3 +120,10 @@ class RecoveryState:
             "recovery_latency_ms": self.last_latency_ms,
             "dropped_input": self.dropped_input,
         }
+
+
+def live_state(upstream: Any) -> RecoveryState | None:
+    candidate = getattr(upstream, "recovery", None)
+    if candidate is not None and hasattr(candidate, "state"):
+        return candidate
+    return getattr(getattr(upstream, "session", None), "recovery", None)

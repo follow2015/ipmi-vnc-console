@@ -82,10 +82,13 @@ def test_only_the_address_is_published():
     source = Path(worker.__file__).read_text(encoding="utf-8")
     assert 'id="asset-label"' in html
     assert "fetch('/_platform/meta'" in worker.REAL_CONSOLE_JS
-    marker = 'if request.path == "/_platform/meta"'
-    assert marker in source
+    markers = ('if request.path == "/_platform/meta"',
+               'if path == "/_platform/meta"')
+    marker = next((m for m in markers if m in source), None)
+    assert marker is not None, markers
     block = source[source.index(marker):source.index('if request.method != "GET"', source.index(marker))]
-    assert '{"address": host or "未接入"}' in block
+    assert '{"address": host or "未接入",' in block
+    assert '"asset_id": getattr(sess, "asset_id", "")' in block
     code = "\n".join(line for line in block.splitlines()
                        if not line.lstrip().startswith("#")).lower()
     for secret in ("password", "ticket", "cookie", "fingerprint", "credential"):
