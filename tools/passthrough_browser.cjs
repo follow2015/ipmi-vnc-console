@@ -456,9 +456,11 @@ if (require.main === module) (async () => {
               else if (char !== char.toUpperCase()) caseMap.push([index, 'l']);
             }
           }
+          const visibleChars = [...text].filter((char) => !/\s/.test(char)).length;
           result.probe = { before: before.fingerprint, after: canvas.fingerprint,
                            changed: before.fingerprint !== canvas.fingerprint,
-                           expected_chars: text.length, case_map: caseMap,
+                           expected_chars: text.length, visible_chars: visibleChars,
+                           case_map: caseMap,
                            echo: await echoReadout('diff') };
         }
         result.step_samples.push({

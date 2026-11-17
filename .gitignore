@@ -31,6 +31,9 @@ frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo
 
+# 并发 pytest 的独立 basetemp；证据落在 docs 后这些只是中间产物
+.pytest-tmp-*/
+
 # 公开部署仓（sync_to_deploy.py 的目标，独立 git 仓，不进主仓）
 ipmi-vnc-console-deploy/
 

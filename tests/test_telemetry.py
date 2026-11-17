@@ -63,7 +63,29 @@ def test_evidence_never_copies_a_payload_even_when_the_relay_offers_one():
                            "exception_type", "since_last_rx_s",
                            "recoveries", "recovery_attempts", "recovery_last_error",
                            "recovery_latency_ms", "dropped_input",
-                           "recovery_input_replayed", "recovery_input_dropped"}
+                           "recovery_input_replayed", "recovery_input_dropped",
+                           "geometry_reloads", "reload_requested", "reload_reason",
+                           "geometry_before", "geometry_after"}
+
+
+def test_a_geometry_reload_is_counted_as_a_survivable_event():
+    class Reloaded(_Relay):
+        def as_dict(self):
+            return dict(super().as_dict(),
+                        reload_requested=True, reload_reason="geometry_changed",
+                        geometry_before={"width": 1024, "height": 768, "pixel_format": "ab" * 16},
+                        geometry_after={"width": 800, "height": 600, "pixel_format": "cd" * 16})
+
+    telemetry = SessionTelemetry()
+    telemetry.note_connection(Reloaded())
+    telemetry.note_geometry_reload()
+    record = telemetry.evidence(sid="d" * 32, reason="client_closed", cleanup="confirmed")
+    assert record["geometry_reloads"] == 1
+    assert record["reload_requested"] is True
+    assert record["reload_reason"] == "geometry_changed"
+    assert record["geometry_before"] == {"width": 1024, "height": 768}
+    assert record["geometry_after"] == {"width": 800, "height": 600}
+    assert telemetry.live(ws_open=1, opening=0, lease_remaining=5, closing=False)["geometry_reloads"] == 1
 
 
 def test_a_relay_that_cannot_describe_itself_still_produces_a_record():

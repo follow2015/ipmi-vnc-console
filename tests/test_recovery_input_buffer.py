@@ -131,3 +131,26 @@ def test_shaper_flush_keeps_a_release_during_recovery_and_counts_dropped_presses
         await sess.close()
 
     asyncio.run(scenario())
+
+
+def test_a_reopened_socket_cannot_receive_new_input_before_configuration_is_restored():
+    async def scenario():
+        sink = Sink()
+        allowed, sizes = client_message_profile("RFB 055.008")
+        sess = RfbPassthroughSession(
+            sink, SimpleNamespace(completed=True, shared=False),
+            allowed_client_messages=allowed, message_sizes=sizes,
+            recovery=RecoveryPolicy())
+        rebuild(sess)
+        from kvmhub.rfb_upstream import set_encodings
+        down, up = build_key_event(0xE1, True), build_key_event(0xE1, False)
+        await sess._forward(set_encodings((0,)) + down + up)
+        assert sink.sent == []
+        assert sess._recovery_input == [up]
+        assert sess.recovery_input_dropped == 2
+        sess.recovery.succeed(10)
+        await sess._replay_recovery_input()
+        assert sink.sent == [up]
+        await sess.close()
+
+    asyncio.run(scenario())

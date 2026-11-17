@@ -89,6 +89,29 @@ class Asset(Contract):
     occupancy_available: bool = False
 
 
+class PlatformAsset(Asset):
+
+    tenant_code: str | None = None
+
+
+class AssetAssignment(Contract):
+
+    asset: Asset
+    action: str
+    previous_tenant: str | None = None
+
+
+class QuotaUsage(Contract):
+
+    tenant_id: str
+    tenant_code: str
+    period: str
+    assets: int
+    sessions: int
+    minutes: int
+    updated: float
+
+
 class CredentialCreated(Contract):
     id: str
     label: str
@@ -317,6 +340,24 @@ class ConsoleCloseResult(Contract):
     sid: str
 
 
+class IntegrationPing(Contract):
+
+    ok: bool
+    tenant_code: str
+    service_account: str
+    token_label: str
+    token_prefix: str
+
+
+class IntegrationAssets(Contract):
+
+    assets: list[Asset]
+
+
+class IntegrationConsoleOpen(ConsoleTicket):
+    session_limit_minutes: int | None = None
+
+
 class ConsoleCleanupResult(Contract):
     ok: bool
     sid: str
@@ -380,6 +421,9 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/login": {"post": "LoginResult"},
     "/api/v2/logout": {"post": "OkResult"},
     "/api/v2/me": {"get": "Me"},
+    "/api/v2/platform/login": {"post": "LoginResult"},
+    "/api/v2/platform/logout": {"post": "OkResult"},
+    "/api/v2/platform/me": {"get": "Me"},
     "/api/v2/users": {"get": "list:UserPublic", "post": "UserPublic"},
     "/api/v2/users/{user_id}/active": {"post": "OkResult"},
     "/api/v2/assets": {"get": "list:Asset", "post": "Asset"},
@@ -405,10 +449,16 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/platform/workers/{worker_id}/drain": {"post": "WorkerInfo"},
     "/api/v2/platform/vendor-profiles": {"get": "list:VendorProfileView"},
     "/api/v2/platform/capabilities": {"get": "list:CapabilityView"},
-    "/api/v2/platform/assets": {"get": "list:Asset"},
+    "/api/v2/platform/assets": {"get": "list:PlatformAsset"},
+    "/api/v2/platform/assets/assign": {"post": "AssetAssignment"},
     "/api/v2/platform/audit": {"get": "list:AuditRow"},
+    "/api/v2/platform/quota-usage": {"get": "list:QuotaUsage"},
     "/api/v2/platform/sessions": {"get": "list:SessionView"},
     "/api/v2/platform/sessions/{sid}/revoke": {"post": "SessionRevoked"},
+    "/api/v2/integration/ping": {"get": "IntegrationPing"},
+    "/api/v2/integration/assets": {"get": "IntegrationAssets"},
+    "/api/v2/integration/console/open": {"post": "IntegrationConsoleOpen"},
+    "/api/v2/integration/consoles/{sid}/close": {"post": "ConsoleCloseResult"},
 }
 
 

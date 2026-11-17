@@ -328,6 +328,71 @@ async def test_ws_disconnect_allows_reconnect_without_logging_out(identities):
         await upstream.close()
 
 
+async def test_geometry_reload_closes_browser_with_4001_and_keeps_session(identities):
+    _, cfg = identities
+
+    class ReloadRelay:
+        protocol = "binary"
+        reload_requested = True
+        reload_reason = "geometry_changed"
+        geometry_before = {"width": 1024, "height": 768}
+        geometry_after = {"width": 800, "height": 600}
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def send_bytes(self, data):
+            return None
+
+        async def close(self, code=1000):
+            return None
+
+    class ReloadAdapter:
+        def __init__(self):
+            self.relay = ReloadRelay()
+
+        async def connect(self, offered):
+            return self.relay
+
+        async def close(self):
+            return True
+
+    app = create_worker(cfg)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    gateway = app[GATEWAY_KEY]
+    reports = []
+
+    async def call(sid, op, data=None):
+        reports.append((op, data))
+        return {"ok": True}
+
+    gateway.call = call
+    sid = "f" * 32
+    adapter = ReloadAdapter()
+    runtime = Runtime(sid, digest("browser-secret"), adapter, time.monotonic() + 30)
+    gateway.sessions[sid] = runtime
+    host = f"w1-{sid}.kvm.localhost:{WORKER_PORT}"
+    headers = {"Host": host, "Origin": f"https://{host}", "Cookie": "__Host-kvm_sid=browser-secret"}
+    try:
+        async with TestServer(app) as server:
+            async with aiohttp.ClientSession() as browser:
+                ws = await browser.ws_connect(server.make_url("/console"), protocols=("binary",),
+                                              headers=headers)
+                message = await ws.receive(timeout=3)
+                assert message.type == aiohttp.WSMsgType.CLOSE
+                assert message.data == worker_module.GEOMETRY_RELOAD_CLOSE
+        assert not runtime.closing, "a geometry reload must not end the session"
+        assert sid in gateway.sessions
+        assert runtime.telemetry.geometry_reloads == 1
+        assert not any(op == "finish" for op, _ in reports)
+    finally:
+        await gateway.finish(runtime, "test_cleanup")
+
+
 async def test_an_upstream_close_is_not_reported_as_a_client_close(identities):
     directory, cfg = identities
     logged_out = []

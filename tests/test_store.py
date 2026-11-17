@@ -90,9 +90,40 @@ def test_unexchanged_ticket_expires_and_releases_slot(setup_store):
     store, now, *_ = setup_store
     row = store.allocate("mock-1", "local-admin", "w1", "i1", "trace")
     now[0] += 61
-    store.sweep()
+    assert store.sweep() == [row["id"]]
     assert store.get(row["id"])["status"] == "closed"
     store.allocate("mock-1", "local-admin", "w1", "i1", "trace")
+
+
+def test_hard_cap_bounds_every_renewal_and_is_audited(setup_store):
+    store, now, *_ = setup_store
+    cap = now[0] + 90
+    row = store.allocate("mock-1", "local-admin", "w1", "i1", "trace", hard_cap=cap)
+    assert row["hard_until"] == cap
+    store.exchange(claims(row), "trace")
+    store.renew(row["id"], "w1", "i1", activate=True)
+    for _ in range(4):
+        now[0] += 20
+        store.renew(row["id"], "w1", "i1")
+    assert store.get(row["id"])["lease_until"] == cap
+    now[0] += 11
+    with pytest.raises(Problem, match="session_revoked"):
+        store.renew(row["id"], "w1", "i1")
+    assert store.sweep() == [row["id"]]
+    deadline = [dict(r) for r in store.db.execute(
+        "SELECT detail FROM audit WHERE action='session_deadline'")]
+    assert deadline[-1]["detail"].find('"cause":"hard_limit"') >= 0
+
+
+def test_sweep_names_only_the_sessions_it_ended(setup_store):
+    store, now, *_ = setup_store
+    first = store.allocate("mock-1", "local-admin", "w1", "i1", "trace")
+    now[0] += 61
+    assert store.sweep() == [first["id"]]
+    assert store.sweep() == []
+    second = store.allocate("mock-1", "local-admin", "w1", "i1", "trace")
+    assert store.sweep() == []
+    assert store.get(second["id"])["status"] == "pending"
 
 
 def test_revoke_blocks_activation_renewal_and_stale_instance(setup_store):
@@ -180,6 +211,25 @@ def test_user_authorization_and_audit_append_only(setup_store):
         store.public(row["id"], "intruder")
     with pytest.raises(sqlite3.IntegrityError, match="append only"):
         store.db.execute("DELETE FROM audit")
+
+
+def test_a_tenant_grant_opens_the_asset_for_any_account(setup_store):
+    from kvmhub.store import TENANT_GRANT
+
+    store, now, *_ = setup_store
+    with pytest.raises(Problem, match="permission_denied"):
+        store.allocate("mock-1", "someone-new", "w1", "i1", "trace")
+
+    store.db.execute("INSERT INTO access_grant VALUES(?,?,?)",
+                     (TENANT_GRANT, "mock-1", now[0] + 3600))
+    row = store.allocate("mock-1", "someone-new", "w1", "i1", "trace")
+    assert row["user_id"] == "someone-new"
+    assert store.exchange(claims(row), "trace")["password"] == "fixture-password"
+
+    store.db.execute("UPDATE access_grant SET expires=? WHERE user_id=?",
+                     (now[0] - 1, TENANT_GRANT))
+    with pytest.raises(Problem, match="permission_denied"):
+        store.allocate("mock-1", "someone-new", "w1", "i2", "trace")
 
 
 def test_ticket_requires_instance_claims_and_signature():

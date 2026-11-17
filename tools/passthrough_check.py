@@ -400,9 +400,14 @@ def probe_report(probe: dict | None, case: dict | None) -> dict:
                 "accuracy": None, "case_sensitive": None, "case": "unknown",
                 "case_method": "none", "caps_lock": "unknown", "notes": []}
     echo = probe.get("echo") if isinstance(probe, dict) else None
-    expected = probe.get("expected_chars")
+    expected = probe.get("visible_chars")
+    if not isinstance(expected, int):
+        expected = probe.get("expected_chars")
     groups = (echo or {}).get("groups")
     notes: list[str] = []
+    if (isinstance(expected, int) and isinstance(probe.get("expected_chars"), int)
+            and expected != probe["expected_chars"]):
+        notes.append("spaces_excluded_from_expected")
     case_sensitive = None
     if isinstance(case, dict):
         lower = (case.get("lower") or {}).get("signature")

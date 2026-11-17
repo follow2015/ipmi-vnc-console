@@ -242,6 +242,16 @@ function makeRfbClass(state) {
       this._rfb_state = 'disconnected';
       this.connected = 0;
       this.disconnected = 0;
+      const listeners = {};
+      this._sock = {
+        _websocket: {
+          addEventListener(type, fn) { listeners[type] = fn; },
+          fire(type, event) { if (listeners[type]) listeners[type](event); },
+          onclose: null,
+          closeCode: null,
+        },
+        send() {},
+      };
       state.rfbs.push(this);
     }
     connect() { this.connected += 1; }
@@ -345,6 +355,25 @@ async function runRealCloseGuard() {
   };
 }
 
+async function runRealGeometryReload() {
+  const { sandbox, state, load } = newReal();
+  load();
+  await flush();
+  const rfb = state.rfbs[0];
+  rfb.emit('normal'); // watchFrames() attaches the transport close watcher
+  const raw = rfb._sock._websocket;
+  raw.fire('close', { code: 4001 });
+  rfb.emit('disconnected');
+  const delay = firePendingTimer(state);
+  return {
+    reloads: state.reloads,
+    delay,
+    status: state.status.textContent,
+    storage_attempts: JSON.parse(state.storage.raw.__kvm_recovery_v1 || '{}').attempts || 0,
+    health_state: sandbox.__kvm_health && sandbox.__kvm_health.state,
+  };
+}
+
 async function runRealSignedOut() {
   const { sandbox, state, load } = newReal({ fetchMode: 'unauthorized' });
   load();
@@ -393,6 +422,7 @@ async function main() {
     mock_close: mockClose,
     real: await runReal(),
     real_recovery: await runRealRecovery(),
+    real_geometry_reload: await runRealGeometryReload(),
     real_close: await runRealCloseGuard(),
     real_signed_out: await runRealSignedOut(),
     real_at_limit: await runRealAtLimit(),

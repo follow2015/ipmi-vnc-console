@@ -41,6 +41,8 @@ MAX_TRACES = 1024
 
 CONNECTION_LIMIT = 4
 
+GEOMETRY_RELOAD_CLOSE = 4001
+
 
 def connection_limit(adapter) -> int:
     return min(CONNECTION_LIMIT, getattr(adapter, "connection_limit", CONNECTION_LIMIT))
@@ -83,6 +85,12 @@ def localize_console(text: str, request) -> str:
 
 CLIENT_SIDE_END_REASONS = frozenset({"client_message_denied", "client_message_malformed",
                                     "input_overflow"})
+
+
+def request_origin(request) -> str:
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    proto = request.headers.get("X-Forwarded-Proto") or "https"
+    return f"{proto}://{host}"
 
 
 def upstream_end_reason(upstream) -> str:
@@ -324,6 +332,11 @@ REAL_CONSOLE_JS = """'use strict';
   var zoomMode = 'oneone';   // 'fit' or 'oneone'
   var ended = false;
   var explained = false;
+  // The gateway closes this socket with 4001 when the BMC came back from a
+  // rebuild at a different resolution. That is a controlled reload, not a dead
+  // session: rebuild the vendor client so it re-handshakes with the new geometry.
+  var GEOMETRY_RELOAD_CODE = 4001;
+  var geometryReloaded = false;
   // The device address is safe to show: the Worker only publishes the host
   // from the verified target policy. Tickets, cookies and credentials never
   // reach this page. A failed probe just keeps the generic label.
@@ -543,6 +556,14 @@ REAL_CONSOLE_JS = """'use strict';
   }
   function retry(state) {
     if (stopped || rec.closed || health.exhausted || reloadTimer !== null || renewing) return;
+    // A geometry-change reload is not a failure of this vendor client. Do not
+    // spend the reconnect budget on it: the gateway already rebuilt the console
+    // and the page just needs one clean handshake at the new framebuffer size.
+    if (geometryReloaded) {
+      setStatus('分辨率已变更，正在重新载入画面…');
+      location.reload();
+      return;
+    }
     if (explained) { exhaust('客户端状态：' + state); return; }
     var n = (rec.attempts || 0) + 1;
     var total = (rec.total || 0) + 1;
@@ -629,7 +650,13 @@ REAL_CONSOLE_JS = """'use strict';
       });
     } catch (error) { exhaust('初始化失败：' + error); return; }
     window.__kvm = rfb;
-    rfb.connect(location.hostname, location.port, '000000000000000000000000',
+    // ``location.port`` is the empty string on a default port, and noVNC
+    // refuses that with "Must set host and port" before it ever opens a
+    // socket. Every fixture ran on 8443/9443, so this only appeared once the
+    // platform was served from https://<host> with no explicit port.
+    rfb.connect(location.hostname,
+                location.port || (location.protocol === 'https:' ? '443' : '80'),
+                '000000000000000000000000',
                 '000000000000000000000000', 'console');
   }
   if (rec.exhausted) {
@@ -1180,6 +1207,31 @@ REAL_CONSOLE_JS = """'use strict';
         sock.__kvmFrameWrapper = wrapper;
         sock.onmessage = wrapper;
       }
+      // Watch the transport close so a gateway-requested geometry reload is not
+      // mistaken for a dead session. The vendor client ships its own `onclose`,
+      // so add a listener rather than replacing it; on the close event we set
+      // the flag that retry() reads. Browsers give the code in the CloseEvent;
+      // a few wrapped transports expose it on the socket object instead.
+      function markGeometryReload(event) {
+        if ((event && event.code === GEOMETRY_RELOAD_CODE) ||
+            raw.closeCode === GEOMETRY_RELOAD_CODE) geometryReloaded = true;
+      }
+      if (typeof raw.addEventListener === 'function' && !raw.__kvmGeometryCloseListener) {
+        raw.__kvmGeometryCloseListener = markGeometryReload;
+        raw.addEventListener('close', markGeometryReload);
+      }
+      // The vendor's own onclose usually fires before an addEventListener handler
+      // registered later, so wrap it too and set the flag *before* it reports the
+      // disconnect. Otherwise retry() would spend a reconnect before it can see
+      // that this was a controlled, geometry-driven reload.
+      if (typeof raw.onclose === 'function' && raw.onclose !== raw.__kvmGeometryCloseWrapper) {
+        var clientClose = raw.onclose;
+        raw.__kvmGeometryCloseWrapper = function (event) {
+          markGeometryReload(event);
+          return clientClose.apply(this, arguments);
+        };
+        raw.onclose = raw.__kvmGeometryCloseWrapper;
+      }
     }
     if (frameTimer === null) frameTimer = setInterval(paintFrameAge, 1000);
   }
@@ -1719,9 +1771,20 @@ class Gateway:
             for task in done:
                 task.result()
             if from_upstream in done and not sess.closing:
-                ending = asyncio.create_task(self.end_lost_upstream(sess, upstream))
-                self.watchdogs.add(ending)
-                ending.add_done_callback(self.watchdogs.discard)
+                if getattr(upstream, "reload_requested", False):
+                    size = upstream.geometry_after or {}
+                    sess.telemetry.note_geometry_reload()
+                    log.info("session %s geometry reload %s->%s (%s)", sess.sid,
+                             (upstream.geometry_before or {}).get("width"),
+                             size.get("width"), upstream.reload_reason)
+                    with contextlib.suppress(Exception):
+                        async with asyncio.timeout(3):
+                            await client.close(code=GEOMETRY_RELOAD_CLOSE,
+                                               message=b"geometry changed")
+                else:
+                    ending = asyncio.create_task(self.end_lost_upstream(sess, upstream))
+                    self.watchdogs.add(ending)
+                    ending.add_done_callback(self.watchdogs.discard)
         finally:
             for task in pumps:
                 task.cancel()
@@ -1743,7 +1806,7 @@ class Gateway:
             return web.Response(text=f"location.replace('{target}');",
                                 content_type="application/javascript")
         sess = self.authenticated(request)
-        origin = "https://" + request.host
+        origin = request_origin(request)
         if path == "/_platform/close" and request.method == "POST":
             if request.headers.get("Origin") != origin:
                 raise Problem("csrf_rejected", 403)

@@ -72,6 +72,7 @@ class Settings:
     worker_url_template: str = ""
     passthrough_targets: str = ""
     iframe_mode: str = "off"
+    integration_trusted_proxies: str = ""
 
     @property
     def is_prod(self) -> bool:
@@ -103,6 +104,11 @@ class Settings:
                 raise ValueError("KVMHUB_SIGNING_KEY is required when KVMHUB_DATA_PLANE_STORE is set")
             if self.data_plane_key is None or len(self.data_plane_key) != 32:
                 raise ValueError("KVMHUB_DATA_PLANE_KEY must decode to exactly 32 bytes")
+        if self.integration_trusted_proxies:
+            import ipaddress
+            for item in self.integration_trusted_proxies.split(","):
+                if item.strip():
+                    ipaddress.ip_network(item.strip(), strict=False)
 
 
 def _decode_key(raw: str, name: str) -> bytes | None:
@@ -139,6 +145,7 @@ def settings(env_path: str | os.PathLike[str] | None = None) -> Settings:
         worker_url_template=os.getenv("KVMHUB_WORKER_URL_TEMPLATE", ""),
         passthrough_targets=os.getenv("KVMHUB_PASSTHROUGH_TARGETS", ""),
         iframe_mode=os.getenv("KVMHUB_IFRAME_MODE", "off").strip().lower(),
+        integration_trusted_proxies=os.getenv("KVMHUB_TRUSTED_PROXIES", "").strip(),
     )
     cfg.validate()
     return cfg

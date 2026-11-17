@@ -37,9 +37,9 @@ def _clamp(value: Any, low: float, high: float, default: float) -> float:
 @dataclass(frozen=True)
 class RecoveryPolicy:
 
-    attempts: int = 2
-    first_delay: float = 0.4
-    max_delay: float = 2.0
+    attempts: int = 3
+    first_delay: float = 1.0
+    max_delay: float = 4.0
     max_total: int = 3
     deadline: float = 20.0
     frame_timeout: float = 3.0

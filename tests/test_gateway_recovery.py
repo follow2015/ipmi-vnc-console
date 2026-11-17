@@ -6,7 +6,9 @@ import pytest
 
 from kvmhub.ast2100_protocol import client_protocol_version, framebuffer_update_request
 from kvmhub.common import Problem
-from kvmhub.passthrough import INSYDE_CLIENT_MESSAGES, INSYDE_MESSAGE_SIZES, BrowserHandshake, RfbPassthroughSession
+from kvmhub.passthrough import (INSYDE_CLIENT_MESSAGES, INSYDE_MESSAGE_SIZES,
+                                BrowserHandshake, RfbPassthroughSession,
+                                server_init_geometry)
 from kvmhub.recovery import RecoveryPolicy, RecoveryState, retryable
 from kvmhub.rfb_upstream import RfbUpstream, set_encodings
 from tests.support.fake_bmc import SERVER_INIT, FakeBmc, config_for
@@ -85,6 +87,45 @@ async def test_a_dropped_console_is_rebuilt_and_frames_resume(server):
     await upstream.close()
 
 
+@pytest.mark.parametrize("pixel_last", [False, True])
+@pytest.mark.parametrize("fail_first_replay", [False, True])
+async def test_rebuild_replays_latest_browser_configuration_before_requesting_frames(
+        server, pixel_last, fail_first_replay):
+    policy = RecoveryPolicy(attempts=2, first_delay=0.02, deadline=10)
+    upstream, session, version = await session_on(server, policy)
+    try:
+        pixel = b"\x00" * 4 + struct.pack(">BBBBHHHBBB3x", 32, 24, 0, 1,
+                                           255, 255, 255, 16, 8, 0)
+        encodings = set_encodings((87, -223))
+        settings = encodings + pixel if pixel_last else pixel + encodings
+        await session.send_bytes(browser_hello(version))
+        await session.send_bytes(set_encodings((0,)))
+        await session.send_bytes(settings[:7])
+        await session.send_bytes(settings[7:] + framebuffer_update_request(False, 0, 0, 1024, 768))
+
+        send_raw = upstream.send_raw
+        failures = []
+
+        async def fail_once(payload):
+            if fail_first_replay and not failures and session.recovery.state == "recovering":
+                failures.append(True)
+                raise Problem("upstream_unavailable", 502)
+            await send_raw(payload)
+
+        upstream.send_raw = fail_once
+
+        assert saw_last_frame(await read_until(session, saw_last_frame))
+        expected = [("SetEncodings", (87, -223)), ("SetPixelFormat", pixel[4:])]
+        if not pixel_last:
+            expected.reverse()
+        assert server.client_messages[-3:] == expected + [("FBURequest", 0, 0, 0, 1024, 768)]
+        assert server.console_opens == (3 if fail_first_replay else 2)
+        assert session.recovery.recoveries == 1
+    finally:
+        await session.close()
+        await upstream.close()
+
+
 async def test_the_rebuild_is_bounded_by_the_session_budget(server):
     server.drop_connections = 99
     policy = RecoveryPolicy(attempts=1, first_delay=0.02, max_total=2, deadline=10)
@@ -99,6 +140,14 @@ async def test_the_rebuild_is_bounded_by_the_session_budget(server):
     assert session.error == "upstream_reconnect_failed"
     await session.close()
     await upstream.close()
+
+
+def test_server_init_geometry_is_shape_only():
+    shape = server_init_geometry(SERVER_INIT)
+    assert shape["width"] == 1024 and shape["height"] == 768
+    assert len(shape["pixel_format"]) == 32
+    assert "fake" not in str(shape)
+    assert server_init_geometry(b"short") == {}
 
 
 def test_the_budget_reason_is_only_used_when_a_budget_ran_out():
@@ -167,17 +216,24 @@ async def test_a_dead_web_session_is_not_reopened(server):
     await upstream.close()
 
 
-async def test_a_changed_framebuffer_ends_the_session_instead_of_growing(server):
-    server.server_init_after = other_server_init()
+async def test_a_changed_framebuffer_requests_a_reload_not_an_end(server):
+    server.server_init_after = other_server_init(width=800, height=600)
     policy = RecoveryPolicy(attempts=2, first_delay=0.02, deadline=10)
     upstream, session, version = await session_on(server, policy)
     await complete_browser_side(session, version)
 
     await read_until(session, lambda messages: False)
-    assert session.recovery.state == "given_up"
-    assert session.recovery.last_error == "upstream_changed"
-    assert session.error == "upstream_changed"
+    assert session.reload_requested is True
+    assert session.reload_reason == "geometry_changed"
+    assert session.geometry_before == {"width": 1024, "height": 768,
+                                       "pixel_format": session.geometry_before["pixel_format"]}
+    assert session.geometry_after["width"] == 800
+    assert session.geometry_after["height"] == 600
+    assert session.recovery.state == "relaying"
+    assert session.recovery.recoveries == 1
+    assert session.error is None
     assert server.console_opens == 2
+    assert upstream.server_init_raw[:2] == (800).to_bytes(2, "big")
     await session.close()
     await upstream.close()
 
@@ -222,8 +278,8 @@ async def test_input_during_a_rebuild_is_dropped_not_fatal(server):
 
 def test_reopen_is_the_default_and_cheap():
     policy = RecoveryPolicy()
-    assert policy.attempts == 2 and policy.max_total == 3
-    assert [policy.delay(n) for n in (1, 2, 3)] == [0.4, 0.8, 1.6]
+    assert policy.attempts == 3 and policy.max_total == 3
+    assert [policy.delay(n) for n in (1, 2, 3)] == [1.0, 2.0, 4.0]
     assert policy.delay(9) == policy.max_delay
 
 

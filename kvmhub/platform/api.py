@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
@@ -63,8 +64,12 @@ class Platform:
             seed_roles(db)
 
     @property
-    def cookie_name(self) -> str:
+    def tenant_cookie_name(self) -> str:
         return "__Host-kvmhub_sid" if self.cfg.is_prod else "kvmhub_sid"
+
+    @property
+    def admin_cookie_name(self) -> str:
+        return "__Host-kvmhub_admin_sid" if self.cfg.is_prod else "kvmhub_admin_sid"
 
     async def ready(self) -> dict:
         checks: dict[str, bool] = {"database": False, "state": False, "credential_key": bool(self.cipher.available)}
@@ -136,8 +141,19 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         return response
 
     async def current(request: Request, *, mutate: bool = False, permission: str | None = None,
-                      tenant_required: bool = True, platform_only: bool = False) -> dict:
-        token = request.cookies.get(platform.cookie_name, "")
+                      tenant_required: bool = True, platform_only: bool = False,
+                      admin: bool = False) -> dict:
+        cookie = platform.admin_cookie_name if admin else platform.tenant_cookie_name
+        token = request.cookies.get(cookie, "")
+        if not token:
+            other = request.cookies.get(
+                platform.tenant_cookie_name if admin else platform.admin_cookie_name, "")
+            if admin and other:
+                raise services.PlatformError("platform_access_denied", "该入口仅限平台管理员", 403)
+            if not admin and other:
+                raise services.PlatformError(
+                    "platform_account_requires_platform_api",
+                    "平台账号请使用 /api/v2/platform 管理接口", 403)
         auth = await platform.state.get_session(token_digest(token)) if token else None
         if not auth or float(auth.get("expires", 0)) <= time.time():
             raise services.PlatformError("authentication_required", "请先登录", 401)
@@ -170,11 +186,87 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     async def current_platform(request: Request, *, mutate: bool = False,
                                permission: str | None = None) -> dict:
         auth = await current(request, mutate=mutate, tenant_required=False,
-                             platform_only=True)
+                             platform_only=True, admin=True)
         code = permission or "platform.tenant.read"
         with transaction(platform.factory) as db:
             services.require(db, auth["user_id"], code)
         return auth
+
+    async def current_integration(request: Request) -> dict:
+        parts = request.headers.get("authorization", "").split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise services.PlatformError("authentication_required", "需要 Bearer 服务凭据", 401)
+        with transaction(platform.factory) as db:
+            auth = services.authenticate_service_token(
+                db, parts[1], request.client.host if request.client else "",
+                request.headers.get("x-forwarded-for", ""),
+                trusted_proxies=platform.cfg.integration_trusted_proxies)
+            services.require(db, auth["user_id"], "console.open")
+        return auth
+
+    @app.get("/api/v2/integration/ping")
+    async def integration_ping(request: Request):
+        auth = await current_integration(request)
+        return {"ok": True, "tenant_code": auth["tenant_code"],
+                "service_account": auth["username"], "token_label": auth["token_label"],
+                "token_prefix": auth["token_prefix"]}
+
+    @app.get("/api/v2/integration/assets")
+    async def integration_assets(request: Request):
+        auth = await current_integration(request)
+        with transaction(platform.factory) as db:
+            assets = db.scalars(select(Asset).where(Asset.tenant_id == auth["tenant_id"])
+                                .order_by(Asset.address)).all()
+            return {"assets": [a.public() for a in assets]}
+
+    @app.post("/api/v2/integration/console/open")
+    async def integration_console_open(request: Request):
+        auth = await current_integration(request)
+        plane = require_plane()
+        body = await _json(request)
+        asset_id = str(body.get("asset_id", "") or "")
+        address = str(body.get("address", "") or "")
+        operator = str(body.get("operator", "") or "")[:128]
+        with transaction(platform.factory) as db:
+            if not asset_id and address:
+                row = db.scalar(select(Asset.id).where(Asset.address == address,
+                                                      Asset.tenant_id == auth["tenant_id"]))
+                asset_id = str(row or "")
+            try:
+                assembly = connection.assembly(
+                    db, asset_id=asset_id, user_id=auth["user_id"],
+                    actor=auth["username"], tenant_id=auth["tenant_id"])
+                quotas = services.tenant_quotas(db, auth["tenant_id"])
+            except connection.ConnectionRefused as exc:
+                raise _refused(exc) from exc
+        result = await plane.open(assembly, user_id=auth["user_id"], trace=request.state.trace,
+                                  concurrent_limit=services.quota_limit(
+                                      quotas, "max_concurrent_sessions"),
+                                  session_limit_minutes=services.quota_limit(
+                                      quotas, "max_session_minutes"))
+        with transaction(platform.factory) as db:
+            services.audit(db, auth["username"], "console_ticket_issued", asset_id=asset_id,
+                           tenant_id=auth["tenant_id"], actor_type="dcim_system",
+                           detail={"sid": result["sid"], "worker_id": result["worker_id"],
+                                   "assembly_id": result["assembly_id"],
+                                   "hard_until": result["hard_until"],
+                                   "session_limit_minutes": result["session_limit_minutes"],
+                                   "operator": operator, "token_id": auth["token_id"]},
+                           trace=request.state.trace)
+        return result
+
+    @app.post("/api/v2/integration/consoles/{sid}/close")
+    async def integration_console_close(sid: str, request: Request):
+        auth = await current_integration(request)
+        result = await require_plane().close_session(
+            sid, user_id=auth["user_id"], trace=request.state.trace,
+            tenant_id=auth["tenant_id"])
+        with transaction(platform.factory) as db:
+            services.audit(db, auth["username"], "console_ticket_revoked",
+                           tenant_id=auth["tenant_id"], actor_type="dcim_system",
+                           detail={"sid": sid, "token_id": auth["token_id"]},
+                           trace=request.state.trace)
+        return result
 
     @app.get("/healthz")
     async def healthz():
@@ -194,6 +286,9 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             user = services.authenticate(db, str(body.get("username", "")),
                                          str(body.get("password", "")),
                                          tenant_code=str(body.get("tenant_code", "") or ""))
+            if user.tenant_id is None:
+                raise services.PlatformError(
+                    "platform_account_requires_platform_login", "平台账号请从独立后台登录", 403)
             roles = services.roles_of(db, user.id)
         token, csrf = new_session_token(), new_session_token()
         await platform.state.put_session(
@@ -203,28 +298,96 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
              "expires": time.time() + platform.cfg.session_ttl}, platform.cfg.session_ttl)
         response = JSONResponse({"user": user.public(), "roles": roles, "csrf": csrf,
                                  "tenant_id": user.tenant_id})
-        response.set_cookie(platform.cookie_name, token, max_age=platform.cfg.session_ttl,
-                            secure=platform.cfg.is_prod, httponly=True, samesite="strict", path="/")
+        response.set_cookie(platform.tenant_cookie_name, token,
+                            max_age=platform.cfg.session_ttl, secure=platform.cfg.is_prod,
+                            httponly=True, samesite="strict", path="/")
+        return response
+
+    @app.post("/api/v2/platform/login")
+    async def platform_login(request: Request):
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            user = services.authenticate(db, str(body.get("username", "")),
+                                         str(body.get("password", "")))
+            if user.tenant_id is not None:
+                raise services.PlatformError("platform_access_denied", "该入口仅限平台管理员", 403)
+            services.require(db, user.id, "platform.tenant.read")
+            roles = services.roles_of(db, user.id)
+        token, csrf = new_session_token(), new_session_token()
+        await platform.state.put_session(
+            token_digest(token),
+            {"user_id": user.id, "username": user.username, "roles": roles, "csrf": csrf,
+             "tenant_id": None,
+             "expires": time.time() + platform.cfg.session_ttl}, platform.cfg.session_ttl)
+        response = JSONResponse({"user": user.public(), "roles": roles, "csrf": csrf,
+                                 "tenant_id": None})
+        response.set_cookie(platform.admin_cookie_name, token,
+                            max_age=platform.cfg.session_ttl, secure=platform.cfg.is_prod,
+                            httponly=True, samesite="strict", path="/")
         return response
 
     @app.post("/api/v2/logout")
     async def logout(request: Request):
-        auth = await current(request, mutate=True)
-        token = request.cookies.get(platform.cookie_name, "")
+        token = request.cookies.get(platform.tenant_cookie_name, "")
+        auth = None
+        if token:
+            session_data = await platform.state.get_session(token_digest(token))
+            is_tenant = False
+            if session_data:
+                user_id = session_data.get("user_id")
+                with transaction(platform.factory) as db:
+                    row = (db.execute(select(User.tenant_id).where(User.id == user_id)).first()
+                           if user_id else None)
+                is_tenant = row is not None and row[0] is not None
+            if is_tenant:
+                auth = await current(request, mutate=True)
+        if token:
+            await platform.state.drop_session(token_digest(token))
+        if auth:
+            with transaction(platform.factory) as db:
+                services.audit(db, auth["username"], "logout", tenant_id=auth["tenant_id"])
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(platform.tenant_cookie_name, path="/")
+        return response
+
+    @app.post("/api/v2/platform/logout")
+    async def platform_logout(request: Request):
+        auth = await current(request, mutate=True, tenant_required=False,
+                             platform_only=True, admin=True)
+        token = request.cookies.get(platform.admin_cookie_name, "")
         await platform.state.drop_session(token_digest(token))
         with transaction(platform.factory) as db:
-            services.audit(db, auth["username"], "logout", tenant_id=auth["tenant_id"])
+            services.audit(db, auth["username"], "logout", tenant_id=None,
+                           actor_type="platform")
         response = JSONResponse({"ok": True})
-        response.delete_cookie(platform.cookie_name, path="/")
+        response.delete_cookie(platform.admin_cookie_name, path="/")
         return response
 
     @app.get("/api/v2/me")
     async def me(request: Request):
         auth = await current(request, tenant_required=False)
+        if auth["tenant_id"] is None:
+            token = request.cookies.get(platform.tenant_cookie_name, "")
+            if token:
+                await platform.state.drop_session(token_digest(token))
+            response = JSONResponse(
+                {"error": "authentication_required", "message": "请使用对应入口登录",
+                 "trace_id": request.state.trace}, status_code=401)
+            response.delete_cookie(platform.tenant_cookie_name, path="/")
+            return response
         with transaction(platform.factory) as db:
             perms = sorted(services.permissions_of(db, auth["user_id"]))
         return {"user_id": auth["user_id"], "username": auth["username"],
                 "tenant_id": auth["tenant_id"], "roles": auth["roles"],
+                "permissions": perms, "csrf": auth["csrf"]}
+
+    @app.get("/api/v2/platform/me")
+    async def platform_me(request: Request):
+        auth = await current(request, tenant_required=False, platform_only=True, admin=True)
+        with transaction(platform.factory) as db:
+            perms = sorted(services.permissions_of(db, auth["user_id"]))
+        return {"user_id": auth["user_id"], "username": auth["username"],
+                "tenant_id": None, "roles": auth["roles"],
                 "permissions": perms, "csrf": auth["csrf"]}
 
     @app.get("/api/v2/users")
@@ -259,17 +422,17 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         return {"ok": True}
 
     @app.get("/api/v2/assets")
-    async def assets(request: Request, scope: str = "granted"):
-        if scope not in ("granted", "all"):
-            raise services.PlatformError("scope_invalid", "scope 只能是 granted 或 all", 400)
-        if scope == "all":
-            auth = await current(request, permission="asset.write")
-            with transaction(platform.factory) as db:
-                rows = services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"])
-        else:
+    async def assets(request: Request, scope: str = "tenant"):
+        if scope not in ("tenant", "granted", "all"):
+            raise services.PlatformError("scope_invalid", "scope 只能是 tenant、granted 或 all", 400)
+        if scope == "granted":
             auth = await current(request, permission="asset.read")
             with transaction(platform.factory) as db:
                 rows = services.assets_for_user(db, auth["user_id"], tenant_id=auth["tenant_id"])
+        else:
+            auth = await current(request, permission="asset.write" if scope == "all" else "asset.read")
+            with transaction(platform.factory) as db:
+                rows = services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"])
         occupancy = platform.plane.asset_occupancy(
             [row["id"] for row in rows], auth["user_id"], manage=scope == "all") if platform.plane else {}
         with transaction(platform.factory) as db:
@@ -438,12 +601,16 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             raise _refused(exc) from exc
         result = await plane.open(assembly, user_id=auth["user_id"], trace=request.state.trace,
                                   concurrent_limit=services.quota_limit(
-                                      quotas, "max_concurrent_sessions"))
+                                      quotas, "max_concurrent_sessions"),
+                                  session_limit_minutes=services.quota_limit(
+                                      quotas, "max_session_minutes"))
         with transaction(platform.factory) as db:
             services.audit(db, auth["username"], "console_ticket_issued", asset_id=asset_id,
                            tenant_id=auth["tenant_id"],
                            detail={"sid": result["sid"], "worker_id": result["worker_id"],
-                                   "assembly_id": result["assembly_id"]},
+                                   "assembly_id": result["assembly_id"],
+                                   "hard_until": result["hard_until"],
+                                   "session_limit_minutes": result["session_limit_minutes"]},
                            trace=request.state.trace)
         return result
 
@@ -645,8 +812,23 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         if tenant_id:
             query = query.where(Asset.tenant_id == tenant_id)
         with transaction(platform.factory) as db:
-            return [{key: value for key, value in asset.public().items() if key != "credential_id"}
+            codes = {row.id: row.code for row in db.scalars(select(Tenant))}
+            return [{**{key: value for key, value in asset.public().items()
+                        if key != "credential_id"},
+                     "tenant_code": codes.get(asset.tenant_id)}
                     for asset in db.scalars(query).all()]
+
+    @app.post("/api/v2/platform/assets/assign")
+    async def platform_assign_asset(request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.asset.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            result = services.assign_asset(
+                db, address=str(body.get("address", "")),
+                tenant_id=str(body.get("tenant_id", "") or ""),
+                name=str(body.get("name", "") or ""), actor=auth["username"],
+                reassign=bool(body.get("reassign", False)))
+        return result
 
     @app.get("/api/v2/platform/audit")
     async def platform_audit(request: Request, limit: int = 100, tenant_id: str = ""):
@@ -657,6 +839,13 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             row["detail"].pop("password", None)
             row["detail"].pop("username", None)
         return rows
+
+    @app.get("/api/v2/platform/quota-usage")
+    async def platform_quota_usage(request: Request, period: str = ""):
+        await current_platform(request, permission="platform.audit.read")
+        period = period or datetime.now(timezone.utc).strftime("%Y-%m")
+        with transaction(platform.factory) as db:
+            return services.quota_usage_view(db, period)
 
     @app.get("/api/v2/platform/sessions")
     async def platform_sessions(request: Request, tenant_id: str = ""):

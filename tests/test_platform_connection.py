@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 
 from kvmhub import capability as poc_capability
 from kvmhub.common import PASSTHROUGH_ADAPTER_ID
@@ -16,7 +16,7 @@ from kvmhub.platform.api import create_app
 from kvmhub.platform.config import Settings
 from kvmhub.platform.db import (init_schema, make_engine, seed_roles,
                                 session_factory, transaction)
-from kvmhub.platform.models import Asset, Capability, VendorProfile
+from kvmhub.platform.models import AccessGrant, Asset, Capability, VendorProfile
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher
 from kvmhub.store import Store
@@ -156,11 +156,21 @@ def test_assembly_is_ready_and_never_exposes_the_credential(world):
     assert BMC_PASSWORD not in str(result) and "ADMIN" not in str(result)
 
 
-def test_viewer_without_a_grant_cannot_assemble(world):
+def test_a_viewer_cannot_assemble_without_console_open(world):
     with transaction(world.factory) as db:
         _refused(lambda: connection.assembly(db, asset_id=world.ids["asset"],
                                              user_id=world.ids["viewer"], actor="viewer"),
-                 "asset_not_granted")
+                 "not_permitted")
+
+
+def test_an_owner_assembles_without_a_grant(world):
+    with transaction(world.factory) as db:
+        db.execute(sa_delete(AccessGrant))
+    with transaction(world.factory) as db:
+        result = connection.assembly(db, asset_id=world.ids["asset"],
+                                     user_id=world.ids["admin"], actor="admin")
+    assert result["checks"] == {"profile": "approved", "capability": "verified",
+                                "credential": "by_id_only"}
 
 
 @pytest.mark.parametrize("gate,expected", [
@@ -259,7 +269,7 @@ def test_http_assembly_refuses_an_unknown_asset(world):
     with TestClient(create_app(world.cfg, state=MemoryState()), base_url=ORIGIN) as c:
         r = c.post("/api/v2/consoles/assembly", headers=login(c),
                    json={"asset_id": str(uuid.uuid4())})
-        assert r.status_code == 409 and r.json()["error"] == "asset_not_granted"
+        assert r.status_code == 409 and r.json()["error"] == "asset_not_found"
 
 
 def test_viewer_cannot_call_the_assembly_endpoint(world):

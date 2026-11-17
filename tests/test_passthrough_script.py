@@ -188,6 +188,16 @@ def test_probe_report_counts_what_actually_came_back():
     assert report["accuracy"] == 0.75
 
 
+def test_a_spaced_marker_is_judged_by_ink_bearing_characters():
+    probe = {"changed": True, "expected_chars": 7, "visible_chars": 4,
+             "echo": {"groups": 4}}
+    report = probe_report(probe, None)
+    assert report["verdict"] == "echoed"
+    assert report["expected_chars"] == 4
+    assert report["accuracy"] == 1.0
+    assert "spaces_excluded_from_expected" in report["notes"]
+
+
 def test_probe_report_calls_a_complete_echo_echoed():
     probe = {"changed": True, "expected_chars": 4, "echo": {"groups": 4}}
     report = probe_report(probe, None)

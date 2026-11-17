@@ -19,11 +19,13 @@ from .ast2100_protocol import (
     RFB_VERSION,
     RFB_VERSION_BYTES,
     SECURITY_TYPE_INSYDE,
+    framebuffer_update_request,
 )
 from .common import Problem
 from .input_shaping import InputOverflow, InputShaper, InputShapingConfig
 from .insyde_messages import is_key_release
 from .recovery import RecoveryPolicy, RecoveryState, retryable
+from .rfb_upstream import set_encodings
 
 SECURITY_TYPES_FRAME = bytes([1, SECURITY_TYPE_INSYDE])
 SECURITY_RESULT_OK = b"\x00\x00\x00\x00"
@@ -58,6 +60,14 @@ SMC_CLIENT_MESSAGES = ALLOWED_CLIENT_MESSAGES | {
     CLIENT_MSG_SMC_MOUSE_SYNC, CLIENT_MSG_INSYDE_MT_CURSOR_POS_REQ}
 SMC_MESSAGE_SIZES = {**INSYDE_MESSAGE_SIZES, CLIENT_MSG_SMC_MOUSE_SYNC: 3}
 MAX_SET_ENCODINGS = 32
+
+
+def server_init_geometry(raw: bytes) -> dict[str, int]:
+    if len(raw) < 20:
+        return {}
+    return {"width": int.from_bytes(raw[0:2], "big"),
+            "height": int.from_bytes(raw[2:4], "big"),
+            "pixel_format": raw[4:20].hex()}
 
 
 def client_message_profile(version: str | None) -> tuple[frozenset[int], dict[int, int]]:
@@ -238,10 +248,16 @@ class RfbPassthroughSession:
                         if input_shaping is not None and input_shaping.enabled else None)
         self._flush_task: asyncio.Task | None = None
         self._recovery_input: list[bytes] = []
+        self._client_settings: dict[int, bytes] = {}
+        self._client_send_lock = asyncio.Lock()
         self.recovery_input_replayed = 0
         self.recovery_input_dropped = 0
         self.client_bytes = 0
         self.server_bytes = 0
+        self.reload_requested = False
+        self.reload_reason: str | None = None
+        self.geometry_before: dict[str, int] | None = None
+        self.geometry_after: dict[str, int] | None = None
 
     @property
     def client_key_events(self) -> int:
@@ -299,7 +315,7 @@ class RfbPassthroughSession:
                 return False
             for payload in outgoing:
                 try:
-                    await self.upstream.send_raw(payload)
+                    await self._send_client(payload)
                 except Problem:
                     if self.recovery is None or self.recovery.state != "recovering":
                         raise
@@ -307,6 +323,17 @@ class RfbPassthroughSession:
         if self._shaper is not None:
             self._schedule_shaper_flush()
         return True
+
+    async def _send_client(self, payload: bytes) -> None:
+        async with self._client_send_lock:
+            if self.recovery is not None and self.recovery.state == "recovering":
+                self._hold_during_recovery(payload)
+                return
+            await self.upstream.send_raw(payload)
+            if self.recovery is not None and payload[0] in (
+                    CLIENT_MSG_SET_PIXEL_FORMAT, CLIENT_MSG_SET_ENCODINGS):
+                self._client_settings.pop(payload[0], None)
+                self._client_settings[payload[0]] = bytes(payload)
 
     RECOVERY_INPUT_LIMIT = 64
 
@@ -343,7 +370,7 @@ class RfbPassthroughSession:
             if not self._closed:
                 for payload in self._shaper.drain():
                     try:
-                        await self.upstream.send_raw(payload)
+                        await self._send_client(payload)
                     except Problem:
                         if self.recovery is not None and self.recovery.state == "recovering":
                             self._hold_during_recovery(payload)
@@ -386,7 +413,8 @@ class RfbPassthroughSession:
                         self.error = error or self.error
                     break
                 if not await self._recover(error):
-                    self.error = self.recovery.last_error or error or self.error
+                    if not self.reload_requested:
+                        self.error = self.recovery.last_error or error or self.error
                     break
         except asyncio.CancelledError:
             raise
@@ -413,7 +441,8 @@ class RfbPassthroughSession:
     async def _recover(self, error: str) -> bool:
         state = self.recovery
         assert state is not None
-        state.begin()
+        async with self._client_send_lock:
+            state.begin()
         expected = self.handshake._server_init[:20]
         started = time.monotonic()
         await self.upstream.drop_websocket()
@@ -428,7 +457,7 @@ class RfbPassthroughSession:
             state.attempt()
             attempt_started = time.monotonic()
             try:
-                await self.upstream.reopen()
+                await self.upstream.reopen(request_frames=False)
             except Problem as exc:
                 state.fail(exc.code)
                 if not retryable(exc.code):
@@ -439,11 +468,22 @@ class RfbPassthroughSession:
                 state.fail("upstream_unavailable")
                 continue
             if self.upstream.server_init_raw[:20] != expected:
-                state.fail("upstream_changed")
-                await self.upstream.drop_websocket()
-                state.give_up("upstream_changed")
+                state.succeed(int((time.monotonic() - attempt_started) * 1000))
+                self.reload_requested = True
+                self.reload_reason = "geometry_changed"
+                self.geometry_before = server_init_geometry(expected)
+                self.geometry_after = server_init_geometry(self.upstream.server_init_raw)
+                await self._replay_recovery_input()
                 return False
             try:
+                async with self._client_send_lock:
+                    settings = b"".join(self._client_settings.values())
+                    if CLIENT_MSG_SET_ENCODINGS not in self._client_settings:
+                        settings += set_encodings()
+                    width = int.from_bytes(expected[:2], "big")
+                    height = int.from_bytes(expected[2:4], "big")
+                    await self.upstream.send_raw(
+                        settings + framebuffer_update_request(False, 0, 0, width, height))
                 await self.upstream.wait_first_frame(timeout=state.policy.frame_timeout)
             except Problem as exc:
                 state.fail(exc.code)
@@ -451,8 +491,9 @@ class RfbPassthroughSession:
             except (aiohttp.ClientError, TimeoutError):
                 state.fail("upstream_unavailable")
                 continue
-            state.succeed(int((time.monotonic() - attempt_started) * 1000))
-            await self._replay_recovery_input()
+            async with self._client_send_lock:
+                await self._replay_recovery_input()
+                state.succeed(int((time.monotonic() - attempt_started) * 1000))
             return True
         state.give_up(state.last_error or error)
         return False
@@ -476,6 +517,7 @@ class RfbPassthroughSession:
             return
         await self._release_held_keys()
         self._closed = True
+        self._client_settings.clear()
         self._room.set()
         if self._flush_task is not None and not self._flush_task.done():
             self._flush_task.cancel()
@@ -511,6 +553,10 @@ class RfbPassthroughSession:
                 "exception_type": self._exception_type,
                 "recovery_input_replayed": self.recovery_input_replayed,
                 "recovery_input_dropped": self.recovery_input_dropped,
+                "reload_requested": self.reload_requested,
+                "reload_reason": self.reload_reason,
+                "geometry_before": self.geometry_before,
+                "geometry_after": self.geometry_after,
                 "client_message_types": {str(kind): count
                                          for kind, count in self._framer.client_types.items()}}
         if self.recovery is not None:

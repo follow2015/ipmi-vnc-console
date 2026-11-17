@@ -66,6 +66,7 @@ def shape(**overrides):
         "recovery_attempts": 2, "recovery_last_error": "bmc_auth_failed",
         "recovery_latency_ms": 740, "dropped_input": 3,
         "recovery_input_replayed": 1, "recovery_input_dropped": 0,
+        "geometry_reloads": 1,
         "client_message_types": {"4": 7, "5": 7},
         "client_message_summary": "4:7,5:7",
         "denied": {"kind": 250, "length": 18},
@@ -82,6 +83,7 @@ def test_audit_evidence_keeps_only_shape_fields():
     assert summary["denied"] == {"kind": 250, "length": 18}
     assert summary["client_message_types"] == {"4": 7, "5": 7}
     assert summary["duration_ms"] == 2000 and summary["dropped_input"] == 3
+    assert summary["geometry_reloads"] == 1
     for forbidden in ("sid", "started_at", "ended_at", "end_reason", "cleanup",
                       "client_message_summary", "password", "keys"):
         assert forbidden not in summary
@@ -90,7 +92,7 @@ def test_audit_evidence_keeps_only_shape_fields():
         "client_bytes", "server_bytes", "key_events", "peak_buffered_bytes",
         "recoveries", "recovery_attempts", "recovery_last_error",
         "recovery_latency_ms", "dropped_input", "client_message_types", "denied",
-        "recovery_input_replayed", "recovery_input_dropped",
+        "recovery_input_replayed", "recovery_input_dropped", "geometry_reloads",
     }
 
 

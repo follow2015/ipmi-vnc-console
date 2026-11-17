@@ -90,6 +90,20 @@ def test_console_scripts_reconnect_bounded(harness_result):
         data["real"]["notices"]
 
 
+def test_geometry_close_reloads_without_spending_retries(harness_result):
+    data = harness_result["real_geometry_reload"]
+    assert data["reloads"] == 1, "the page must re-handshake at the new geometry"
+    assert data["storage_attempts"] == 0, "a geometry reload is not a failed reconnect"
+    assert "分辨率已变更" in data["status"]
+    assert data["delay"] is None
+
+
+def test_geometry_close_code_matches_served_script():
+    code = worker_module.GEOMETRY_RELOAD_CLOSE
+    assert code == 4001
+    assert "GEOMETRY_RELOAD_CODE = " + str(code) in REAL_CONSOLE_JS
+
+
 def test_fixed_host_gone_route_renews_ticket(harness_result):
     data = harness_result["path"]["real_route_gone"]
     assert data["reloads"] == 0, "reloading a dead route would loop on 404"

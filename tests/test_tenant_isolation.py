@@ -1,6 +1,7 @@
 """Multi-tenant isolation (design §4)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -21,7 +22,7 @@ from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,
                                 init_schema, seed_roles, session_factory, transaction)
 from kvmhub.platform.models import DEFAULT_TENANT_ID, Asset, User
 from kvmhub.platform.redis_state import MemoryState
-from kvmhub.platform.security import CredentialCipher
+from kvmhub.platform.security import CredentialCipher, new_session_token, token_digest
 from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,10 +69,12 @@ def env():
 
 def login(client, password, tenant_code="", username="admin"):
     body = {"username": username, "password": password}
-    if tenant_code:
+    path = "/api/v2/login"
+    if username == "platform":
+        path = "/api/v2/platform/login"
+    elif tenant_code:
         body["tenant_code"] = tenant_code
-    response = client.post("/api/v2/login", json=body)
-    return response
+    return client.post(path, json=body)
 
 
 def signed_in(env, tenant_code="", username="admin", password=ADMIN_PASSWORD):
@@ -105,7 +108,7 @@ def test_platform_account_logs_in_without_a_tenant(env):
     response = login(env["client"], PLATFORM_PASSWORD, username="platform")
     assert response.status_code == 200, response.text
     assert response.json()["tenant_id"] is None
-    me = env["client"].get("/api/v2/me").json()
+    me = env["client"].get("/api/v2/platform/me").json()
     assert me["tenant_id"] is None
     assert any(code.startswith("platform.") for code in me["permissions"])
 
@@ -174,6 +177,97 @@ def test_platform_session_cannot_reach_tenant_routes(env):
         response = env["client"].get(path)
         assert response.status_code == 403, path
         assert response.json()["error"] == "platform_account_requires_platform_api"
+
+
+def test_the_two_entrances_mint_different_cookies(env):
+    client, platform = env["client"], env["platform"]
+    client.cookies.clear()
+    assert login(client, ADMIN_PASSWORD, "acme").status_code == 200
+    assert client.cookies.get(platform.tenant_cookie_name)
+    assert client.cookies.get(platform.admin_cookie_name) is None
+    client.cookies.clear()
+    assert login(client, PLATFORM_PASSWORD, username="platform").status_code == 200
+    assert client.cookies.get(platform.admin_cookie_name)
+    assert client.cookies.get(platform.tenant_cookie_name) is None
+
+
+def test_neither_entrance_accepts_the_other_account(env):
+    client = env["client"]
+    response = client.post("/api/v2/login",
+                           json={"username": "platform", "password": PLATFORM_PASSWORD})
+    assert response.status_code == 403
+    assert response.json()["error"] == "platform_account_requires_platform_login"
+
+    with transaction(env["platform"].factory) as db:
+        services.create_user(db, "solo-admin", ADMIN_PASSWORD, "admin", actor="test",
+                             tenant_id=env["acme"])
+    response = client.post("/api/v2/platform/login",
+                           json={"username": "solo-admin", "password": ADMIN_PASSWORD})
+    assert response.status_code == 403
+    assert response.json()["error"] == "platform_access_denied"
+
+
+def test_admin_logout_does_not_sign_out_the_tenant_tab(env):
+    client, platform = env["client"], env["platform"]
+    client.cookies.clear()
+    admin_csrf = login(client, PLATFORM_PASSWORD, username="platform").json()["csrf"]
+    assert login(client, ADMIN_PASSWORD, "acme").status_code == 200
+    tenant_cookie = client.cookies.get(platform.tenant_cookie_name)
+    assert tenant_cookie
+
+    response = client.post("/api/v2/platform/logout",
+                            headers={"Origin": ORIGIN, "X-CSRF-Token": admin_csrf})
+    assert response.status_code == 200, response.text
+    assert client.cookies.get(platform.admin_cookie_name) is None
+    assert client.cookies.get(platform.tenant_cookie_name) == tenant_cookie
+    assert client.get("/api/v2/me").status_code == 200
+    assert client.get("/api/v2/platform/me").status_code == 403
+
+
+def _park_platform_account_in_tenant_cookie(env):
+    client, platform = env["client"], env["platform"]
+    client.cookies.clear()
+    assert login(client, ADMIN_PASSWORD, "acme").status_code == 200
+    token = client.cookies.get(platform.tenant_cookie_name)
+    with transaction(platform.factory) as db:
+        platform_user = db.scalar(select(User).where(User.tenant_id.is_(None)))
+
+    async def seed():
+        await platform.state.put_session(
+            token_digest(token),
+            {"user_id": platform_user.id, "username": platform_user.username,
+             "roles": ["platform_admin"], "csrf": new_session_token(),
+             "tenant_id": None, "expires": time.time() + 3600}, 3600)
+
+    asyncio.run(seed())
+    return token
+
+
+def test_legacy_platform_cookie_in_tenant_channel_heals_on_me(env):
+    client, platform = env["client"], env["platform"]
+    token = _park_platform_account_in_tenant_cookie(env)
+
+    me = client.get("/api/v2/me")
+    assert me.status_code == 401
+    assert me.json()["error"] == "authentication_required"
+    assert any(platform.tenant_cookie_name in h and "Max-Age=0" in h
+               for h in me.headers.get_list("set-cookie"))
+    assert client.cookies.get(platform.tenant_cookie_name) is None
+
+    async def gone():
+        return await platform.state.get_session(token_digest(token))
+
+    assert asyncio.run(gone()) is None
+    assert client.get("/api/v2/me").status_code == 401
+
+
+def test_logout_clears_legacy_cookie_without_csrf(env):
+    client, platform = env["client"], env["platform"]
+    _park_platform_account_in_tenant_cookie(env)
+
+    response = client.post("/api/v2/logout")
+    assert response.status_code == 200, response.text
+    assert client.cookies.get(platform.tenant_cookie_name) is None
 
 
 def test_platform_can_enumerate_tenants_and_their_counts(env):
@@ -389,10 +483,12 @@ def test_migration_reports_its_head_and_downgrade_is_reversible(tmp_path):
     _legacy_db(db_path)
     assert _alembic(db_path, "upgrade", "head").returncode == 0
     head = _alembic(db_path, "current")
-    assert "0002_tenant" in head.stdout + head.stderr
+    assert "0004_integration (head)" in head.stdout + head.stderr
     down = _alembic(db_path, "downgrade", "0001_baseline")
     assert down.returncode == 0, down.stdout + down.stderr
     with sqlite3.connect(db_path) as conn:
+        assert not conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='kvm_quota_usage'").fetchall()
         columns = {row[1] for row in conn.execute("PRAGMA table_info(kvm_user)")}
         assert "tenant_id" not in columns
         assert not conn.execute(

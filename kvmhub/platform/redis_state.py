@@ -41,6 +41,7 @@ class State(Protocol):
     async def reserve_quota(self, key: str, member: str, limit: int | None, ttl: int) -> bool: ...
     async def release_quota(self, key: str, member: str) -> None: ...
     async def quota_usage(self, key: str) -> int: ...
+    async def quota_members(self, key: str) -> list[str]: ...
     async def subscribe_revocations(self) -> AsyncIterator[str]: ...
     async def close(self) -> None: ...
 
@@ -195,6 +196,9 @@ class MemoryState:
     async def quota_usage(self, key: str) -> int:
         return len(self._prune(key, self._clock()))
 
+    async def quota_members(self, key: str) -> list[str]:
+        return list(self._prune(key, self._clock()).keys())
+
     async def close(self) -> None:
         self._values.clear()
         self._zsets.clear()
@@ -305,6 +309,9 @@ class RedisState:
 
     async def quota_usage(self, key: str) -> int:
         return int(await self._client.eval(self._USAGE_SCRIPT, 1, key, QUOTA_TOLERANCE_MS))
+
+    async def quota_members(self, key: str) -> list[str]:
+        return [str(member) for member in await self._client.zrange(key, 0, -1)]
 
     def _subscription_client(self):
         if self._subscriber is None:

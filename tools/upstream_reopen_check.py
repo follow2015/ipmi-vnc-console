@@ -18,7 +18,7 @@ from kvmhub.ast2100_protocol import RFB_VERSION
 from kvmhub.common import Problem
 from kvmhub.rfb_upstream import RfbUpstream, UpstreamConfig
 
-SCENARIOS = ("clean", "abort", "stale", "idle", "fanout", "logout", "relogin")
+SCENARIOS = ("clean", "abort", "stale", "idle", "fanout", "slots", "logout", "relogin")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -382,8 +382,63 @@ async def scenario_relogin(args) -> dict:
     return report
 
 
+async def scenario_slots(args) -> dict:
+    up = _transport(args)
+    report: dict = {"slot_ceiling": 4, "release_after_refusal": True}
+    sockets: list = []
+    try:
+        report["login"] = (await _login(up)).as_dict()
+
+        async def open_and_check(label: str) -> dict:
+            step = Step(label)
+            await step.run(up.open(request_frames=True))
+            entry = step.as_dict()
+            if not step.ok:
+                return entry
+            sockets.append(up._ws)
+            frames = Step(label.replace("open", "frames"))
+            await frames.run(up.wait_frames(1, timeout=6.0))
+            entry["frames"] = frames.as_dict()
+            entry["close_code"] = up.upstream_close_code
+            return entry
+
+        report["fill"] = [await open_and_check(f"open_{n}") for n in range(1, 5)]
+        report["at_ceiling"] = await open_and_check("open_5")
+        if sockets:
+            released = Step("release_one_console")
+            await released.run(sockets[0].close(code=1000))
+            report["release"] = released.as_dict()
+            await asyncio.sleep(2.0)
+        report["after_release"] = await open_and_check("open_6_after_release")
+        report["refilled"] = await open_and_check("open_7_after_refill")
+
+        close_codes = [entry.get("close_code") for entry in
+                       [report["at_ceiling"], report["after_release"], report["refilled"]]]
+        report["verdict"] = {
+            "fifth_had_no_frames": not report["at_ceiling"].get("frames", {}).get("ok"),
+            "freed_slot_reused": bool(report["after_release"].get("frames", {}).get("ok")),
+            "refill_had_no_frames": not report["refilled"].get("frames", {}).get("ok"),
+            "observed_12592": 12592 in close_codes,
+        }
+        report["semantics"] = (
+            "per-login console slot ceiling; not an eviction by another session"
+            if all((report["verdict"]["fifth_had_no_frames"],
+                    report["verdict"]["freed_slot_reused"],
+                    report["verdict"]["refill_had_no_frames"])) else "inconclusive")
+    finally:
+        up._ws = None
+        report["cleanup"] = await _cleanup(up)
+        report["logout_status"] = up.last_logout_status
+        await asyncio.sleep(1.5)
+        report["orphans_after_logout"] = [
+            {"closed": bool(s.closed), "close_code": s.close_code} for s in sockets]
+    if 12592 in [row.get("close_code") for row in report.get("orphans_after_logout", [])]:
+        report["verdict"]["observed_12592"] = True
+    return report
+
+
 RUNNERS = {"clean": scenario_clean, "abort": scenario_abort, "stale": scenario_stale,
-           "idle": scenario_idle, "fanout": scenario_fanout,
+           "idle": scenario_idle, "fanout": scenario_fanout, "slots": scenario_slots,
            "logout": scenario_logout, "relogin": scenario_relogin}
 
 

@@ -6,7 +6,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kvmhub.platform.bus import AssemblyBus
 from kvmhub.platform.redis_state import MemoryState
-from kvmhub.route_resolver import create_app
+from kvmhub.route_resolver import BUS_KEY, create_app
 
 SID = "a" * 32
 
@@ -14,7 +14,7 @@ SID = "a" * 32
 async def _client(bus=None):
     app = create_app()
     if bus is not None:
-        app["bus"] = bus
+        app[BUS_KEY] = bus
     return TestClient(TestServer(app))
 
 
@@ -100,3 +100,73 @@ async def test_proxy_relays_websocket_cookie_and_frames():
                 assert message.data == b"echo:ping"
     finally:
         await upstream.close()
+
+
+async def test_session_prefix_must_start_the_path():
+    bus = AssemblyBus(MemoryState())
+    await bus.put_route(SID, {"upstream": "127.0.0.1:29443"}, 60)
+    async with await _client(bus) as client:
+        response = await client.get(f"/evil/s/{SID}/x")
+        assert response.status == 404
+
+
+async def test_oversized_request_body_is_refused_before_forwarding():
+    from kvmhub.route_resolver import MAX_REQUEST_BODY
+
+    seen = []
+
+    async def sink(request):
+        seen.append(request.path)
+        return web.Response(text="ok")
+
+    upstream_app = web.Application()
+    upstream_app.router.add_route("*", "/{tail:.*}", sink)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+    bus = AssemblyBus(MemoryState())
+    await bus.put_route(SID, {"upstream": f"{upstream.host}:{upstream.port}"}, 60)
+    try:
+        async with await _client(bus) as resolver:
+            response = await resolver.post(
+                f"/s/{SID}/up", data=b"x",
+                headers={"Content-Length": str(MAX_REQUEST_BODY + 1)})
+            assert response.status == 413
+            assert seen == []
+    finally:
+        await upstream.close()
+
+
+async def test_websocket_relay_ends_when_the_worker_side_closes_first():
+    async def upstream_ws(request):
+        socket = web.WebSocketResponse()
+        await socket.prepare(request)
+        await socket.send_bytes(b"hello")
+        await socket.close()
+        return socket
+
+    upstream_app = web.Application()
+    upstream_app.router.add_get("/{tail:.*}", upstream_ws)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+    bus = AssemblyBus(MemoryState())
+    await bus.put_route(SID, {"upstream": f"{upstream.host}:{upstream.port}"}, 60)
+    try:
+        async with await _client(bus) as resolver:
+            async with resolver.ws_connect(f"/s/{SID}/console") as ws:
+                assert (await ws.receive()).data == b"hello"
+                final = await asyncio.wait_for(ws.receive(), 3)
+                assert final.type in (WSMsgType.CLOSE, WSMsgType.CLOSED)
+    finally:
+        await upstream.close()
+
+
+def test_app_startup_does_not_assign_new_app_keys():
+    import warnings
+
+    async def scenario():
+        async with await _client(AssemblyBus(MemoryState())):
+            pass
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        asyncio.run(scenario())

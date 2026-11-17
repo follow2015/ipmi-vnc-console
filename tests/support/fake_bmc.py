@@ -40,6 +40,7 @@ def parse_client_messages(data: bytes) -> list[tuple]:
             out.append(("PointerEvent", mask, x, y))
             index += 6
         elif kind == 0:
+            out.append(("SetPixelFormat", data[index + 4:index + 20]))
             index += 20
         else:
             out.append(("Unknown", kind))

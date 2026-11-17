@@ -84,6 +84,11 @@ class AssemblyBus:
             return 0
         return await self.state.quota_usage(quota_key(tenant_id))
 
+    async def quota_members(self, tenant_id: str) -> list[str]:
+        if not tenant_id:
+            return []
+        return await self.state.quota_members(quota_key(tenant_id))
+
     async def reclaim_quota(self, sids: set[str]) -> int:
         if not sids:
             return 0

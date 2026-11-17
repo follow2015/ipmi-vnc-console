@@ -46,6 +46,18 @@ BUILTIN_PROFILES = (
      "licence": "IKVM HTML5", "concurrency_limit": 1,
      "evidence": "docs/implementation/evidence/real-bmc-capslock-d-20261115.json",
      "priority": 100},
+    {"code": "smci-x10-ast2100-rfb055008", "vendor": "supermicro",
+     "vendor_aliases": ["supermicro", "supermicro (inspur oem)", "smci", "inspur"],
+     "model_pattern": r"(?i)X10DRT|X10|SA5248M4", "firmware_min": "", "firmware_max": "",
+     "rfb_version": "RFB 055.008", "message_profile": "smc",
+     "asset_paths": ["/novnc/include/*.js", "/js/*.js", "/css/*.css",
+                     "/images/**/*.png", "/images/**/*.gif", "/images/**/*.jpg",
+                     "/images/**/*.svg", "/favicon.ico"],
+     "login_path": "/cgi/login.cgi",
+     "logout_path": "/cgi/logout.cgi", "console_impl": "passthrough",
+     "licence": "IKVM HTML5", "concurrency_limit": 1,
+     "evidence": "docs/implementation/evidence/real-bmc-fleet-greetings-20261117.json",
+     "priority": 110},
 )
 
 
@@ -140,10 +152,12 @@ class Match:
                 "usable": self.usable, "reason": self.reason, "candidates": self.candidates}
 
 
-def identify(session: Session, detection: dict, *, tenant_id: str | None = None) -> Match:
+def identify(session: Session, detection: dict, *, tenant_id: str | None = None,
+             greeting: str = "") -> Match:
     vendor = normalize_vendor(detection.get("vendor") or detection.get("Manufacturer"))
     model = str(detection.get("model") or "")
     firmware = str(detection.get("firmware") or "")
+    measured = str(greeting or "").strip()
     if not vendor:
         return Match(None, reason="vendor_not_detected")
 
@@ -172,6 +186,8 @@ def identify(session: Session, detection: dict, *, tenant_id: str | None = None)
             continue
         reasons.append("firmware_window")
         score = len(reasons) * 1000 + (1000 if profile.status == PROFILE_APPROVED else 0) - int(profile.priority)
+        if measured and str(profile.rfb_version or "").strip() == measured:
+            score += 3000
         if tenant_id is not None and profile.tenant_id == tenant_id:
             score += 500
         scored.append((score, profile, reasons))

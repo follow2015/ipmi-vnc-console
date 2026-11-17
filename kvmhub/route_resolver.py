@@ -14,8 +14,13 @@ from .platform.redis_state import create_state
 
 SID_RE = re.compile(r"[0-9a-f]{32}\Z")
 SESSION_PATH_RE = re.compile(r"/s/([0-9a-f]{32})(?:/|\Z)")
+MAX_REQUEST_BODY = 16 * 1024 * 1024
 DEFAULT_PORT = 18081
 log = logging.getLogger("kvmhub.route_resolver")
+
+BUS_KEY = web.AppKey("bus", AssemblyBus)
+STATE_KEY = web.AppKey("state", object)
+CLIENTS_KEY = web.AppKey("clients", dict)
 
 HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -39,8 +44,15 @@ def valid_upstream(value: object) -> str:
     return f"{address}:{port}"
 
 
+def client_of(app: web.Application) -> ClientSession:
+    client = app[CLIENTS_KEY].get("main")
+    if client is None:
+        raise web.HTTPServiceUnavailable()
+    return client
+
+
 async def upstream_for(request: web.Request, sid: str) -> str:
-    route = await request.app["bus"].get_route(sid)
+    route = await request.app[BUS_KEY].get_route(sid)
     upstream = valid_upstream((route or {}).get("upstream"))
     log.info("route lookup sid=%s upstream=%r", sid, upstream)
     return upstream
@@ -65,10 +77,15 @@ def _forward_headers(headers) -> dict[str, str]:
 
 
 async def proxy_http(request: web.Request, sid: str, upstream: str) -> web.StreamResponse:
+    declared = request.headers.get("Content-Length", "")
+    if declared and (not declared.isdigit() or int(declared) > MAX_REQUEST_BODY):
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=MAX_REQUEST_BODY,
+            actual_size=int(declared) if declared.isdigit() else 0)
     target = f"http://{upstream}{request.rel_url}"
     headers = _forward_headers(request.headers)
     body = request.content if request.can_read_body else None
-    async with request.app["client"].request(
+    async with client_of(request.app).request(
             request.method, target, headers=headers, data=body,
             allow_redirects=False) as response:
         reply = web.StreamResponse(
@@ -89,7 +106,15 @@ async def proxy_websocket(request: web.Request, sid: str, upstream: str) -> web.
     browser = web.WebSocketResponse(protocols=offered, autoping=False, heartbeat=None)
     await browser.prepare(request)
     target = f"ws://{upstream}{request.rel_url}"
-    headers = {"Origin": f"https://{upstream}"}
+    headers = {}
+    if request.headers.get("Origin"):
+        headers["Origin"] = request.headers["Origin"]
+    else:
+        host = request.headers.get("X-Forwarded-Host") or upstream
+        headers["Origin"] = f"https://{host}"
+    for name in ("X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-For"):
+        if request.headers.get(name):
+            headers[name] = request.headers[name]
     if request.headers.get("Cookie"):
         headers["Cookie"] = request.headers["Cookie"]
 
@@ -117,16 +142,24 @@ async def proxy_websocket(request: web.Request, sid: str, upstream: str) -> web.
             elif message.type is WSMsgType.ERROR:
                 break
 
-    async with request.app["client"].ws_connect(
+    async with client_of(request.app).ws_connect(
             target, protocols=offered, headers=headers,
             autoping=False, heartbeat=None) as worker:
-        await asyncio.gather(browser_to_worker(), worker_to_browser(),
-                             return_exceptions=True)
+        tasks = [asyncio.ensure_future(browser_to_worker()),
+                 asyncio.ensure_future(worker_to_browser())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    if not browser.closed:
+        await browser.close()
     return browser
 
 
 async def proxy(request: web.Request) -> web.StreamResponse:
-    match = SESSION_PATH_RE.search(request.path)
+    match = SESSION_PATH_RE.match(request.path)
     sid = match.group(1) if match else ""
     if not sid:
         raise web.HTTPNotFound()
@@ -142,19 +175,21 @@ def create_app(redis_url: str = "") -> web.Application:
     state = create_state(redis_url)
     bus = AssemblyBus(state)
     app = web.Application()
-    app["bus"] = bus
-    app["state"] = state
-    app["client"] = None
+    app[BUS_KEY] = bus
+    app[STATE_KEY] = state
+    app[CLIENTS_KEY] = {}
     app.router.add_get("/route/{sid}", resolve)
     app.router.add_route("*", "/{tail:.*}", proxy)
 
     async def open_client(_app: web.Application) -> None:
-        app["client"] = ClientSession(connector=TCPConnector(limit=0),
-                                      timeout=ClientTimeout(total=None))
+        app[CLIENTS_KEY]["main"] = ClientSession(
+            connector=TCPConnector(limit=0),
+            timeout=ClientTimeout(total=None))
 
     async def close_resources(_app: web.Application) -> None:
-        if app["client"] is not None:
-            await app["client"].close()
+        client = app[CLIENTS_KEY].pop("main", None)
+        if client is not None:
+            await client.close()
         await state.close()
 
     app.on_startup.append(open_client)

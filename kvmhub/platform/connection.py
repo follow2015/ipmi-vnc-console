@@ -88,10 +88,11 @@ def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
     tenant = session.get(Tenant, tenant_id)
     if tenant is None or tenant.status != TENANT_ACTIVE:
         raise ConnectionRefused("tenant_suspended", "租户已停用，无法开启新的控制台")
-    visible = {row["id"] for row in
-               services.assets_for_user(session, user_id, now=stamp, tenant_id=tenant_id)}
-    if asset_id not in visible:
-        raise ConnectionRefused("asset_not_granted", "资产不存在或当前用户未被授权")
+
+    try:
+        services.require(session, user_id, "console.open")
+    except services.PlatformError:
+        raise ConnectionRefused("not_permitted", "没有开启控制台的权限") from None
 
     asset = session.get(Asset, asset_id)
     if asset is None or asset.tenant_id != tenant_id:

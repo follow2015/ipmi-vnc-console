@@ -20,6 +20,7 @@ AUDIT_INT_FIELDS = (
     "client_bytes", "server_bytes", "key_events", "peak_buffered_bytes",
     "recoveries", "recovery_attempts", "recovery_latency_ms", "dropped_input",
     "recovery_input_replayed", "recovery_input_dropped",
+    "geometry_reloads",
 )
 AUDIT_CLASS_FIELDS = ("exception_type",)
 AUDIT_DECIMAL_FIELDS = ("since_last_rx_s",)
@@ -61,6 +62,16 @@ def _audit_seconds(value: Any) -> float | None:
 def _audit_class(value: Any) -> str | None:
     if isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", value):
         return value
+    return None
+
+
+def _audit_geometry(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    width, height = value.get("width"), value.get("height")
+    if (isinstance(width, int) and not isinstance(width, bool) and 0 <= width <= 65535
+            and isinstance(height, int) and not isinstance(height, bool) and 0 <= height <= 65535):
+        return {"width": width, "height": height}
     return None
 
 
@@ -167,6 +178,10 @@ def upstream_shape(upstream: Any) -> dict[str, Any]:
         "dropped_input": int(data.get("dropped_input", 0) or 0),
         "recovery_input_replayed": int(data.get("recovery_input_replayed", 0) or 0),
         "recovery_input_dropped": int(data.get("recovery_input_dropped", 0) or 0),
+        "reload_requested": bool(data.get("reload_requested", False)),
+        "reload_reason": _code(data.get("reload_reason")),
+        "geometry_before": _audit_geometry(data.get("geometry_before")),
+        "geometry_after": _audit_geometry(data.get("geometry_after")),
     }
 
 
@@ -179,6 +194,7 @@ class SessionTelemetry:
     reconnects: int = 0
     upstream: Any = None
     cleanup_outcome: str | None = None
+    geometry_reloads: int = 0
 
     def note_connection(self, upstream: Any = None) -> None:
         self.connections += 1
@@ -186,6 +202,9 @@ class SessionTelemetry:
             self.reconnects += 1
         if upstream is not None:
             self.upstream = upstream
+
+    def note_geometry_reload(self) -> None:
+        self.geometry_reloads += 1
 
     def live(self, *, ws_open: int, opening: int, lease_remaining: float, closing: bool) -> dict[str, Any]:
         shape = upstream_shape(self.upstream)
@@ -198,6 +217,7 @@ class SessionTelemetry:
             "reconnects": self.reconnects,
             "ws_open": ws_open,
             "opening": opening,
+            "geometry_reloads": self.geometry_reloads,
             **shape,
         }
 
@@ -219,6 +239,7 @@ class SessionTelemetry:
             "cleanup": cleanup,
             "connections": self.connections,
             "reconnects": self.reconnects,
+            "geometry_reloads": self.geometry_reloads,
             **upstream_shape(self.upstream if upstream is None else upstream),
         }
         if self.cleanup_outcome is not None:

@@ -51,7 +51,7 @@ def test_stats_describes_the_rebuild_with_its_budget(cfg):
     body = gateway.stats(sess)
 
     assert body["recovery"] == {"state": "recovering", "attempts": 1, "recoveries": 0,
-                                "limit": 2, "max_total": 3}
+                                "limit": 3, "max_total": 3}
     assert body["session"]["state"] == "recovering"
     assert body["machine"]["phase"] == "reconnecting"
     assert set(body["recovery"]) == {"state", "attempts", "recoveries", "limit", "max_total"}

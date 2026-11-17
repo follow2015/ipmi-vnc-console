@@ -60,12 +60,14 @@ class ConsolePlane:
         return f"{address}:{port}"
 
     async def open(self, assembly: dict, *, user_id: str, trace: str = "",
-                   concurrent_limit: int | None = None) -> dict:
+                   concurrent_limit: int | None = None,
+                   session_limit_minutes: int | None = None) -> dict:
         asset_id = str(assembly.get("asset_id") or "")
         if not asset_id or not assembly.get("ready"):
             raise services.PlatformError("assembly_not_ready", "装配包未通过全部闸门", 409)
         tenant_id = str(assembly.get("tenant_id") or "")
         await self.reconcile_claims()
+        await self.reconcile_quota(tenant_id)
         try:
             worker = await self.bus.choose_worker()
         except BusError as exc:
@@ -73,15 +75,17 @@ class ConsolePlane:
         worker_id = str(worker["worker_id"])
         instance_id = str(worker["instance_id"])
         correlation = trace if len(trace) == 32 else uuid.uuid4().hex
+        now = self._clock()
+        hard_cap = now + int(session_limit_minutes) * 60 if session_limit_minutes else None
         store, dispose = self._connect()
         try:
             try:
-                row = store.allocate(asset_id, user_id, worker_id, instance_id, correlation)
+                row = store.allocate(asset_id, user_id, worker_id, instance_id, correlation,
+                                     hard_cap=hard_cap)
             except Problem as exc:
                 raise services.PlatformError(exc.code, f"会话分配被拒绝：{exc.code}",
                                              exc.status) from exc
             sid = row["id"]
-            now = self._clock()
             hard_ttl = max(60, int(row["hard_until"] - now))
             if not await self.bus.reserve_tenant_quota(tenant_id, sid, concurrent_limit, hard_ttl):
                 store.revoke(sid, user_id, correlation)
@@ -118,7 +122,8 @@ class ConsolePlane:
                     "accept_url": self.accept_url(worker_id=worker_id, sid=sid),
                     "worker_id": worker_id, "instance_id": instance_id,
                     "assembly_id": assembly_id, "delivery": "worker_bridge",
-                    "hard_until": row["hard_until"], "asset_id": asset_id,
+                    "hard_until": row["hard_until"],
+                    "session_limit_minutes": session_limit_minutes, "asset_id": asset_id,
                     "note": "票据不含 BMC 凭据；装配包由 Worker 一次性取用，凭据由 Store.exchange 在内部套接字解密。"}
         finally:
             if dispose:
@@ -145,6 +150,30 @@ class ConsolePlane:
         if dead:
             await self.bus.reclaim_quota(dead)
         return released
+
+    async def reconcile_quota(self, tenant_id: str) -> int:
+        if not tenant_id:
+            return 0
+        members = await self.bus.quota_members(tenant_id)
+        if not members:
+            return 0
+        dead: set[str] = set()
+        store, dispose = self._connect()
+        try:
+            for sid in members:
+                try:
+                    row = store.get(sid)
+                except Problem:
+                    dead.add(sid)
+                    continue
+                if row["status"] not in store.LIVE_STATES:
+                    dead.add(sid)
+        finally:
+            if dispose:
+                store.close()
+        if dead:
+            await self.bus.reclaim_quota(dead)
+        return len(dead)
 
     async def close_session(self, sid: str, *, user_id: str, trace: str = "",
                             tenant_id: str = "") -> dict:

@@ -12,6 +12,8 @@ from . import capability
 from .common import PASSTHROUGH_ADAPTER_ID, Problem
 from .telemetry import audit_evidence
 
+TENANT_GRANT = "*"
+
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -280,8 +282,10 @@ class Store:
 
     def gate(self, aid, user):
         row = self.db.execute("SELECT a.*,g.expires AS grant_expires FROM asset a "
-                              "JOIN access_grant g ON a.id=g.asset_id WHERE a.id=? AND g.user_id=?",
-                              (aid, user)).fetchone()
+                              "JOIN access_grant g ON a.id=g.asset_id "
+                              "WHERE a.id=? AND (g.user_id=? OR g.user_id=?) "
+                              "ORDER BY g.expires DESC LIMIT 1",
+                              (aid, user, TENANT_GRANT)).fetchone()
         if row is None or row["grant_expires"] <= self.clock():
             raise Problem("permission_denied", 403)
         asset = dict(row)
@@ -439,7 +443,7 @@ class Store:
             raise Problem("permission_denied", 403)
         return row
 
-    def allocate(self, aid, user, worker, instance, trace):
+    def allocate(self, aid, user, worker, instance, trace, *, hard_cap: float | None = None):
         now = self.clock()
         with self.tx():
             asset = self.eligible(aid, user)
@@ -447,6 +451,8 @@ class Store:
                 raise Problem("asset_busy", 409)
             sid = uuid.uuid4().hex
             hard = min(now + 4 * 3600, asset["grant_expires"], asset["cap_expires"])
+            if hard_cap is not None:
+                hard = min(hard, hard_cap)
             self.db.execute("INSERT INTO session(id,user_id,asset_id,worker_id,instance_id,jti,status,created,phase_until,lease_until,hard_until) "
                             "VALUES(?,?,?,?,?,?,'pending',?,?,?,?)",
                             (sid, user, aid, worker, instance, uuid.uuid4().hex, now, min(now + 60, hard), 0, hard))
@@ -599,6 +605,7 @@ class Store:
                 self.release_confirmed(sid)
 
     def sweep(self):
+        ended = []
         with self.tx():
             now = self.clock()
             for r in self.db.execute("SELECT * FROM session WHERE status IN ('pending','connecting','active','closing')").fetchall():
@@ -611,8 +618,13 @@ class Store:
                     status = "lost"
                 if status:
                     self.db.execute("UPDATE session SET status=?,reason='deadline',version=version+1 WHERE id=?", (status, r["id"]))
-                    self.event("reaper", "session_deadline", r["id"], {"status": status})
+                    detail = {"status": status}
+                    if r["hard_until"] <= now:
+                        detail["cause"] = "hard_limit"
+                    self.event("reaper", "session_deadline", r["id"], detail)
                     self.release_confirmed(r["id"])
+                    ended.append(r["id"])
+        return ended
 
     def public(self, sid, user):
         row = self.owned(sid, user)

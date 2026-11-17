@@ -25,7 +25,7 @@ from kvmhub.platform.security import CredentialCipher  # noqa: E402
 from kvmhub.platform import connection, governance, services, vendor_registry  # noqa: E402
 from kvmhub.platform.bus import AssemblyBus  # noqa: E402
 from kvmhub.platform.redis_state import create_state  # noqa: E402
-from kvmhub.store import Store  # noqa: E402
+from kvmhub.store import TENANT_GRANT, Store  # noqa: E402
 
 
 def _context(args):
@@ -193,15 +193,48 @@ def cmd_detect(args):
     detection = vendor_registry.detect_from_redfish(inventory)
     _, _, factory, _ = _context(args)
     with transaction(factory) as db:
-        match = vendor_registry.identify(db, detection)
+        match = vendor_registry.identify(db, detection, greeting=args.greeting or "")
         result = match.as_dict()
         result["detection"] = detection
+        if args.greeting:
+            result["measured_greeting"] = args.greeting
         if match.usable:
             result["connection_plan"] = vendor_registry.connection_plan(match.profile)
         if args.make_draft and match.profile is not None:
             row = services.capability_draft(db, match.profile, detection=detection, actor=args.actor)
             result["capability_draft_id"] = row.id
     print(json.dumps(result, ensure_ascii=False, indent=1))
+
+
+def cmd_rebind_asset(args):
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        asset = db.get(PlatformAsset, args.id)
+        if asset is None:
+            raise SystemExit("asset not found")
+        profile = connection.approved_profile(db, args.profile)
+        if profile is None:
+            raise SystemExit(f"profile {args.profile} not found")
+        if profile.status != PROFILE_APPROVED:
+            raise SystemExit(f"profile {args.profile} is {profile.status}; approve it first")
+        detection = {"vendor": asset.vendor, "model": asset.model,
+                     "firmware": asset.firmware, "raw": {"Manufacturer": asset.vendor}}
+        draft = services.capability_draft(db, profile, detection=detection, actor=args.actor,
+                                          tenant_id=asset.tenant_id)
+        before = {"profile_id": asset.profile_id, "capability_id": asset.capability_id}
+        asset.profile_id = profile.id
+        asset.capability_id = draft.id
+        asset.updated = time.time()
+        services.audit(db, args.actor, "asset_rebound", asset_id=asset.id,
+                       tenant_id=asset.tenant_id,
+                       detail={**before, "profile_id": profile.id,
+                               "capability_id": draft.id, "rfb_version": profile.rfb_version},
+                       now=time.time())
+        print(json.dumps({"asset": asset.id, "address": asset.address,
+                          "profile": profile.code, "rfb_version": profile.rfb_version,
+                          "message_profile": profile.message_profile,
+                          "capability": draft.id, "capability_status": draft.status},
+                         ensure_ascii=False))
 
 
 def cmd_worker_drain(args):
@@ -246,6 +279,46 @@ def cmd_audit(args):
         print(json.dumps(services.recent_audit(db, args.limit), ensure_ascii=False, indent=1))
 
 
+def cmd_create_service_token(args):
+    _, _, factory, _ = _context(args)
+    allowlist = [item.strip() for item in args.allow.split(",") if item.strip()]
+    with transaction(factory) as db:
+        result = services.create_service_token(
+            db, tenant_code=args.tenant, label=args.label, allowlist=allowlist,
+            actor=args.actor, expires_days=args.expires_days)
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+
+
+def cmd_list_service_tokens(args):
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        rows = services.list_service_tokens(db, tenant_code=args.tenant)
+    print(json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def cmd_revoke_service_token(args):
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        row = services.revoke_service_token(db, args.id, actor=args.actor)
+    print(json.dumps(row, ensure_ascii=False, indent=1))
+
+
+def cmd_quota_usage(args):
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        rows = services.quota_usage_view(db, args.period)
+    print(json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def cmd_rebuild_quota_usage(args):
+    _, engine, factory, _ = _context(args)
+    with transaction(factory) as db:
+        result = services.rebuild_quota_usage(
+            db, plane_db=args.data_plane_db, period=args.period)
+    engine.dispose()
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+
+
 def cmd_sync_data_plane(args):
     if not args.evidence or not Path(args.evidence).exists():
         raise SystemExit("--evidence must point at an existing measured evidence file")
@@ -279,8 +352,10 @@ def cmd_sync_data_plane(args):
             grants = [row[0] for row in db.execute(
                 select(AccessGrant.user_id).where(
                     AccessGrant.asset_id == asset.id, AccessGrant.expires > stamp)).all()]
+            if asset.tenant_id:
+                grants = [TENANT_GRANT, *grants]
             if not grants and not args.user:
-                skipped.append({"asset": asset.id, "reason": "no_active_grant"})
+                skipped.append({"asset": asset.id, "reason": "no_owner_no_grant"})
                 continue
             users = [args.user] if args.user else grants
             target = asset.address if "://" in asset.address else f"https://{asset.address}"
@@ -373,9 +448,35 @@ def parser():
     q = sub.add_parser("approve-profile"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--renew", action="store_true", help="record a new review of an already-approved profile"); q.set_defaults(fn=cmd_approve_profile)
     sub.add_parser("capabilities").set_defaults(fn=cmd_capabilities)
     q = sub.add_parser("approve-capability"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--valid-days", type=int, default=365); q.set_defaults(fn=cmd_approve_capability)
-    q = sub.add_parser("detect"); q.add_argument("--inventory", required=True); q.add_argument("--make-draft", action="store_true"); q.set_defaults(fn=cmd_detect)
+    q = sub.add_parser("detect"); q.add_argument("--inventory", required=True); q.add_argument("--make-draft", action="store_true"); q.add_argument("--greeting", help="RFB greeting measured by a probe, e.g. 'RFB 055.008'"); q.set_defaults(fn=cmd_detect)
+    q = sub.add_parser("rebind-asset", help="bind an asset to a measured profile and mint its capability draft")
+    q.add_argument("--id", required=True); q.add_argument("--profile", required=True, help="profile code")
+    q.set_defaults(fn=cmd_rebind_asset)
     q = sub.add_parser("users"); q.add_argument("--tenant", help="filter by tenant code"); q.set_defaults(fn=cmd_users)
     q = sub.add_parser("audit"); q.add_argument("--limit", type=int, default=50); q.set_defaults(fn=cmd_audit)
+    q = sub.add_parser("create-service-token", help="issue a DCIM bearer token with a source-IP allowlist")
+    q.add_argument("--tenant", required=True, help="tenant code the token is bound to")
+    q.add_argument("--label", required=True, help="operator-facing name, unique per tenant")
+    q.add_argument("--allow", required=True,
+                    help="comma-separated source CIDRs, e.g. 192.0.2.0/24,192.0.2.5/32")
+    q.add_argument("--expires-days", type=int, default=None, help="omit for a non-expiring token")
+    q.add_argument("--actor", default="platform")
+    q.set_defaults(fn=cmd_create_service_token)
+    q = sub.add_parser("list-service-tokens", help="list token metadata (never the secret)")
+    q.add_argument("--tenant", default="")
+    q.set_defaults(fn=cmd_list_service_tokens)
+    q = sub.add_parser("revoke-service-token", help="invalidate a token immediately")
+    q.add_argument("--id", required=True)
+    q.add_argument("--actor", default="platform")
+    q.set_defaults(fn=cmd_revoke_service_token)
+    q = sub.add_parser("quota-usage", help="read a rebuilt monthly usage snapshot")
+    q.add_argument("--period", required=True, help="UTC month, YYYY-MM")
+    q.set_defaults(fn=cmd_quota_usage)
+    q = sub.add_parser("rebuild-quota-usage", help="rebuild a month from raw audit/session rows")
+    q.add_argument("--period", required=True, help="UTC month, YYYY-MM")
+    q.add_argument("--data-plane-db", required=True,
+                   help="data-plane SQLite path, e.g. /var/lib/kvmhub/gateway/manager.sqlite3")
+    q.set_defaults(fn=cmd_rebuild_quota_usage)
     q = sub.add_parser("sync-data-plane", help="import approved assets into the Worker's SQLite store")
     q.add_argument("--store", required=True, help="path to the PoC data-plane SQLite file")
     q.add_argument("--asset", help="sync only this control-plane asset id")

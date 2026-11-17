@@ -24,7 +24,7 @@ from kvmhub.platform.db import (bootstrap_platform_admin, init_schema, seed_role
 from kvmhub.platform.models import (DEFAULT_TENANT_ID, Capability, Tenant,
                                     VendorProfile, json_field)
 from kvmhub.platform.redis_state import MemoryState, RedisState, quota_key
-from kvmhub.store import Store
+from kvmhub.store import TENANT_GRANT, Store
 from kvmhub.worker import Gateway
 from tools.bootstrap import generate
 
@@ -110,9 +110,12 @@ def rig(tmp_path):
                              capability_id=capability["id"], target=TARGET,
                              fingerprint=FINGERPRINT, username="ADMIN",
                              password=BMC_PASSWORD, user_id=ids["admin"], actor="test")
+        with store.tx():
+            store.db.execute("INSERT OR REPLACE INTO access_grant VALUES(?,?,?)",
+                             (TENANT_GRANT, asset_id, time.time() + 86400 * 30))
     asyncio.run(bus.register_worker("w1", instance_id="i1", capacity=4))
     store.close()
-    with TestClient(app, base_url=ORIGIN) as client:
+    with TestClient(app, base_url=ORIGIN, client=("127.0.0.1", 54321)) as client:
         yield SimpleNamespace(client=client, platform=platform, state=state, bus=bus,
                               plane=plane, ids=ids)
         platform.engine.dispose()
@@ -120,8 +123,8 @@ def rig(tmp_path):
 
 def login(client: TestClient, username: str = "admin",
           password: str = ADMIN_PASSWORD) -> str:
-    response = client.post("/api/v2/login", json={"username": username,
-                                                  "password": password})
+    path = "/api/v2/platform/login" if username == "platform" else "/api/v2/login"
+    response = client.post(path, json={"username": username, "password": password})
     assert response.status_code == 200, response.text
     return response.json()["csrf"]
 
@@ -159,12 +162,66 @@ def test_quota_gate_refuses_the_second_console_and_returns_the_slot_on_close(rig
     assert retried.status_code == 200, retried.text
 
 
+def test_a_session_the_worker_reaper_ended_stops_counting_against_the_quota(rig):
+    set_quotas(rig, {"max_concurrent_sessions": 1})
+    csrf = login(rig.client)
+    first = open_console(rig, csrf, rig.ids["assets"][0])
+    assert first.status_code == 200, first.text
+    sid = first.json()["sid"]
+
+    store, dispose = rig.plane._connect()
+    try:
+        store.db.execute("UPDATE session SET status='closed', reason='deadline' WHERE id=?",
+                         (sid,))
+        store.db.commit()
+    finally:
+        if dispose:
+            store.close()
+    assert asyncio.run(rig.bus.tenant_quota_usage(DEFAULT_TENANT_ID)) == 1
+    assert asyncio.run(rig.bus.quota_members(DEFAULT_TENANT_ID)) == [sid]
+
+    second = open_console(rig, csrf, rig.ids["assets"][1])
+    assert second.status_code == 200, second.text
+    members = asyncio.run(rig.bus.quota_members(DEFAULT_TENANT_ID))
+    assert sid not in members and second.json()["sid"] in members
+
+
 def test_absent_quota_means_unlimited(rig):
     csrf = login(rig.client)
     first = open_console(rig, csrf, rig.ids["assets"][0])
     assert first.status_code == 200, first.text
     second = open_console(rig, csrf, rig.ids["assets"][1])
     assert second.status_code == 200, second.text
+
+
+def test_session_minutes_narrows_the_ticket_and_leaves_live_sessions_alone(rig):
+    set_quotas(rig, {"max_session_minutes": 2})
+    csrf = login(rig.client)
+    opened = open_console(rig, csrf, rig.ids["assets"][0])
+    assert opened.status_code == 200, opened.text
+    body = opened.json()
+    now = time.time()
+    assert body["session_limit_minutes"] == 2
+    assert now + 110 <= body["hard_until"] <= now + 121
+    store, dispose = rig.plane._connect()
+    try:
+        original = store.get(body["sid"])["hard_until"]
+        assert original == body["hard_until"]
+    finally:
+        if dispose:
+            store.close()
+
+    set_quotas(rig, {"max_session_minutes": 1})
+    store, dispose = rig.plane._connect()
+    try:
+        assert store.get(body["sid"])["hard_until"] == original
+    finally:
+        if dispose:
+            store.close()
+    second = open_console(rig, csrf, rig.ids["assets"][1])
+    assert second.status_code == 200, second.text
+    now = time.time()
+    assert now + 50 <= second.json()["hard_until"] <= now + 61
 
 
 def test_suspended_tenant_is_refused_and_says_so(rig):

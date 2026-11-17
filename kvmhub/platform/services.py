@@ -1,9 +1,16 @@
 """Control-plane use cases: accounts, RBAC, assets, credentials, grants, audit."""
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
+import math
+import re
+import secrets
+import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import and_, delete, func, select, update
@@ -11,8 +18,9 @@ from sqlalchemy.orm import Session
 
 from .models import (AccessGrant, Asset, AuditLog, Capability, Credential,
                      DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID, Permission, Role,
-                     RolePermission, ROLE_ADMIN, ROLE_PLATFORM_ADMIN, Tenant, User,
-                     UserRole, VendorProfile, json_field, parse_json)
+                     RolePermission, ROLE_ADMIN, ROLE_OPERATOR, ROLE_PLATFORM_ADMIN,
+                     TENANT_ACTIVE, QuotaUsage, ServiceToken, Tenant, User, UserRole,
+                     VendorProfile, json_field, parse_json)
 from .security import (CredentialCipher, hash_password, verify_password)
 
 MAX_FAILED_ATTEMPTS = 5
@@ -220,6 +228,93 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
     return existing
 
 
+def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor: str,
+                 name: str = "", reassign: bool = False,
+                 now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    addr = (address or "").strip()
+    if not addr:
+        raise PlatformError("invalid_asset", "请填写设备 IP 地址")
+    target = (tenant_id or "").strip() or None
+    tenant = None
+    if target is not None:
+        tenant = session.get(Tenant, target)
+        if tenant is None:
+            raise PlatformError("tenant_not_found", "租户不存在", 404)
+        if tenant.status != TENANT_ACTIVE:
+            raise PlatformError("tenant_suspended", "租户已停用，不能接收设备", 403)
+
+    candidates = session.scalars(
+        select(Asset).where(Asset.address == addr).order_by(Asset.created)).all()
+    if not candidates:
+        if target is None:
+            raise PlatformError("asset_not_found", "没有这个地址的设备", 404)
+        enforce_asset_quota(session, target)
+        asset = Asset(id=str(uuid.uuid4()), tenant_id=target, name=(name or addr).strip() or addr,
+                      address=addr, created=stamp, updated=stamp)
+        session.add(asset)
+        session.flush()
+        audit(session, actor, "asset_assigned", asset_id=asset.id, tenant_id=target,
+              detail={"address": addr, "to": tenant.code, "action": "created"}, now=stamp)
+        session.commit()
+        return {"asset": asset.public(), "action": "created", "previous_tenant": None}
+
+    same = next((row for row in candidates if row.tenant_id == target), None)
+    if same is not None:
+        if name and name.strip() and same.name != name.strip():
+            same.name = name.strip()
+            same.updated = stamp
+            session.commit()
+        return {"asset": same.public(), "action": "unchanged", "previous_tenant": None}
+
+    if len(candidates) > 1:
+        codes = sorted({session.get(Tenant, row.tenant_id).code if row.tenant_id else "(pool)"
+                        for row in candidates})
+        raise PlatformError("asset_ambiguous",
+                            f"该地址已存在于多个归属：{', '.join(codes)}，请先合并重复记录", 409)
+
+    asset = candidates[0]
+    origin = session.get(Tenant, asset.tenant_id) if asset.tenant_id else None
+    origin_code = origin.code if origin is not None else None
+    if origin_code is not None and not reassign:
+        raise PlatformError("asset_owned_by_tenant",
+                            f"设备当前属于租户 {origin_code}，改派或回收需要显式确认", 409)
+    if target is not None:
+        enforce_asset_quota(session, target)
+    if asset.credential_id:
+        siblings = session.scalar(select(func.count()).select_from(Asset)
+                                  .where(Asset.credential_id == asset.credential_id,
+                                         Asset.id != asset.id)) or 0
+        if siblings:
+            raise PlatformError("credential_shared",
+                                "该设备的凭据还被其他设备共用，请先拆分凭据再改派", 409)
+    capability = session.get(Capability, asset.capability_id) if asset.capability_id else None
+    asset.tenant_id = target
+    if name and name.strip():
+        asset.name = name.strip()
+    asset.updated = stamp
+    if capability is not None and capability.tenant_id != target:
+        previous_tenant = (session.get(Tenant, capability.tenant_id).code
+                           if capability.tenant_id else None)
+        capability.tenant_id = target
+        audit(session, actor, "capability_rehomed", asset_id=asset.id, tenant_id=target,
+              detail={"capability_id": capability.id, "from": previous_tenant,
+                      "to": tenant.code if tenant is not None else None}, now=stamp)
+    if asset.credential_id:
+        credential = session.get(Credential, asset.credential_id)
+        if credential is not None and credential.tenant_id != target:
+            credential.tenant_id = target
+            audit(session, actor, "credential_rehomed", asset_id=asset.id, tenant_id=target,
+                  detail={"credential_id": credential.id,
+                          "to": tenant.code if tenant is not None else None}, now=stamp)
+    action = "unassigned" if target is None else ("moved" if origin_code else "assigned")
+    audit(session, actor, f"asset_{action}", asset_id=asset.id, tenant_id=target,
+          detail={"address": addr, "from": origin_code,
+                  "to": tenant.code if tenant is not None else None}, now=stamp)
+    session.commit()
+    return {"asset": asset.public(), "action": action, "previous_tenant": origin_code}
+
+
 def assets_for_user(session: Session, user_id: str, *, now: float | None = None,
                     tenant_id: str = DEFAULT_TENANT_ID) -> list[dict]:
     stamp = time.time() if now is None else now
@@ -420,3 +515,252 @@ def set_tenant_status(session: Session, tenant_id: str, status: str, *, actor: s
           now=now)
     session.commit()
     return row
+
+
+PERIOD_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
+
+
+def period_bounds(period: str) -> tuple[float, float]:
+    if not PERIOD_RE.fullmatch(str(period or "")):
+        raise PlatformError("invalid_period", "period 必须是 YYYY-MM（UTC）", 400)
+    start = datetime.strptime(period, "%Y-%m").replace(tzinfo=timezone.utc).timestamp()
+    year, month = int(period[:4]), int(period[5:])
+    end = (datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp()
+           if month == 12 else
+           datetime(year, month + 1, 1, tzinfo=timezone.utc).timestamp())
+    return start, end
+
+
+def _plane_usage(plane_db: str, sids: set[str], start: float, end: float,
+                 now: float) -> dict[str, tuple[int, int]]:
+    try:
+        db = sqlite3.connect(f"file:{plane_db}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise PlatformError("data_plane_unavailable", f"数据面库不可读：{exc}", 503) from exc
+    try:
+        db.row_factory = sqlite3.Row
+        ended, started = {}, {}
+        for action, target in (("session_finished", ended), ("ticket_consumed", started)):
+            for row in db.execute("SELECT session_id, MAX(ts) AS ts FROM audit "
+                                  "WHERE action=? AND session_id IS NOT NULL "
+                                  "GROUP BY session_id", (action,)):
+                target[row["session_id"]] = row["ts"]
+        usage: dict[str, tuple[int, int]] = {}
+        for row in db.execute("SELECT id, created, consumed, hard_until, status "
+                              "FROM session WHERE created>=? AND created<?", (start, end)):
+            sid = row["id"]
+            if sid not in sids or not row["consumed"]:
+                continue
+            finish = ended.get(sid)
+            if finish is None and row["status"] not in ("closed", "failed", "lost"):
+                finish = now
+            first = max(row["created"], started.get(sid, row["created"]))
+            last = min(finish if finish is not None else row["hard_until"],
+                       row["hard_until"])
+            minutes = max(1, math.ceil((last - first) / 60)) if last > first else 0
+            usage[sid] = (1, minutes)
+        return usage
+    finally:
+        db.close()
+
+
+def rebuild_quota_usage(session: Session, *, plane_db: str, period: str,
+                        now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    start, end = period_bounds(period)
+    tickets: dict[str, str] = {}
+    for row in session.scalars(select(AuditLog).where(
+            AuditLog.action == "console_ticket_issued",
+            AuditLog.ts >= start, AuditLog.ts < end)):
+        detail = parse_json(row.detail, {})
+        sid = str(detail.get("sid") or "")
+        if sid and row.tenant_id:
+            tickets[sid] = str(row.tenant_id)
+    plane = _plane_usage(plane_db, set(tickets), start, end, stamp)
+    tenants = [str(row) for row in session.scalars(select(Tenant.id))]
+    sessions = {tenant: 0 for tenant in tenants}
+    minutes = {tenant: 0 for tenant in tenants}
+    for sid, tenant in tickets.items():
+        count, total = plane.get(sid, (0, 0))
+        sessions.setdefault(tenant, 0)
+        minutes.setdefault(tenant, 0)
+        sessions[tenant] += count
+        minutes[tenant] += total
+
+    asset_counts = {str(tenant_id): 0 for tenant_id in tenants}
+    for tenant_id, count in session.execute(
+            select(Asset.tenant_id, func.count()).group_by(Asset.tenant_id)):
+        if tenant_id in asset_counts:
+            asset_counts[str(tenant_id)] = int(count)
+
+    session.execute(delete(QuotaUsage).where(QuotaUsage.period == period))
+    for tenant_id in sorted(sessions):
+        session.add(QuotaUsage(tenant_id=tenant_id, period=period,
+                               assets=asset_counts.get(tenant_id, 0),
+                               sessions=sessions[tenant_id],
+                               minutes=minutes[tenant_id], updated=stamp))
+    session.commit()
+    return {"period": period, "tenants": len(sessions),
+            "sessions": sum(sessions.values()), "minutes": sum(minutes.values()),
+            "rebuilt_at": stamp}
+
+
+def quota_usage_view(session: Session, period: str) -> list[dict]:
+    period_bounds(period)
+    rows = session.execute(
+        select(QuotaUsage, Tenant.code).join(Tenant, Tenant.id == QuotaUsage.tenant_id)
+        .where(QuotaUsage.period == period).order_by(Tenant.code)).all()
+    return [{"tenant_id": usage.tenant_id, "tenant_code": code,
+             "period": usage.period, "assets": usage.assets,
+             "sessions": usage.sessions, "minutes": usage.minutes,
+             "updated": usage.updated} for usage, code in rows]
+
+
+
+def _allowlist(entries: Any) -> list[str]:
+    if not isinstance(entries, (list, tuple)) or not entries:
+        raise PlatformError("invalid_allowlist", "来源白名单不能为空", 400)
+    out: list[str] = []
+    for item in entries:
+        try:
+            out.append(str(ipaddress.ip_network(str(item).strip(), strict=False)))
+        except ValueError as exc:
+            raise PlatformError("invalid_allowlist", f"非法的来源网段：{item}", 400) from exc
+    return out
+
+
+def source_ip(peer: str | None, forwarded: str, trusted_proxies: str) -> str:
+    try:
+        address = ipaddress.ip_address(str(peer or ""))
+    except ValueError:
+        return ""
+    networks = []
+    for cidr in (item.strip() for item in (trusted_proxies or "").split(",")):
+        if cidr:
+            networks.append(ipaddress.ip_network(cidr, strict=False))
+    if not networks or not any(address in net for net in networks):
+        return str(address)
+    chain = [item.strip() for item in (forwarded or "").split(",") if item.strip()]
+    for candidate in reversed(chain):
+        try:
+            hop = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not any(hop in net for net in networks):
+            return str(hop)
+    return str(address)
+
+
+def ip_allowed(address: str, networks: list[str]) -> bool:
+    if not address:
+        return False
+    try:
+        peer = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(peer in ipaddress.ip_network(cidr, strict=False) for cidr in networks)
+
+
+def _service_user(session: Session, tenant: Tenant) -> User:
+    username = f"svc-dcim-{tenant.code}"
+    user = session.scalar(select(User).where(User.tenant_id == tenant.id,
+                                             User.username == username))
+    if user is not None:
+        return user
+    role = session.scalar(select(Role).where(Role.code == ROLE_OPERATOR))
+    if role is None:
+        raise PlatformError("unknown_role", "服务主体所需角色不存在")
+    user = User(id=str(uuid.uuid4()), tenant_id=tenant.id, username=username,
+                display_name=f"DCIM service account ({tenant.code})",
+                password_hash=hash_password(secrets.token_urlsafe(48)),
+                is_active=False, created=time.time())
+    session.add(user)
+    session.flush()
+    session.add(UserRole(user_id=user.id, role_id=role.id))
+    return user
+
+
+def create_service_token(session: Session, *, tenant_code: str, label: str,
+                         allowlist: list[str], actor: str,
+                         expires_days: int | None = None,
+                         now: float | None = None) -> dict:
+    tenant = session.scalar(select(Tenant).where(Tenant.code == tenant_code))
+    if tenant is None:
+        raise PlatformError("tenant_not_found", "租户不存在", 404)
+    if tenant.status != TENANT_ACTIVE:
+        raise PlatformError("tenant_suspended", "租户已停用", 403)
+    label = str(label or "").strip()
+    if not label:
+        raise PlatformError("invalid_label", "凭据名称不能为空", 400)
+    if session.scalar(select(ServiceToken.id).where(ServiceToken.tenant_id == tenant.id,
+                                                    ServiceToken.label == label)) is not None:
+        raise PlatformError("token_label_exists", "该租户下凭据名称已存在", 409)
+    if expires_days is not None and (not isinstance(expires_days, int) or not 1 <= expires_days <= 3650):
+        raise PlatformError("invalid_expiry", "有效期天数必须在 1..3650", 400)
+    networks = _allowlist(allowlist)
+    user = _service_user(session, tenant)
+    raw = secrets.token_urlsafe(32)
+    stamp = time.time() if now is None else now
+    token = ServiceToken(id=str(uuid.uuid4()), tenant_id=tenant.id, user_id=user.id,
+                         label=label, prefix=raw[:8],
+                         token_hash=hashlib.sha256(raw.encode()).hexdigest(),
+                         allowlist_json=json_field(networks),
+                         expires=stamp + expires_days * 86400 if expires_days else None,
+                         created=stamp, created_by=actor)
+    session.add(token)
+    audit(session, actor, "service_token_created", now=now, tenant_id=tenant.id,
+          actor_type="platform", detail={"id": token.id, "label": label,
+                                         "allowlist": networks,
+                                         "expires": token.expires})
+    session.commit()
+    result = token.public()
+    result["token"] = raw
+    return result
+
+
+def list_service_tokens(session: Session, *, tenant_code: str = "") -> list[dict]:
+    query = select(ServiceToken, Tenant.code).join(Tenant, Tenant.id == ServiceToken.tenant_id)
+    if tenant_code:
+        query = query.where(Tenant.code == tenant_code)
+    return [{**token.public(), "tenant_code": code}
+            for token, code in session.execute(query.order_by(ServiceToken.created)).all()]
+
+
+def revoke_service_token(session: Session, token_id: str, *, actor: str,
+                         now: float | None = None) -> dict:
+    token = session.get(ServiceToken, str(token_id))
+    if token is None:
+        raise PlatformError("token_not_found", "凭据不存在", 404)
+    if token.revoked is None:
+        token.revoked = time.time() if now is None else now
+        audit(session, actor, "service_token_revoked", now=now, tenant_id=token.tenant_id,
+              actor_type="platform", detail={"id": token.id, "label": token.label})
+        session.commit()
+    return token.public()
+
+
+def authenticate_service_token(session: Session, raw: str, peer: str | None,
+                               forwarded: str = "", *, trusted_proxies: str = "") -> dict:
+    if not raw or not isinstance(raw, str):
+        raise PlatformError("authentication_required", "缺少服务凭据", 401)
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    token = session.scalar(select(ServiceToken).where(ServiceToken.token_hash == digest))
+    if token is None:
+        raise PlatformError("invalid_service_token", "服务凭据无效", 401)
+    now = time.time()
+    if token.revoked is not None:
+        raise PlatformError("service_token_revoked", "服务凭据已撤销", 401)
+    if token.expires is not None and token.expires <= now:
+        raise PlatformError("service_token_expired", "服务凭据已过期", 401)
+    address = source_ip(peer, forwarded, trusted_proxies)
+    if not ip_allowed(address, parse_json(token.allowlist_json, [])):
+        raise PlatformError("source_not_allowed", "来源地址不在凭据白名单内", 403)
+    tenant = session.get(Tenant, token.tenant_id)
+    user = session.get(User, token.user_id)
+    if tenant is None or tenant.status != TENANT_ACTIVE or user is None or user.tenant_id != tenant.id:
+        raise PlatformError("service_principal_invalid", "服务主体或租户不可用", 403)
+    token.last_used = now
+    session.commit()
+    return {"user_id": user.id, "username": user.username, "tenant_id": tenant.id,
+            "tenant_code": tenant.code, "token_id": token.id, "token_label": token.label,
+            "token_prefix": token.prefix, "actor_type": "dcim_system"}

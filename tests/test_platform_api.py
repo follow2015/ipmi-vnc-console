@@ -91,20 +91,19 @@ def test_credentials_are_write_only_and_assets_never_echo_them(client):
                         json={"name": "node-1", "address": "192.0.2.11",
                               "credential_id": cred["id"], "vendor": "supermicro"}).json()
     assert "credential" not in asset and BMC_PASSWORD not in str(asset)
-    assert client.get("/api/v2/assets").json() == []
+    listed = client.get("/api/v2/assets").json()
+    assert [row["name"] for row in listed] == ["node-1"]
+    assert "credential" not in str(listed) and BMC_PASSWORD not in str(listed)
 
 
-def test_grant_then_asset_is_visible_only_to_its_user(client):
+def test_a_tenant_device_is_visible_to_every_account_in_that_tenant(client):
     csrf = login(client)
-    asset = client.post("/api/v2/assets", headers=headers(csrf),
-                        json={"name": "node-1", "address": "192.0.2.11"}).json()
-    viewer = next(u for u in client.get("/api/v2/users").json() if u["username"] == "viewer")
-    assert client.post("/api/v2/grants", headers=headers(csrf),
-                       json={"user_id": viewer["id"], "asset_id": asset["id"]}).json() == {"ok": True}
-    assert [a["name"] for a in client.get("/api/v2/assets").json()] == []
+    client.post("/api/v2/assets", headers=headers(csrf),
+                json={"name": "node-1", "address": "192.0.2.11"})
     client.post("/api/v2/logout", headers=headers(csrf))
     login(client, "viewer", VIEWER_PASSWORD)
     assert [a["name"] for a in client.get("/api/v2/assets").json()] == ["node-1"]
+    assert client.get("/api/v2/assets?scope=granted").json() == []
 
 
 def test_detect_reports_a_draft_and_never_self_approves(client):
@@ -176,15 +175,16 @@ def test_an_unauthenticated_me_never_returns_a_token(client):
     assert r.status_code == 401 and "csrf" not in r.text
 
 
-def test_the_management_scope_shows_assets_that_are_not_granted_yet(client):
+def test_the_default_list_is_the_whole_tenant_fleet(client):
     csrf = login(client)
     created = client.post("/api/v2/assets", headers=headers(csrf),
                           json={"name": "ungranted", "address": "192.0.2.60"}).json()
-    assert client.get("/api/v2/assets").json() == []
-    managed = client.get("/api/v2/assets?scope=all").json()
-    assert [row["name"] for row in managed] == ["ungranted"]
-    assert managed[0]["grant_expires"] is None
-    assert managed[0]["id"] == created["id"]
+    listed = client.get("/api/v2/assets").json()
+    assert [row["name"] for row in listed] == ["ungranted"]
+    assert listed[0]["grant_expires"] is None
+    assert listed[0]["id"] == created["id"]
+    assert client.get("/api/v2/assets?scope=granted").json() == []
+    assert [row["name"] for row in client.get("/api/v2/assets?scope=all").json()] == ["ungranted"]
 
 
 def test_the_management_scope_is_refused_to_a_read_only_account(client):
@@ -208,22 +208,22 @@ def test_deactivation_revokes_all_existing_sessions_and_reactivation_does_not_re
     tokens = []
     for _ in range(2):
         tokens.append(login(client, "operator", ADMIN_PASSWORD))
-        cookies.append(client.cookies.get(platform.cookie_name))
+        cookies.append(client.cookies.get(platform.tenant_cookie_name))
     admin_csrf = login(client)
     assert client.post(f"/api/v2/users/{user_id}/active", headers=headers(admin_csrf),
                        json={"active": False}).status_code == 200
-    admin_cookie = client.cookies.get(platform.cookie_name)
+    admin_cookie = client.cookies.get(platform.tenant_cookie_name)
     for cookie, csrf in zip(cookies, tokens):
-        client.cookies.set(platform.cookie_name, cookie)
+        client.cookies.set(platform.tenant_cookie_name, cookie)
         assert client.get("/api/v2/me").status_code == 401
         r = client.post("/api/v2/assets", headers=headers(csrf),
                         json={"name": "disabled-write", "address": "192.0.2.99"})
         assert r.status_code == 401
-    client.cookies.set(platform.cookie_name, admin_cookie)
+    client.cookies.set(platform.tenant_cookie_name, admin_cookie)
     assert client.post(f"/api/v2/users/{user_id}/active", headers=headers(admin_csrf),
                        json={"active": True}).status_code == 200
     for cookie in cookies:
-        client.cookies.set(platform.cookie_name, cookie)
+        client.cookies.set(platform.tenant_cookie_name, cookie)
         assert client.get("/api/v2/me").status_code == 401
     client.cookies.clear()
     login(client, "operator", ADMIN_PASSWORD)

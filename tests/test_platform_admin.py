@@ -49,9 +49,12 @@ def rig(tmp_path):
 
 def login(client: TestClient, username: str, tenant_code: str | None = None) -> str:
     body = {"username": username, "password": PASSWORD}
-    if tenant_code:
+    path = "/api/v2/login"
+    if username == "platform":
+        path = "/api/v2/platform/login"
+    elif tenant_code:
         body["tenant_code"] = tenant_code
-    response = client.post("/api/v2/login", json=body)
+    response = client.post(path, json=body)
     assert response.status_code == 200, response.text
     return response.json()["csrf"]
 

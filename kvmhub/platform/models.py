@@ -43,7 +43,7 @@ ROLE_PERMISSIONS = {
 PLATFORM_PERMISSIONS = (
     "platform.tenant.read", "platform.tenant.write",
     "platform.session.read", "platform.session.revoke",
-    "platform.audit.read", "platform.asset.read",
+    "platform.audit.read", "platform.asset.read", "platform.asset.write",
     "platform.worker.read", "platform.worker.manage",
     "platform.vendor.read",
 )
@@ -276,3 +276,42 @@ class AuditLog(Base):
     __table_args__ = (Index("ix_kvm_audit_ts", "ts"),
                       Index("ix_kvm_audit_tenant_ts", "tenant_id", "ts"),
                       UniqueConstraint("id", name="uq_kvm_audit_id"))
+
+
+class QuotaUsage(Base):
+    __tablename__ = "kvm_quota_usage"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_tenant.id"),
+                                           nullable=False, index=True)
+    period: Mapped[str] = mapped_column(String(7), nullable=False)
+    assets: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sessions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    __table_args__ = (UniqueConstraint("tenant_id", "period", name="uq_kvm_quota_usage"),)
+
+
+class ServiceToken(Base):
+    __tablename__ = "kvm_service_token"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_tenant.id"),
+                                           nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_user.id"), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    allowlist_json: Mapped[str] = mapped_column(Text, default="[]")
+    expires: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    revoked: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(128), default="")
+    __table_args__ = (UniqueConstraint("tenant_id", "label", name="uq_kvm_service_token_label"),)
+
+    def public(self) -> dict:
+        return {"id": self.id, "tenant_id": self.tenant_id, "user_id": self.user_id,
+                "label": self.label, "prefix": self.prefix,
+                "allowlist": parse_json(self.allowlist_json, []),
+                "expires": self.expires, "created": self.created,
+                "revoked": self.revoked, "last_used": self.last_used,
+                "created_by": self.created_by}
