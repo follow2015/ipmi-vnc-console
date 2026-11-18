@@ -22,6 +22,7 @@ from .models import (AccessGrant, Asset, AuditLog, Capability, Credential,
                      TENANT_ACTIVE, QuotaUsage, ServiceToken, Tenant, User, UserRole,
                      VendorProfile, json_field, parse_json)
 from .security import (CredentialCipher, hash_password, verify_password)
+from ..sql_backend import open_store, parse_store_dsn
 
 MAX_FAILED_ATTEMPTS = 5
 LOCK_SECONDS = 900
@@ -534,11 +535,13 @@ def period_bounds(period: str) -> tuple[float, float]:
 def _plane_usage(plane_db: str, sids: set[str], start: float, end: float,
                  now: float) -> dict[str, tuple[int, int]]:
     try:
-        db = sqlite3.connect(f"file:{plane_db}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
+        dsn = parse_store_dsn(plane_db)
+        db = open_store(dsn, readonly=True)
+    except Exception as exc:
         raise PlatformError("data_plane_unavailable", f"数据面库不可读：{exc}", 503) from exc
     try:
-        db.row_factory = sqlite3.Row
+        if dsn.dialect == "sqlite":
+            db.row_factory = sqlite3.Row
         ended, started = {}, {}
         for action, target in (("session_finished", ended), ("ticket_consumed", started)):
             for row in db.execute("SELECT session_id, MAX(ts) AS ts FROM audit "

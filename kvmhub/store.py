@@ -1,4 +1,4 @@
-"""Transactional SQLite implementation for the single-Manager local PoC."""
+"""Transactional data-plane Store: SQLite locally, MySQL in production."""
 import json
 import secrets
 import sqlite3
@@ -10,12 +10,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
 from .common import PASSTHROUGH_ADAPTER_ID, Problem
+from .sql_backend import mysql_capability_ddl, open_store, parse_store_dsn
 from .telemetry import audit_evidence
 
 TENANT_GRANT = "*"
 
 
-SCHEMA = """
+SQLITE_SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS adapter_capability (
  id TEXT PRIMARY KEY, vendor TEXT NOT NULL, model TEXT NOT NULL, firmware TEXT NOT NULL,
@@ -53,6 +54,47 @@ CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit BEGIN
  SELECT RAISE(ABORT,'append only'); END;
 """
 
+SCHEMA = SQLITE_SCHEMA
+
+MYSQL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS adapter_capability (
+ id VARCHAR(64) PRIMARY KEY, vendor VARCHAR(128) NOT NULL, model VARCHAR(128) NOT NULL,
+ firmware VARCHAR(128) NOT NULL, adapter VARCHAR(128) NOT NULL, status VARCHAR(32) NOT NULL,
+ expires DOUBLE NOT NULL, evidence TEXT NOT NULL, approver VARCHAR(128) NOT NULL,
+ console_impl VARCHAR(128) NOT NULL DEFAULT '', licence TEXT NOT NULL,
+ concurrency_limit INT NOT NULL DEFAULT 1, models VARCHAR(4096) NOT NULL DEFAULT '[]',
+ firmware_min VARCHAR(128) NOT NULL DEFAULT '', firmware_max VARCHAR(128) NOT NULL DEFAULT '',
+ approved_at DOUBLE NOT NULL DEFAULT 0, effective_from DOUBLE NOT NULL DEFAULT 0,
+ review_due DOUBLE NOT NULL DEFAULT 0, status_reason VARCHAR(512) NOT NULL DEFAULT '',
+ revision INT NOT NULL DEFAULT 0, protocol_versions VARCHAR(4096) NOT NULL DEFAULT '[]',
+ input_shaping VARCHAR(4096) NOT NULL DEFAULT '{}', logout_path VARCHAR(256) NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS asset (
+ id VARCHAR(64) PRIMARY KEY, name VARCHAR(255) NOT NULL, vendor VARCHAR(128) NOT NULL,
+ model VARCHAR(128) NOT NULL, firmware VARCHAR(128) NOT NULL,
+ capability_id VARCHAR(64) NOT NULL, target VARCHAR(255) NOT NULL,
+ fingerprint VARCHAR(128) NOT NULL, credential LONGBLOB NOT NULL,
+ INDEX ix_asset_capability (capability_id));
+CREATE TABLE IF NOT EXISTS access_grant (
+ user_id VARCHAR(128) NOT NULL, asset_id VARCHAR(64) NOT NULL, expires DOUBLE NOT NULL,
+ PRIMARY KEY(user_id,asset_id), INDEX ix_grant_asset (asset_id), INDEX ix_grant_expiry (expires));
+CREATE TABLE IF NOT EXISTS session (
+ id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(128) NOT NULL, asset_id VARCHAR(64) NOT NULL,
+ worker_id VARCHAR(64) NOT NULL, instance_id VARCHAR(64) NOT NULL,
+ jti VARCHAR(64) NOT NULL UNIQUE, consumed INT NOT NULL DEFAULT 0,
+ status VARCHAR(32) NOT NULL, version INT NOT NULL DEFAULT 0,
+ created DOUBLE NOT NULL, phase_until DOUBLE NOT NULL, lease_until DOUBLE NOT NULL,
+ hard_until DOUBLE NOT NULL, cleanup VARCHAR(32) NOT NULL DEFAULT 'not_needed',
+ reason VARCHAR(64), end_evidence TEXT,
+ INDEX ix_session_status (status), INDEX ix_session_asset (asset_id),
+ INDEX ix_session_created (created));
+CREATE TABLE IF NOT EXISTS asset_slot (
+ asset_id VARCHAR(64) PRIMARY KEY, session_id VARCHAR(64) NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS audit (
+ id BIGINT AUTO_INCREMENT PRIMARY KEY, ts DOUBLE NOT NULL, trace_id VARCHAR(64) NOT NULL,
+ actor VARCHAR(128) NOT NULL, action VARCHAR(96) NOT NULL, session_id VARCHAR(64),
+ detail TEXT NOT NULL, INDEX ix_audit_session (session_id), INDEX ix_audit_action (action));
+"""
+
 CAPABILITY_COLUMNS = {
     "console_impl": "TEXT NOT NULL DEFAULT ''",
     "licence": "TEXT NOT NULL DEFAULT ''",
@@ -87,9 +129,16 @@ class _CapabilityLost(Exception):
 class Store:
     def __init__(self, path, key: bytes | None = None, clock=time.time, lease_seconds=30,
                  passthrough_targets: tuple[str, ...] = ()):
-        self.db = sqlite3.connect(path, isolation_level=None, timeout=5)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript(SCHEMA)
+        self._dsn = parse_store_dsn(str(path))
+        self.dialect = self._dsn.dialect
+        self.db = open_store(self._dsn)
+        if self.dialect == "sqlite":
+            self.db.row_factory = sqlite3.Row
+            self.db.executescript(SQLITE_SCHEMA)
+        else:
+            for statement in MYSQL_SCHEMA.split(";"):
+                if statement.strip():
+                    self.db.execute(statement)
         self._migrate()
         self.cipher = AESGCM(key) if key is not None else None
         self.clock, self.lease_seconds = clock, lease_seconds
@@ -98,10 +147,15 @@ class Store:
     def _migrate(self):
         for table, columns in (("adapter_capability", CAPABILITY_COLUMNS),
                                ("session", SESSION_COLUMNS)):
-            present = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            if self.dialect == "sqlite":
+                present = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            else:
+                present = {row["Field"] for row in self.db.execute(f"SHOW COLUMNS FROM {table}")}
             for name, ddl in columns.items():
                 if name not in present:
-                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                    statement = f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                    self.db.execute(mysql_capability_ddl(statement)
+                                    if self.dialect == "mysql" else statement)
 
     def close(self):
         self.db.close()
@@ -325,9 +379,9 @@ class Store:
             for aid, name in (("mock-1", "模拟控制台一"), ("mock-2", "模拟控制台二")):
                 nonce = secrets.token_bytes(12)
                 encrypted = nonce + self.cipher.encrypt(nonce, json.dumps({"username": username, "password": password}).encode(), aid.encode())
-                self.db.execute("INSERT OR REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
+                self.db.execute("REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
                                 (aid, name, "mock", "test-console", "1", "mock-v1", target, fingerprint, encrypted))
-                self.db.execute("INSERT OR REPLACE INTO access_grant VALUES(?,?,?)",
+                self.db.execute("REPLACE INTO access_grant VALUES(?,?,?)",
                                 ("local-admin", aid, self.clock() + 86400))
 
     def seed_passthrough(self, *, target: str, fingerprint: str, username: str, password: str,
@@ -356,10 +410,10 @@ class Store:
             nonce = secrets.token_bytes(12)
             encrypted = nonce + self.cipher.encrypt(
                 nonce, json.dumps({"username": username, "password": password}).encode(), asset_id.encode())
-            self.db.execute("INSERT OR REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
+            self.db.execute("REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
                             (asset_id, name, vendor, model, firmware, capability_id, target,
                              fingerprint, encrypted))
-            self.db.execute("INSERT OR REPLACE INTO access_grant VALUES(?,?,?)",
+            self.db.execute("REPLACE INTO access_grant VALUES(?,?,?)",
                             ("local-admin", asset_id, self.clock() + 86400))
 
     def register_asset(self, *, asset_id: str, name: str, vendor: str, model: str,
@@ -381,10 +435,10 @@ class Store:
             nonce, json.dumps({"username": username, "password": password}).encode(),
             asset_id.encode())
         with self.tx():
-            self.db.execute("INSERT OR REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
+            self.db.execute("REPLACE INTO asset VALUES(?,?,?,?,?,?,?,?,?)",
                             (asset_id, name, vendor, model, firmware, capability_id,
                              target, digest, encrypted))
-            self.db.execute("INSERT OR REPLACE INTO access_grant VALUES(?,?,?)",
+            self.db.execute("REPLACE INTO access_grant VALUES(?,?,?)",
                             (user_id, asset_id, self.clock() + grant_ttl))
             self.event(actor, "data_plane_asset_imported",
                        detail={"asset": asset_id, "capability": capability_id,
@@ -617,7 +671,11 @@ class Store:
                 elif r["status"] in ("connecting", "active", "closing") and r["lease_until"] <= now:
                     status = "lost"
                 if status:
-                    self.db.execute("UPDATE session SET status=?,reason='deadline',version=version+1 WHERE id=?", (status, r["id"]))
+                    updated = self.db.execute(
+                        "UPDATE session SET status=?,reason='deadline',version=version+1 "
+                        "WHERE id=? AND status=?", (status, r["id"], r["status"]))
+                    if not updated.rowcount:
+                        continue
                     detail = {"status": status}
                     if r["hard_until"] <= now:
                         detail["cause"] = "hard_limit"

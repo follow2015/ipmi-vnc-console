@@ -78,6 +78,13 @@ class Settings:
     def is_prod(self) -> bool:
         return self.env == "prod"
 
+    @property
+    def data_plane_dialect(self) -> str:
+        if not self.data_plane_store:
+            return ""
+        from ..sql_backend import parse_store_dsn
+        return parse_store_dsn(self.data_plane_store).dialect
+
     def validate(self) -> None:
         if self.env not in ("dev", "test", "prod"):
             raise ValueError(f"KVMHUB_ENV must be dev/test/prod, got {self.env!r}")

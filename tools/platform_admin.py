@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import shlex
 import sys
 import time
 import uuid
@@ -22,7 +23,8 @@ from kvmhub.platform.models import (AccessGrant, Asset as PlatformAsset,  # noqa
                                     PROFILE_APPROVED, Capability, Credential, User,
                                     VendorProfile)
 from kvmhub.platform.security import CredentialCipher  # noqa: E402
-from kvmhub.platform import connection, governance, services, vendor_registry  # noqa: E402
+from kvmhub.platform import (brand_onboarding, connection, governance,  # noqa: E402
+                             services, vendor_registry)
 from kvmhub.platform.bus import AssemblyBus  # noqa: E402
 from kvmhub.platform.redis_state import create_state  # noqa: E402
 from kvmhub.store import TENANT_GRANT, Store  # noqa: E402
@@ -39,6 +41,19 @@ def _required_env(name: str) -> str:
     if not value:
         raise SystemExit(f"{name} must be set (secrets are never CLI arguments)")
     return value
+
+
+def _load_json(path: str, label: str) -> dict:
+    target = Path(path)
+    if not target.is_file():
+        raise SystemExit(f"{label} must point at an existing JSON file: {path}")
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{label} is not readable JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"{label} must contain a JSON object")
+    return payload
 
 
 def cmd_init_db(args):
@@ -122,6 +137,77 @@ def cmd_profiles(args):
                 for row in db.scalars(select(VendorProfile)
                                       .order_by(VendorProfile.priority)).all()]
     print(json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def cmd_create_profile(args):
+    spec = _load_json(args.spec, "--spec")
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        try:
+            row = brand_onboarding.create_draft_profile(
+                db, spec=spec, evidence=args.evidence, actor=args.actor)
+        except brand_onboarding.SpecError as exc:
+            raise SystemExit(str(exc)) from exc
+    print(json.dumps({**row.public(),
+                      "approve_command": governance.approve_profile_command(
+                          row.id, approver=args.actor, evidence=args.evidence)},
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_brand_onboard(args):
+    spec = _load_json(args.spec, "--spec")
+    payload = _load_json(args.inventory, "--inventory")
+    inventory = payload.get("inventory", payload)
+    _, _, factory, _ = _context(args)
+
+    with transaction(factory) as db:
+        existing = db.scalar(select(VendorProfile).where(VendorProfile.code == spec.get("code")))
+        if existing is not None:
+            profile = existing
+            try:
+                if not brand_onboarding.profile_matches_spec(
+                        existing, spec, evidence=args.evidence):
+                    raise SystemExit("profile code exists with different wire settings; "
+                                     "refusing to reuse it")
+            except brand_onboarding.SpecError as exc:
+                raise SystemExit(str(exc)) from exc
+            created = False
+        else:
+            try:
+                profile = brand_onboarding.create_draft_profile(
+                    db, spec=spec, evidence=args.evidence, actor=args.actor)
+            except brand_onboarding.SpecError as exc:
+                raise SystemExit(str(exc)) from exc
+            created = True
+
+        detection = vendor_registry.detect_from_redfish(inventory)
+        match = vendor_registry.identify(db, detection, greeting=args.greeting or "")
+        if match.profile is None or match.profile.id != profile.id:
+            raise SystemExit("inventory did not match the new profile "
+                             f"({match.reason or 'matched_a_different_profile'}); "
+                             "no capability draft was created")
+
+        draft = services.capability_draft(db, profile, detection=detection, actor=args.actor)
+        services.audit(db, args.actor, "brand_onboard_prepared",
+                       detail={"profile_id": profile.id, "code": profile.code,
+                               "capability_id": draft.id,
+                               "detection": {k: detection.get(k)
+                                             for k in ("vendor", "model", "firmware")}})
+
+    commands = []
+    if profile.status != PROFILE_APPROVED:
+        commands.append(governance.approve_profile_command(
+            profile.id, approver=args.actor, evidence=args.evidence))
+    commands.append(governance.approve_capability_command(
+        draft.id, approver=args.actor, evidence=args.evidence))
+    commands.append("tools/platform_admin.py sync-data-plane "
+                    f"--store '/path/to/data-plane-dsn' --evidence {shlex.quote(args.evidence)} "
+                    f"--approver {shlex.quote(args.actor)}")
+    print(json.dumps({"profile": profile.public(), "profile_created": created,
+                      "capability": {"id": draft.id, "status": draft.status},
+                      "match": match.as_dict(), "detection": detection,
+                      "commands": commands},
+                     ensure_ascii=False, indent=1))
 
 
 def cmd_approve_profile(args):
@@ -445,6 +531,16 @@ def parser():
     q.set_defaults(fn=cmd_add_asset)
     q = sub.add_parser("grant"); q.add_argument("--user", required=True); q.add_argument("--asset", required=True); q.add_argument("--ttl", type=int, default=86400 * 30); q.set_defaults(fn=cmd_grant)
     sub.add_parser("profiles").set_defaults(fn=cmd_profiles)
+    q = sub.add_parser("create-profile", help="create a draft vendor profile from a measured spec")
+    q.add_argument("--spec", required=True, help="JSON file with the measured brand spec")
+    q.add_argument("--evidence", required=True, help="existing measured evidence file")
+    q.set_defaults(fn=cmd_create_profile)
+    q = sub.add_parser("brand-onboard", help="prepare a new brand through drafts; never approves")
+    q.add_argument("--spec", required=True, help="JSON file with the measured brand spec")
+    q.add_argument("--inventory", required=True, help="saved Redfish inventory JSON")
+    q.add_argument("--evidence", required=True, help="existing measured evidence file")
+    q.add_argument("--greeting", help="measured RFB greeting, e.g. 'RFB 003.008'")
+    q.set_defaults(fn=cmd_brand_onboard)
     q = sub.add_parser("approve-profile"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--renew", action="store_true", help="record a new review of an already-approved profile"); q.set_defaults(fn=cmd_approve_profile)
     sub.add_parser("capabilities").set_defaults(fn=cmd_capabilities)
     q = sub.add_parser("approve-capability"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--valid-days", type=int, default=365); q.set_defaults(fn=cmd_approve_capability)
@@ -475,10 +571,11 @@ def parser():
     q = sub.add_parser("rebuild-quota-usage", help="rebuild a month from raw audit/session rows")
     q.add_argument("--period", required=True, help="UTC month, YYYY-MM")
     q.add_argument("--data-plane-db", required=True,
-                   help="data-plane SQLite path, e.g. /var/lib/kvmhub/gateway/manager.sqlite3")
+                   help="data-plane store DSN: sqlite path or mysql://user:password@host:3306/db")
     q.set_defaults(fn=cmd_rebuild_quota_usage)
-    q = sub.add_parser("sync-data-plane", help="import approved assets into the Worker's SQLite store")
-    q.add_argument("--store", required=True, help="path to the PoC data-plane SQLite file")
+    q = sub.add_parser("sync-data-plane", help="import approved assets into the data-plane store")
+    q.add_argument("--store", required=True,
+                   help="data-plane store DSN: sqlite path or mysql://user:password@host:3306/db")
     q.add_argument("--asset", help="sync only this control-plane asset id")
     q.add_argument("--user", help="sync only this control-plane user id (default: every active grant)")
     q.add_argument("--evidence", required=True)
