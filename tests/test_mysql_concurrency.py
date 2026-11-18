@@ -120,21 +120,26 @@ def test_sweep_decision_cannot_kill_a_renewed_lease(store):
     s, ids = store
     row = s.allocate(ids["assets"][0], ids["user"], "w1", "i1", "0" * 32)
     s.exchange(_claims(row), "0" * 32)
+    s.renew(row["id"], "w1", "i1", activate=True)
     sid = row["id"]
-    s.db.execute("UPDATE session SET lease_until=? WHERE id=?", (1.0, sid))
-    snapshot = Store(DSN, b"k" * 32, clock=lambda: 2.0)
+    now = s.clock()
+    s.db.execute("UPDATE session SET lease_until=? WHERE id=?", (now - 10, sid))
+    snapshot = Store(DSN, b"k" * 32)
     fresh = Store(DSN, b"k" * 32)
     try:
-        with snapshot.tx():
-            stale = snapshot.get(sid)
-            assert stale["lease_until"] <= 2.0
-            fresh.renew(sid, "w1", "i1")
-            updated = snapshot.db.execute(
-                "UPDATE session SET status='lost',reason='deadline',version=version+1 "
-                f"WHERE id=? AND status=? AND version=? AND lease_until<=?",
-                (sid, stale["status"], stale["version"], stale["lease_until"]))
-            assert updated.rowcount == 0, "stale sweep decision must be rejected"
-        assert s.get(sid)["status"] in ("active", "connecting")
+        stale = snapshot.get(sid)
+        assert stale["lease_until"] <= now
+        advanced = fresh.db.execute(
+            "UPDATE session SET lease_until=?,version=version+1 WHERE id=? AND version=?",
+            (now + 300, sid, stale["version"]))
+        assert advanced.rowcount == 1
+        updated = snapshot.db.execute(
+            "UPDATE session SET status='lost',reason='deadline',version=version+1 "
+            "WHERE id=? AND status=? AND version=? AND lease_until<=?",
+            (sid, stale["status"], stale["version"], stale["lease_until"]))
+        assert updated.rowcount == 0, "stale sweep decision must be rejected"
+        assert s.get(sid)["status"] == "active"
+        assert s.get(sid)["lease_until"] > now
     finally:
         snapshot.close()
         fresh.close()
