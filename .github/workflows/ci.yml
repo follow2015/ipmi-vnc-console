@@ -94,5 +94,13 @@ jobs:
       - name: 安装锁版依赖
         run: python -m pip install -r requirements.lock
 
+      # Store builds its append-only audit triggers at runtime as the
+      # non-SUPER kvmhub_ci user. MySQL 8.4 ships with binlog on, so CREATE
+      # TRIGGER would fail with 1419 without this — the CI equivalent of the
+      # bare-metal /etc/mysql/mysql.conf.d/kvmhub.cnf prerequisite.
+      - name: 允许非 SUPER 用户建审计触发器
+        run: |
+          python -c "import pymysql; c=pymysql.connect(host='127.0.0.1',user='root',password='root-placeholder-password'); cur=c.cursor(); cur.execute('SET GLOBAL log_bin_trust_function_creators=ON'); c.close()"
+
       - name: 真实 MySQL 并发兑换 / 分配
         run: python -m pytest -q -s --basetemp=/tmp/kvmhub-ci-mysql tests/test_mysql_concurrency.py

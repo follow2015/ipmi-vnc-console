@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from aiohttp import WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -96,8 +97,11 @@ def test_production_nginx_overwrites_forwarded_host():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    conf = (root / "deploy" / "nginx" / "platform.conf").read_text(encoding="utf-8")
-    lines = [ln.strip() for ln in conf.splitlines()
+    conf = (root / "deploy" / "nginx" / "platform.conf")
+    if not conf.is_file():
+        pytest.skip("deploy/nginx is not published to the public repo")
+    text = conf.read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in text.splitlines()
              if ln.strip().lower().startswith("proxy_set_header x-forwarded-host")]
     assert lines, "platform.conf never sets X-Forwarded-Host"
     assert all(ln.endswith("$host;") for ln in lines), lines
