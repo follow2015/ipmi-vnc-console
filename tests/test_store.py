@@ -243,3 +243,63 @@ def test_ticket_requires_instance_claims_and_signature():
         verify(key.public_key(), ticket, "w1", "i2")
     with pytest.raises(Problem, match="invalid_ticket"):
         verify(Ed25519PrivateKey.generate().public_key(), ticket, "w1", "i1")
+
+
+def test_non_default_worker_lifecycle(setup_store):
+    store, now, _, _ = setup_store
+    worker, instance = "w7", "i7"
+    row = store.allocate("mock-1", "local-admin", worker, instance, "trace")
+    result = store.exchange(claims(row), "trace")
+    assert result["password"] == "fixture-password"
+    assert store.get(row["id"])["status"] == "connecting"
+    renewed = store.renew(row["id"], worker, instance, activate=True)
+    assert renewed["lease_seconds"] > 0
+    assert store.get(row["id"])["status"] == "active"
+    store.finish(row["id"], worker, instance, "confirmed", "client_closed", trace="trace")
+    assert store.get(row["id"])["status"] == "closed"
+    row2 = store.allocate("mock-2", "local-admin", worker, instance, "trace")
+    store.exchange(claims(row2), "trace")
+    from kvmhub.common import Problem as _Problem
+    with pytest.raises(_Problem, match="instance_mismatch"):
+        store.renew(row2["id"], "w1", instance)
+
+
+def test_renew_refuses_a_stale_version(setup_store, monkeypatch):
+    store, now, _, _ = setup_store
+    row = store.allocate("mock-1", "local-admin", "w1", "i1", "t")
+    store.exchange(claims(row), "t")
+    store.renew(row["id"], "w1", "i1", activate=True)
+    assert store.get(row["id"])["status"] == "active"
+
+    original = store.worker_row
+
+    def stale(sid, w, i):
+        r = original(sid, w, i)
+        r["version"] = r["version"] - 1
+        return r
+
+    monkeypatch.setattr(store, "worker_row", stale)
+    with pytest.raises(Problem, match="session_revoked"):
+        store.renew(row["id"], "w1", "i1")
+
+
+def test_finish_keeps_confirmed_cleanup_against_a_stale_pending(setup_store, monkeypatch):
+    store, now, _, _ = setup_store
+    row = store.allocate("mock-1", "local-admin", "w1", "i1", "t")
+    store.exchange(claims(row), "t")
+    store.renew(row["id"], "w1", "i1", activate=True)
+    store.finish(row["id"], "w1", "i1", "confirmed", "revoked", trace="t")
+    assert store.get(row["id"])["cleanup"] == "confirmed"
+
+    original = store.worker_row
+
+    def stale(sid, w, i):
+        r = original(sid, w, i)
+        r["cleanup"] = "pending"
+        r["status"] = "active"
+        r["version"] = r["version"] - 1
+        return r
+
+    monkeypatch.setattr(store, "worker_row", stale)
+    store.finish(row["id"], "w1", "i1", "pending", "client_closed", trace="t")
+    assert store.get(row["id"])["cleanup"] == "confirmed", "cleanup must be monotonic"

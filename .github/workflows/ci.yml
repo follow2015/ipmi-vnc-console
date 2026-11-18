@@ -56,3 +56,43 @@ jobs:
 
       - name: 全套测试
         run: python -m pytest -q --basetemp=/tmp/kvmhub-ci-basetemp
+
+  # Real-MySQL concurrency contract. The default suite uses an in-memory
+  # SQLite shim; BEGIN IMMEDIATE there serialises writers and hides the race
+  # that MySQL's REPEATABLE READ allows. This job is the only place the
+  # ticket-single-use invariant is tested against a real relational engine.
+  mysql-concurrency:
+    name: 真实 MySQL 并发门禁
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root-placeholder-password
+          MYSQL_DATABASE: kvmhub_ci
+          MYSQL_USER: kvmhub_ci
+          MYSQL_PASSWORD: placeholder-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot-placeholder-password"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+    env:
+      KVMHUB_TEST_MYSQL_DSN: mysql://kvmhub_ci:placeholder-password@127.0.0.1:3306/kvmhub_ci
+      # Fail loud: a service that never came up must not turn four skipped
+      # tests into a green gate (f6611a2 R5).
+      KVMHUB_REQUIRE_MYSQL: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装锁版依赖
+        run: python -m pip install -r requirements.lock
+
+      - name: 真实 MySQL 并发兑换 / 分配
+        run: python -m pytest -q -s --basetemp=/tmp/kvmhub-ci-mysql tests/test_mysql_concurrency.py

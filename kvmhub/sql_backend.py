@@ -8,6 +8,20 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 MYSQL_SCHEMES = ("mysql", "mysql+pymysql")
 
 
+def _integrity_errors() -> tuple[type[BaseException], ...]:
+    errors: list[type[BaseException]] = [sqlite3.IntegrityError]
+    try:
+        from pymysql.err import IntegrityError as MySQLError
+    except ImportError:
+        pass
+    else:
+        errors.append(MySQLError)
+    return tuple(errors)
+
+
+INTEGRITY_ERRORS = _integrity_errors()
+
+
 @dataclass(frozen=True)
 class StoreDSN:
     dialect: str
@@ -139,6 +153,9 @@ class MysqlConnection:
     def execute(self, sql: str, params=()):
         return self.db.execute(sql, params)
 
+    def ping(self, reconnect: bool = True):
+        self._conn.ping(reconnect=reconnect)
+
     def commit(self):
         self._conn.commit()
 
@@ -156,10 +173,15 @@ def open_store(dsn: StoreDSN, *, readonly: bool = False):
         if readonly and target != ":memory:":
             from urllib.parse import quote
             return sqlite3.connect(f"file:{quote(target)}?mode=ro", uri=True,
-                                   isolation_level=None, timeout=5)
-        return sqlite3.connect(target, isolation_level=None, timeout=5)
+                                   isolation_level=None, timeout=5,
+                                   check_same_thread=False)
+        return sqlite3.connect(target, isolation_level=None, timeout=5,
+                               check_same_thread=False)
     if readonly:
-        return MysqlConnection(**dsn.target)
+        conn = MysqlConnection(**dsn.target)
+        conn.execute("SET SESSION TRANSACTION READ ONLY")
+        conn.execute("START TRANSACTION READ ONLY")
+        return conn
     return MysqlConnection(**dsn.target)
 
 

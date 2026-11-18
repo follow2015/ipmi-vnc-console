@@ -412,6 +412,13 @@ REAL_CONSOLE_JS = """'use strict';
   // so it lands inside the grace window, the rest back off but stay under it.
   var DELAYS = [0, 400, 900];
   var MAX_TOTAL = 6;
+  // R8: a controlled geometry close (4001) is not a failed reconnect, but a
+  // gateway stuck renegotiating video mode could close with 4001 forever. Give
+  // geometry reloads their OWN window budget — persisted across the reloads —
+  // so one or a few legitimate mode switches still re-handshake immediately,
+  // while an unbroken pattern is reported as exhausted instead of looping.
+  var MAX_GEOMETRY_RELOADS = 4;
+  var GEOMETRY_WINDOW_MS = 60000;
   var KEY = '__kvm_recovery_v1';
   var EXHAUSTED_TEXT = '连接已断开，自动重连已用尽。请返回 Manager 查看会话状态并重新申请。';
   function readRecovery() {
@@ -560,8 +567,24 @@ REAL_CONSOLE_JS = """'use strict';
     // spend the reconnect budget on it: the gateway already rebuilt the console
     // and the page just needs one clean handshake at the new framebuffer size.
     if (geometryReloaded) {
-      setStatus('分辨率已变更，正在重新载入画面…');
-      location.reload();
+      // Separate, windowed budget — never the failure-retry counters. One
+      // legitimate mode switch reloads at once, but a gateway that keeps
+      // closing with 4001 must not make this page reload forever (R8).
+      var gnow = Date.now();
+      var gstart = Number(rec.geoStart || 0);
+      if (!gstart || (gnow - gstart) > GEOMETRY_WINDOW_MS) {
+        gstart = gnow; rec.geoCount = 0;
+      }
+      rec.geoStart = gstart;
+      var gcount = Number(rec.geoCount || 0) + 1;
+      rec.geoCount = gcount;
+      writeRecovery(rec);
+      if (gcount <= MAX_GEOMETRY_RELOADS) {
+        setStatus('分辨率已变更，正在重新载入画面…');
+        location.reload();
+        return;
+      }
+      exhaust('分辨率反复变更，已停止自动重载（' + gcount + '/' + MAX_GEOMETRY_RELOADS + '）。');
       return;
     }
     if (explained) { exhaust('客户端状态：' + state); return; }

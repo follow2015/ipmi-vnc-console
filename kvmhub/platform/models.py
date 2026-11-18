@@ -27,6 +27,10 @@ DEFAULT_TENANT_CODE = "default"
 TENANT_ACTIVE = "active"
 TENANT_SUSPENDED = "suspended"
 
+TENANT_MODE_CONSUMER = "consumer"
+TENANT_MODE_MANAGER = "manager"
+TENANT_MODES = (TENANT_MODE_CONSUMER, TENANT_MODE_MANAGER)
+
 PERMISSIONS = (
     "asset.read", "asset.write", "console.open", "console.close",
     "credential.write", "vendor.read", "vendor.approve",
@@ -42,12 +46,21 @@ ROLE_PERMISSIONS = {
 
 PLATFORM_PERMISSIONS = (
     "platform.tenant.read", "platform.tenant.write",
+    "platform.user.read", "platform.user.write",
     "platform.session.read", "platform.session.revoke",
     "platform.audit.read", "platform.asset.read", "platform.asset.write",
     "platform.worker.read", "platform.worker.manage",
     "platform.vendor.read",
 )
 ROLE_PERMISSIONS[ROLE_PLATFORM_ADMIN] = PLATFORM_PERMISSIONS
+
+TENANT_MODE_PERMISSIONS: dict[str, tuple[str, ...]] = {
+    TENANT_MODE_CONSUMER: (
+        "asset.read", "console.open", "console.close",
+        "user.read", "user.write", "grant.write", "audit.read",
+    ),
+    TENANT_MODE_MANAGER: PERMISSIONS,
+}
 
 
 class Base(DeclarativeBase):
@@ -102,12 +115,14 @@ class Tenant(Base):
     name: Mapped[str] = mapped_column(String(128), default="")
     status: Mapped[str] = mapped_column(String(32), default=TENANT_ACTIVE)
     plan: Mapped[str] = mapped_column(String(64), default="standard")
+    mode: Mapped[str] = mapped_column(String(32), default=TENANT_MODE_MANAGER,
+                                      nullable=False, server_default=TENANT_MODE_MANAGER)
     quotas_json: Mapped[str] = mapped_column(Text, default="{}")
     created: Mapped[float] = mapped_column(Float, nullable=False)
 
     def public(self) -> dict:
         return {"id": self.id, "code": self.code, "name": self.name,
-                "status": self.status, "plan": self.plan,
+                "status": self.status, "plan": self.plan, "mode": self.mode,
                 "quotas": parse_json(self.quotas_json, {}), "created": self.created}
 
 

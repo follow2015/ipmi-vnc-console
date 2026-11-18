@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import re
 import secrets
@@ -17,12 +18,16 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.orm import Session
 
 from .models import (AccessGrant, Asset, AuditLog, Capability, Credential,
-                     DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID, Permission, Role,
-                     RolePermission, ROLE_ADMIN, ROLE_OPERATOR, ROLE_PLATFORM_ADMIN,
-                     TENANT_ACTIVE, QuotaUsage, ServiceToken, Tenant, User, UserRole,
-                     VendorProfile, json_field, parse_json)
+                     DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID, PERMISSIONS, Permission,
+                     Role, RolePermission, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER,
+                     ROLE_PLATFORM_ADMIN, TENANT_ACTIVE, TENANT_MODE_CONSUMER,
+                     TENANT_MODE_MANAGER, TENANT_MODE_PERMISSIONS, TENANT_MODES,
+                     QuotaUsage, ServiceToken, Tenant, User, UserRole, VendorProfile,
+                     json_field, parse_json)
 from .security import (CredentialCipher, hash_password, verify_password)
 from ..sql_backend import open_store, parse_store_dsn
+
+logger = logging.getLogger(__name__)
 
 MAX_FAILED_ATTEMPTS = 5
 LOCK_SECONDS = 900
@@ -109,8 +114,25 @@ def permissions_of(session: Session, user_id: str) -> set[str]:
     return {row[0] for row in rows}
 
 
-def require(session: Session, user_id: str, code: str) -> None:
-    if code not in permissions_of(session, user_id):
+def tenant_mode_permissions(session: Session, tenant_id: str | None) -> frozenset[str]:
+    row = session.get(Tenant, tenant_id) if tenant_id else None
+    mode = row.mode if row else TENANT_MODE_MANAGER
+    return frozenset(TENANT_MODE_PERMISSIONS.get(mode, PERMISSIONS))
+
+
+def effective_permissions(session: Session, user_id: str,
+                          tenant_id: str | None = None) -> set[str]:
+    granted = permissions_of(session, user_id)
+    if tenant_id is None:
+        return granted
+    return granted & set(tenant_mode_permissions(session, tenant_id))
+
+
+def require(session: Session, user_id: str, code: str,
+            *, tenant_id: str | None = None) -> None:
+    granted = (effective_permissions(session, user_id, tenant_id)
+               if tenant_id is not None else permissions_of(session, user_id))
+    if code not in granted:
         raise PlatformError("permission_denied", f"缺少权限：{code}", 403)
 
 
@@ -121,6 +143,8 @@ def create_user(session: Session, username: str, password: str, role: str,
         raise PlatformError("invalid_username", "用户名不能为空")
     if tenant_id is None and role != ROLE_PLATFORM_ADMIN:
         raise PlatformError("invalid_tenant", "只有平台管理员可以不属于任何租户", 400)
+    if tenant_id is not None and role == ROLE_PLATFORM_ADMIN:
+        raise PlatformError("invalid_role", "租户账号不能使用平台管理员角色", 400)
     if session.get(Tenant, tenant_id) is None:
         raise PlatformError("tenant_not_found", "租户不存在", 404)
     if session.scalar(select(User.id).where(User.tenant_id == tenant_id,
@@ -153,13 +177,52 @@ def list_users(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID) -> list[
 
 
 def set_user_active(session: Session, user_id: str, active: bool, *, actor: str,
-                    tenant_id: str = DEFAULT_TENANT_ID) -> None:
+                    tenant_id: str | None = DEFAULT_TENANT_ID) -> None:
     user = session.get(User, user_id)
-    if user is None or user.tenant_id != tenant_id:
+    if user is None or user.tenant_id is None:
+        raise PlatformError("user_not_found", "用户不存在", 404)
+    if tenant_id is not None and user.tenant_id != tenant_id:
         raise PlatformError("user_not_found", "用户不存在", 404)
     session.execute(update(User).where(User.id == user_id).values(is_active=active))
-    audit(session, actor, "user_activation_changed", tenant_id=tenant_id,
+    audit(session, actor, "user_activation_changed", tenant_id=user.tenant_id,
           detail={"user_id": user_id, "active": active})
+    session.commit()
+
+
+def set_user_role(session: Session, user_id: str, role: str, *, actor: str,
+                  tenant_id: str | None = None) -> User:
+    if role not in (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER):
+        raise PlatformError("unknown_role", f"未知角色：{role}", 400)
+    user = session.get(User, user_id)
+    if user is None or user.tenant_id is None:
+        raise PlatformError("user_not_found", "用户不存在", 404)
+    if tenant_id is not None and user.tenant_id != tenant_id:
+        raise PlatformError("user_not_found", "用户不存在", 404)
+    role_row = session.scalar(select(Role).where(Role.code == role))
+    if role_row is None:
+        raise PlatformError("unknown_role", f"未知角色：{role}")
+    before = roles_of(session, user_id)
+    session.execute(delete(UserRole).where(UserRole.user_id == user_id))
+    session.add(UserRole(user_id=user_id, role_id=role_row.id))
+    audit(session, actor, "user_role_changed", tenant_id=user.tenant_id,
+          actor_type="platform",
+          detail={"user_id": user_id, "before": before, "after": [role]})
+    session.commit()
+    return user
+
+
+def set_user_password(session: Session, user_id: str, password: str, *, actor: str,
+                      tenant_id: str | None) -> None:
+    if not password or not password.strip():
+        raise PlatformError("invalid_password", "新密码不能为空", 400)
+    user = session.get(User, user_id)
+    if user is None or (tenant_id is not None and user.tenant_id != tenant_id):
+        raise PlatformError("user_not_found", "用户不存在", 404)
+    session.execute(update(User).where(User.id == user_id)
+                    .values(password_hash=hash_password(password)))
+    audit(session, actor, "user_password_reset", tenant_id=user.tenant_id,
+          actor_type="platform" if tenant_id is None else "user",
+          detail={"user_id": user_id, "username": user.username})
     session.commit()
 
 
@@ -434,12 +497,14 @@ def normalise_quotas(raw: dict) -> dict:
 
 
 def update_tenant(session: Session, tenant_id: str, *, name: str | None = None,
-                  plan: str | None = None, quotas: dict | None = None,
+                  plan: str | None = None, mode: str | None = None,
+                  quotas: dict | None = None,
                   actor: str, now: float | None = None) -> Tenant:
     row = session.get(Tenant, tenant_id)
     if row is None:
         raise PlatformError("tenant_not_found", "租户不存在", 404)
-    before = {"name": row.name, "plan": row.plan, "quotas": parse_json(row.quotas_json, {})}
+    before = {"name": row.name, "plan": row.plan, "mode": row.mode,
+              "quotas": parse_json(row.quotas_json, {})}
     if name is not None:
         name = name.strip()
         if not name:
@@ -450,9 +515,15 @@ def update_tenant(session: Session, tenant_id: str, *, name: str | None = None,
         if not plan:
             raise PlatformError("invalid_plan", "套餐不能为空", 400)
         row.plan = plan
+    if mode is not None:
+        if mode not in TENANT_MODES:
+            raise PlatformError("invalid_tenant_mode",
+                                f"租户模式只能是 {', '.join(TENANT_MODES)}", 400)
+        row.mode = mode
     if quotas is not None:
         row.quotas_json = json_field(normalise_quotas(quotas))
-    after = {"name": row.name, "plan": row.plan, "quotas": parse_json(row.quotas_json, {})}
+    after = {"name": row.name, "plan": row.plan, "mode": row.mode,
+             "quotas": parse_json(row.quotas_json, {})}
     audit(session, actor, "tenant_updated", tenant_id=None, actor_type="platform",
           detail={"tenant_id": tenant_id, "code": row.code,
                   "before": before, "after": after}, now=now)
@@ -484,19 +555,24 @@ def enforce_asset_quota(session: Session, tenant_id: str) -> None:
 
 
 def create_tenant(session: Session, *, code: str, name: str, plan: str = "standard",
-                  quotas: dict | None = None, actor: str,
-                  now: float | None = None) -> Tenant:
+                  mode: str = TENANT_MODE_MANAGER, quotas: dict | None = None,
+                  actor: str, now: float | None = None) -> Tenant:
     code = (code or "").strip()
     if not code or not code.replace("-", "").replace("_", "").isalnum():
         raise PlatformError("invalid_tenant_code", "租户码只能包含字母、数字、下划线与短横线", 400)
     if session.scalar(select(Tenant.id).where(Tenant.code == code)) is not None:
         raise PlatformError("tenant_exists", "租户码已存在", 409)
+    if mode not in TENANT_MODES:
+        raise PlatformError("invalid_tenant_mode",
+                            f"租户模式只能是 {', '.join(TENANT_MODES)}", 400)
     stamp = time.time() if now is None else now
     row = Tenant(id=str(uuid.uuid4()), code=code, name=name or code, status="active",
-                 plan=plan or "standard", quotas_json=json_field(quotas or {}), created=stamp)
+                 plan=plan or "standard", mode=mode,
+                 quotas_json=json_field(quotas or {}), created=stamp)
     session.add(row)
     audit(session, actor, "tenant_created", tenant_id=None, actor_type="platform",
-          detail={"tenant_id": row.id, "code": code, "plan": row.plan}, now=stamp)
+          detail={"tenant_id": row.id, "code": code, "plan": row.plan,
+                  "mode": mode}, now=stamp)
     session.commit()
     return row
 
@@ -538,7 +614,8 @@ def _plane_usage(plane_db: str, sids: set[str], start: float, end: float,
         dsn = parse_store_dsn(plane_db)
         db = open_store(dsn, readonly=True)
     except Exception as exc:
-        raise PlatformError("data_plane_unavailable", f"数据面库不可读：{exc}", 503) from exc
+        logger.error("data plane store unavailable for usage rebuild: %s", exc)
+        raise PlatformError("data_plane_unavailable", "数据面库不可读", 503) from exc
     try:
         if dsn.dialect == "sqlite":
             db.row_factory = sqlite3.Row

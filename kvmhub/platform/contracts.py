@@ -285,6 +285,7 @@ class Tenant(Contract):
     name: str
     status: str
     plan: str
+    mode: str = "manager"
     quotas: dict[str, Any]
     created: float
     assets: int = 0
@@ -426,6 +427,7 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/platform/me": {"get": "Me"},
     "/api/v2/users": {"get": "list:UserPublic", "post": "UserPublic"},
     "/api/v2/users/{user_id}/active": {"post": "OkResult"},
+    "/api/v2/users/{user_id}/password": {"post": "OkResult"},
     "/api/v2/assets": {"get": "list:Asset", "post": "Asset"},
     "/api/v2/credentials": {"post": "CredentialCreated"},
     "/api/v2/grants": {"post": "OkResult"},
@@ -445,6 +447,11 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/platform/tenants": {"get": "list:Tenant", "post": "Tenant"},
     "/api/v2/platform/tenants/{tenant_id}": {"patch": "Tenant"},
     "/api/v2/platform/tenants/{tenant_id}/status": {"post": "Tenant"},
+    "/api/v2/platform/tenants/{tenant_id}/users": {"post": "UserPublic"},
+    "/api/v2/platform/users": {"get": "list:UserPublic"},
+    "/api/v2/platform/users/{user_id}/active": {"post": "OkResult"},
+    "/api/v2/platform/users/{user_id}/role": {"patch": "UserPublic"},
+    "/api/v2/platform/users/{user_id}/password": {"post": "OkResult"},
     "/api/v2/platform/workers": {"get": "map:WorkerInfo"},
     "/api/v2/platform/workers/{worker_id}/drain": {"post": "WorkerInfo"},
     "/api/v2/platform/vendor-profiles": {"get": "list:VendorProfileView"},

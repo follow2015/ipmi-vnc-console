@@ -7,7 +7,8 @@ import logging
 import os
 import re
 
-from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
+from aiohttp import (ClientError, ClientSession, ClientTimeout, TCPConnector,
+                     WSMsgType, WSServerHandshakeError, web)
 
 from .platform.bus import AssemblyBus
 from .platform.redis_state import create_state
@@ -103,8 +104,6 @@ async def proxy_websocket(request: web.Request, sid: str, upstream: str) -> web.
     offered = tuple(item.strip() for item in
                     request.headers.get("Sec-WebSocket-Protocol", "").split(",")
                     if item.strip())
-    browser = web.WebSocketResponse(protocols=offered, autoping=False, heartbeat=None)
-    await browser.prepare(request)
     target = f"ws://{upstream}{request.rel_url}"
     headers = {}
     if request.headers.get("Origin"):
@@ -142,9 +141,24 @@ async def proxy_websocket(request: web.Request, sid: str, upstream: str) -> web.
             elif message.type is WSMsgType.ERROR:
                 break
 
-    async with client_of(request.app).ws_connect(
+    try:
+        worker_cm = client_of(request.app).ws_connect(
             target, protocols=offered, headers=headers,
-            autoping=False, heartbeat=None) as worker:
+            autoping=False, heartbeat=None)
+        worker = await worker_cm.__aenter__()
+    except WSServerHandshakeError as exc:
+        if exc.status == 401:
+            raise web.HTTPUnauthorized(text="worker rejected the console") from None
+        if exc.status == 403:
+            raise web.HTTPForbidden(text="worker rejected the console") from None
+        raise web.HTTPBadGateway(text="worker unavailable") from None
+    except (ClientError, OSError):
+        raise web.HTTPBadGateway(text="worker unavailable") from None
+    try:
+        agreed = (worker.protocol,) if worker.protocol else ()
+        browser = web.WebSocketResponse(protocols=agreed, autoping=False,
+                                        heartbeat=None)
+        await browser.prepare(request)
         tasks = [asyncio.ensure_future(browser_to_worker()),
                  asyncio.ensure_future(worker_to_browser())]
         try:
@@ -153,9 +167,11 @@ async def proxy_websocket(request: web.Request, sid: str, upstream: str) -> web.
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-    if not browser.closed:
-        await browser.close()
-    return browser
+        if not browser.closed:
+            await browser.close()
+        return browser
+    finally:
+        await worker_cm.__aexit__(None, None, None)
 
 
 async def proxy(request: web.Request) -> web.StreamResponse:

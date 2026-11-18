@@ -1,6 +1,7 @@
 """Entry route resolver: one Redis GET, no ticket/cookie/tenant unpacking."""
 import asyncio
 
+import pytest
 from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -170,3 +171,26 @@ def test_app_startup_does_not_assign_new_app_keys():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         asyncio.run(scenario())
+
+
+async def test_websocket_upstream_rejection_is_not_a_101():
+    async def upstream_ws(request):
+        return web.Response(status=401, text="unauthorized")
+
+    upstream_app = web.Application()
+    upstream_app.router.add_get("/{tail:.*}", upstream_ws)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+    bus = AssemblyBus(MemoryState())
+    await bus.put_route(SID, {"upstream": f"{upstream.host}:{upstream.port}"}, 60)
+    try:
+        async with await _client(bus) as resolver:
+            from aiohttp import WSServerHandshakeError
+
+            with pytest.raises(WSServerHandshakeError) as raised:
+                async with resolver.ws_connect(f"/s/{SID}/console",
+                                               headers={"Cookie": "session=wrong"}):
+                    pass
+            assert raised.value.status == 401
+    finally:
+        await upstream.close()

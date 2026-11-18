@@ -10,7 +10,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
 from .common import PASSTHROUGH_ADAPTER_ID, Problem
-from .sql_backend import mysql_capability_ddl, open_store, parse_store_dsn
+from .sql_backend import (INTEGRITY_ERRORS, mysql_capability_ddl, open_store,
+                          parse_store_dsn)
 from .telemetry import audit_evidence
 
 TENANT_GRANT = "*"
@@ -95,6 +96,13 @@ CREATE TABLE IF NOT EXISTS audit (
  detail TEXT NOT NULL, INDEX ix_audit_session (session_id), INDEX ix_audit_action (action));
 """
 
+MYSQL_AUDIT_TRIGGERS = {
+    "audit_no_update": "CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit "
+                       "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='audit is append only'",
+    "audit_no_delete": "CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit "
+                       "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='audit is append only'",
+}
+
 CAPABILITY_COLUMNS = {
     "console_impl": "TEXT NOT NULL DEFAULT ''",
     "licence": "TEXT NOT NULL DEFAULT ''",
@@ -139,10 +147,23 @@ class Store:
             for statement in MYSQL_SCHEMA.split(";"):
                 if statement.strip():
                     self.db.execute(statement)
+            self._ensure_audit_triggers()
         self._migrate()
         self.cipher = AESGCM(key) if key is not None else None
         self.clock, self.lease_seconds = clock, lease_seconds
         self.passthrough_targets = frozenset(passthrough_targets)
+
+    def _ensure_audit_triggers(self):
+        try:
+            rows = self.db.execute(
+                "SELECT TRIGGER_NAME FROM information_schema.triggers "
+                "WHERE TRIGGER_SCHEMA=DATABASE()").fetchall()
+            present = {row[0] for row in rows}
+        except Exception:
+            return
+        for name, ddl in MYSQL_AUDIT_TRIGGERS.items():
+            if name not in present:
+                self.db.execute(ddl)
 
     def _migrate(self):
         for table, columns in (("adapter_capability", CAPABILITY_COLUMNS),
@@ -162,6 +183,8 @@ class Store:
 
     @contextmanager
     def tx(self):
+        if self.dialect == "mysql" and hasattr(self.db, "ping"):
+            self.db.ping(reconnect=True)
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
@@ -510,7 +533,10 @@ class Store:
             self.db.execute("INSERT INTO session(id,user_id,asset_id,worker_id,instance_id,jti,status,created,phase_until,lease_until,hard_until) "
                             "VALUES(?,?,?,?,?,?,'pending',?,?,?,?)",
                             (sid, user, aid, worker, instance, uuid.uuid4().hex, now, min(now + 60, hard), 0, hard))
-            self.db.execute("INSERT INTO asset_slot VALUES(?,?)", (aid, sid))
+            try:
+                self.db.execute("INSERT INTO asset_slot VALUES(?,?)", (aid, sid))
+            except INTEGRITY_ERRORS:
+                raise Problem("asset_busy", 409) from None
             self.event(user, "session_requested", sid, trace=trace)
         return self.get(sid)
 
@@ -548,8 +574,13 @@ class Store:
             asset = self.eligible(row["asset_id"], row["user_id"])
             now = self.clock()
             lease = min(now + self.lease_seconds, row["hard_until"])
-            self.db.execute("UPDATE session SET consumed=1,status='connecting',cleanup='pending',version=version+1,"
-                            "phase_until=?,lease_until=? WHERE id=?", (min(now+30,row["hard_until"]), lease, sid))
+            updated = self.db.execute(
+                "UPDATE session SET consumed=1,status='connecting',cleanup='pending',"
+                "version=version+1,phase_until=?,lease_until=? "
+                "WHERE id=? AND consumed=0 AND status='pending'",
+                (min(now+30,row["hard_until"]), lease, sid))
+            if not updated.rowcount:
+                raise Problem("ticket_consumed_or_expired", 409)
             self.event(row["worker_id"], "ticket_consumed", sid, trace=trace)
             self.event(row["worker_id"], "credential_access_intent", sid, trace=trace)
             blob = asset["credential"]
@@ -610,7 +641,13 @@ class Store:
                     raise _CapabilityLost() from None
                 raise
             until = min(now + self.lease_seconds, row["hard_until"], asset["grant_expires"], asset["cap_expires"])
-            self.db.execute("UPDATE session SET status='active',lease_until=?,version=version+1 WHERE id=?", (until, sid))
+            expected = "connecting" if activate else "active"
+            updated = self.db.execute(
+                "UPDATE session SET status='active',lease_until=?,version=version+1 "
+                "WHERE id=? AND status=? AND version=?",
+                (until, sid, expected, row["version"]))
+            if not updated.rowcount:
+                raise Problem("session_revoked", 410)
             if activate:
                 self.event(worker, "session_active", sid, trace=trace)
         return {"lease_seconds": until - now}
@@ -628,10 +665,15 @@ class Store:
             effective = "confirmed" if row["cleanup"] == "confirmed" else cleanup
             if row["reason"] == "capability_withdrawn" and reason == "revoked":
                 reason = "capability_withdrawn"
-            self.db.execute("UPDATE session SET status=?,cleanup=?,reason=?,"
-                            "end_evidence=COALESCE(end_evidence,?),version=version+1 WHERE id=?",
-                            (status, effective, reason, stored, sid))
-            detail = {"cleanup": effective, "reason": reason}
+            self.db.execute(
+                "UPDATE session SET "
+                "status=CASE WHEN status IN ('failed','lost','closed') THEN status ELSE ? END,"
+                "cleanup=CASE WHEN cleanup='confirmed' THEN 'confirmed' ELSE ? END,"
+                "reason=CASE WHEN reason='capability_withdrawn' THEN reason ELSE ? END,"
+                "end_evidence=COALESCE(end_evidence,?),version=version+1 WHERE id=?",
+                (status, effective, reason, stored, sid))
+            final = self.get(sid)
+            detail = {"cleanup": final["cleanup"], "reason": final["reason"]}
             if summary:
                 detail["evidence"] = summary
             self.event(worker, "session_finished", sid, detail, trace=trace)
@@ -658,22 +700,43 @@ class Store:
                 self.event(user, "session_revoked", sid, trace=trace)
                 self.release_confirmed(sid)
 
+    def force_revoke(self, sid, actor, trace):
+        with self.tx():
+            row = self.get(sid)
+            live = row["status"] in ("pending", "connecting", "active", "closing")
+            if live:
+                target = "closed" if row["status"] == "pending" else "closing"
+                updated = self.db.execute(
+                    "UPDATE session SET status=?,reason='revoked',version=version+1 "
+                    "WHERE id=? AND status=?", (target, sid, row["status"]))
+                if not updated.rowcount:
+                    row = self.get(sid)
+                    live = row["status"] in ("pending", "connecting", "active", "closing")
+                else:
+                    self.event(actor, "session_revoked", sid, trace=trace)
+                    row = dict(row, status=target, reason="revoked")
+        return {"status": row["status"], "was_live": live,
+                "asset_id": row["asset_id"], "worker_id": row["worker_id"]}
+
     def sweep(self):
         ended = []
         with self.tx():
             now = self.clock()
             for r in self.db.execute("SELECT * FROM session WHERE status IN ('pending','connecting','active','closing')").fetchall():
                 status = None
+                deadline_col = None
+                deadline_at = None
                 if r["status"] == "pending" and r["phase_until"] <= now:
-                    status = "closed"
+                    status, deadline_col, deadline_at = "closed", "phase_until", r["phase_until"]
                 elif r["status"] == "connecting" and r["phase_until"] <= now:
-                    status = "failed"
+                    status, deadline_col, deadline_at = "failed", "phase_until", r["phase_until"]
                 elif r["status"] in ("connecting", "active", "closing") and r["lease_until"] <= now:
-                    status = "lost"
+                    status, deadline_col, deadline_at = "lost", "lease_until", r["lease_until"]
                 if status:
                     updated = self.db.execute(
                         "UPDATE session SET status=?,reason='deadline',version=version+1 "
-                        "WHERE id=? AND status=?", (status, r["id"], r["status"]))
+                        f"WHERE id=? AND status=? AND version=? AND {deadline_col}<=?",
+                        (status, r["id"], r["status"], r["version"], deadline_at))
                     if not updated.rowcount:
                         continue
                     detail = {"status": status}

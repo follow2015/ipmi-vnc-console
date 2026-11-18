@@ -1,6 +1,7 @@
 """Console ticket issuance from the production control plane."""
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
 import ipaddress
@@ -97,26 +98,39 @@ class ConsolePlane:
                 await self.bus.release_tenant_quota(tenant_id, sid)
                 raise services.PlatformError("worker_capacity_exhausted",
                                              "Worker 容量已满，请重试", 503)
-            document = {
-                "asset_id": asset_id,
-                "tenant_id": tenant_id,
-                "profile": assembly.get("profile"),
-                "plan": assembly.get("plan"),
-                "data_plane": assembly.get("data_plane"),
-                "checks": assembly.get("checks"),
-                "credential_id": assembly.get("credential_id"),
-            }
-            assembly_id = await self.bus.put_assembly(sid, document)
-            if common.SESSION_MODE == "path":
-                await self.bus.put_route(sid, {
-                    "worker_id": worker_id,
-                    "instance_id": instance_id,
-                    "upstream": self._worker_upstream(worker),
+            try:
+                document = {
                     "asset_id": asset_id,
                     "tenant_id": tenant_id,
-                }, hard_ttl)
-            ticket = issue(self.private_key, row, now, trace=correlation,
-                           tenant_id=tenant_id)
+                    "profile": assembly.get("profile"),
+                    "plan": assembly.get("plan"),
+                    "data_plane": assembly.get("data_plane"),
+                    "checks": assembly.get("checks"),
+                    "credential_id": assembly.get("credential_id"),
+                }
+                assembly_id = await self.bus.put_assembly(sid, document)
+                if common.SESSION_MODE == "path":
+                    await self.bus.put_route(sid, {
+                        "worker_id": worker_id,
+                        "instance_id": instance_id,
+                        "upstream": self._worker_upstream(worker),
+                        "asset_id": asset_id,
+                        "tenant_id": tenant_id,
+                    }, hard_ttl)
+                ticket = issue(self.private_key, row, now, trace=correlation,
+                               tenant_id=tenant_id)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    store.revoke(sid, user_id, correlation)
+                with contextlib.suppress(Exception):
+                    await self.bus.release_session(worker_id, sid)
+                with contextlib.suppress(Exception):
+                    await self.bus.release_tenant_quota(tenant_id, sid)
+                with contextlib.suppress(Exception):
+                    await self.bus.delete_assembly(sid)
+                with contextlib.suppress(Exception):
+                    await self.bus.delete_route(sid)
+                raise
             return {"sid": sid, "ticket": ticket,
                     "tenant_id": assembly.get("tenant_id"),
                     "accept_url": self.accept_url(worker_id=worker_id, sid=sid),
@@ -235,11 +249,12 @@ class ConsolePlane:
                 store.close()
 
     async def force_revoke(self, sid: str, *, tenant_id: str = "",
-                           trace: str = "") -> dict:
+                           trace: str = "", actor: str = "platform") -> dict:
+        correlation = trace if len(trace) == 32 else uuid.uuid4().hex
         store, dispose = self._connect()
         try:
             try:
-                row = store.get(sid)
+                outcome = store.force_revoke(sid, actor, correlation)
             except Problem as exc:
                 raise services.PlatformError("session_not_found", "会话不存在", 404) from exc
         finally:
@@ -247,14 +262,13 @@ class ConsolePlane:
                 store.close()
         route = await self.bus.get_route(sid)
         route_tenant = str((route or {}).get("tenant_id") or "") or None
-        live = row["status"] in ("pending", "connecting", "active", "closing")
         await self.bus.publish_revoke(sid)
         await self.bus.delete_route(sid)
         await self.bus.delete_assembly(sid)
-        await self.bus.release_session(str(row["worker_id"]), sid)
+        await self.bus.release_session(str(outcome["worker_id"]), sid)
         await self.bus.release_tenant_quota(tenant_id or route_tenant or "", sid)
-        return {"ok": True, "sid": sid, "status": row["status"],
-                "asset_id": row["asset_id"], "was_live": live,
+        return {"ok": True, "sid": sid, "status": outcome["status"],
+                "asset_id": outcome["asset_id"], "was_live": outcome["was_live"],
                 "tenant_id": tenant_id or route_tenant, "trace_id": trace}
 
     def confirm_cleanup(self, sid: str, *, user_id: str, manage: bool = False,

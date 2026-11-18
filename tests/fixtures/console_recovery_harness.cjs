@@ -374,6 +374,29 @@ async function runRealGeometryReload() {
   };
 }
 
+async function runRealGeometryFlood() {
+  const { sandbox, state, load } = newReal();
+  load();
+  await flush();
+  for (let i = 0; i < 12; i += 1) {
+    const rfb = state.rfbs[state.rfbs.length - 1];
+    rfb.emit('normal');
+    const raw = rfb._sock._websocket;
+    raw.fire('close', { code: 4001 });
+    rfb.emit('disconnected');
+    firePendingTimer(state);
+    load(); // the reload produced a new document with the same sessionStorage
+    await flush();
+  }
+  return {
+    reloads: state.reloads,
+    health_state: sandbox.__kvm_health && sandbox.__kvm_health.state,
+    exhausted: !!(sandbox.__kvm_health && sandbox.__kvm_health.exhausted),
+    status: state.status.textContent,
+    storage: JSON.parse(state.storage.raw.__kvm_recovery_v1 || '{}'),
+  };
+}
+
 async function runRealSignedOut() {
   const { sandbox, state, load } = newReal({ fetchMode: 'unauthorized' });
   load();
@@ -423,6 +446,7 @@ async function main() {
     real: await runReal(),
     real_recovery: await runRealRecovery(),
     real_geometry_reload: await runRealGeometryReload(),
+    real_geometry_flood: await runRealGeometryFlood(),
     real_close: await runRealCloseGuard(),
     real_signed_out: await runRealSignedOut(),
     real_at_limit: await runRealAtLimit(),

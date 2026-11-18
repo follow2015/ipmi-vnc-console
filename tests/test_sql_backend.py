@@ -86,7 +86,10 @@ class _ShimCursor:
         if head.startswith("CREATE TABLE") or head.startswith("CREATE TRIGGER") \
                 or head.startswith("PRAGMA FOREIGN"):
             return self
-        if head == "START TRANSACTION" or head == "BEGIN IMMEDIATE":
+        if head.startswith("SET SESSION TRANSACTION"):
+            return self
+        if head == "START TRANSACTION" or head == "BEGIN IMMEDIATE" \
+                or head == "START TRANSACTION READ ONLY":
             statement = "BEGIN"
         elif head.startswith("SHOW COLUMNS FROM"):
             table = statement.strip().rsplit(" ", 1)[-1]
@@ -96,6 +99,10 @@ class _ShimCursor:
         self.columns = False
         self.raw.execute(statement.replace("%s", "?"), params or ())
         return self
+
+    @property
+    def rowcount(self):
+        return self.raw.rowcount
 
     def _row(self, value):
         if value is None:
@@ -207,3 +214,136 @@ def test_config_exposes_data_plane_dialect(monkeypatch):
     assert settings(data_plane_store="").data_plane_dialect == ""
     assert settings(data_plane_store="/tmp/x.sqlite").data_plane_dialect == "sqlite"
     assert settings(data_plane_store="mysql://u:password@h/db").data_plane_dialect == "mysql"
+
+
+def test_exchange_guard_rejects_a_stale_read(monkeypatch):
+    monkeypatch.setattr(sql_backend, "MysqlConnection", _ShimConnection)
+    store = Store("mysql://u:password@host/db", b"k" * 32)
+    try:
+        store.seed_mock("127.0.0.1:5900", "0" * 64, "admin", "secret")
+        row = store.allocate("mock-1", "local-admin", "w1", "i1", "0" * 32)
+        claims = {"sid": row["id"], "sub": row["user_id"], "aid": row["asset_id"],
+                  "wid": row["worker_id"], "iid": row["instance_id"], "jti": row["jti"]}
+        store.exchange(claims, "0" * 32)
+
+        stale = dict(row)
+        stale["consumed"] = 0
+        stale["status"] = "pending"
+        monkeypatch.setattr(store, "get", lambda sid: stale)
+        with pytest.raises(Problem) as exc:
+            store.exchange(claims, "0" * 32)
+        assert exc.value.code == "ticket_consumed_or_expired"
+    finally:
+        store.close()
+
+
+def test_mysql_asset_slot_conflict_maps_to_asset_busy(monkeypatch):
+    from pymysql.err import IntegrityError
+
+    class ConflictShim(_ShimConnection):
+        def execute(self, statement, params=()):
+            if statement.strip().upper().startswith("INSERT INTO ASSET_SLOT"):
+                raise IntegrityError(1062, "Duplicate entry 'mock-1' for key 'PRIMARY'")
+            return super().execute(statement, params)
+
+    monkeypatch.setattr(sql_backend, "MysqlConnection", ConflictShim)
+    store = Store("mysql://u:password@host/db", b"k" * 32)
+    try:
+        store.seed_mock("127.0.0.1:5900", "0" * 64, "admin", "secret")
+        with pytest.raises(Problem) as exc:
+            store.allocate("mock-1", "local-admin", "w1", "i1", "0" * 32)
+        assert exc.value.code == "asset_busy"
+    finally:
+        store.close()
+
+
+def test_mysql_schema_makes_audit_append_only():
+    from kvmhub.store import MYSQL_AUDIT_TRIGGERS
+
+    assert set(MYSQL_AUDIT_TRIGGERS) == {"audit_no_update", "audit_no_delete"}
+    joined = " ".join(MYSQL_AUDIT_TRIGGERS.values()).upper()
+    assert "BEFORE UPDATE ON AUDIT" in joined
+    assert "BEFORE DELETE ON AUDIT" in joined
+    assert "SIGNAL SQLSTATE" in joined
+
+
+def test_mysql_audit_triggers_are_created_idempotently(monkeypatch):
+    from kvmhub import store as store_mod
+
+    created = []
+
+    class TriggerShim(_ShimConnection):
+        def execute(self, statement, params=()):
+            head = statement.strip().upper()
+            if head.startswith("SELECT TRIGGER_NAME FROM INFORMATION_SCHEMA.TRIGGERS"):
+                self.db.columns = False
+                self.db.raw.execute("SELECT 'audit_no_update' AS TRIGGER_NAME WHERE 1=0 "
+                                    "UNION SELECT 'audit_no_update' WHERE 1=1")
+                return self.db
+            if head.startswith("CREATE TRIGGER"):
+                created.append(statement.strip().split()[2])
+                return self.db
+            return super().execute(statement, params)
+
+    monkeypatch.setattr(sql_backend, "MysqlConnection", TriggerShim)
+    monkeypatch.setattr(store_mod, "MYSQL_AUDIT_TRIGGERS", {
+        "audit_no_update": "CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit FOR EACH ROW SIGNAL SQLSTATE '45000'",
+        "audit_no_delete": "CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit FOR EACH ROW SIGNAL SQLSTATE '45000'",
+    })
+    store = Store("mysql://u:password@host/db", b"k" * 32)
+    store.close()
+    assert created == ["audit_no_delete"]
+
+
+def test_mysql_readonly_connection_sets_read_only_transaction(monkeypatch):
+    statements = []
+
+    class RoShim(_ShimConnection):
+        def execute(self, statement, params=()):
+            statements.append(statement.strip().upper())
+            return super().execute(statement, params)
+
+    monkeypatch.setattr(sql_backend, "MysqlConnection", RoShim)
+    db = open_store(StoreDSN("mysql", {"host": "h", "database": "d"}), readonly=True)
+    db.close()
+    assert "SET SESSION TRANSACTION READ ONLY" in statements
+
+
+def test_mysql_transaction_pings_connection_before_begin(monkeypatch):
+    pings = []
+
+    class PingShim(_ShimConnection):
+        def ping(self, reconnect=False):
+            pings.append(reconnect)
+
+    monkeypatch.setattr(sql_backend, "MysqlConnection", PingShim)
+    store = Store("mysql://u:password@host/db", b"k" * 32)
+    try:
+        with store.tx():
+            pass
+        with store.tx():
+            pass
+        assert pings == [True, True]
+    finally:
+        store.close()
+
+
+def test_sqlite_store_can_be_used_from_the_store_executor_thread():
+    import threading
+
+    db = open_store(StoreDSN("sqlite", ":memory:"))
+    errors = []
+
+    def use():
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TABLE t (x INT)")
+            db.execute("COMMIT")
+        except Exception as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=use)
+    t.start()
+    t.join()
+    db.close()
+    assert not errors, errors

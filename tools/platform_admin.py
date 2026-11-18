@@ -1,3 +1,4 @@
+#!/usr/bin/env -S .venv/bin/python
 """Out-of-band administration for the production control plane."""
 from __future__ import annotations
 
@@ -6,7 +7,9 @@ import asyncio
 import base64
 import json
 import os
+import secrets
 import shlex
+import string
 import sys
 import time
 import uuid
@@ -26,7 +29,7 @@ from kvmhub.platform.security import CredentialCipher  # noqa: E402
 from kvmhub.platform import (brand_onboarding, connection, governance,  # noqa: E402
                              services, vendor_registry)
 from kvmhub.platform.bus import AssemblyBus  # noqa: E402
-from kvmhub.platform.redis_state import create_state  # noqa: E402
+from kvmhub.platform.redis_state import SESSION_PREFIX, create_state  # noqa: E402
 from kvmhub.store import TENANT_GRANT, Store  # noqa: E402
 
 
@@ -41,6 +44,16 @@ def _required_env(name: str) -> str:
     if not value:
         raise SystemExit(f"{name} must be set (secrets are never CLI arguments)")
     return value
+
+
+def _generated_password(length: int = 20) -> str:
+    special = "-_!@#$%^&*"
+    alphabet = string.ascii_letters + string.digits + special
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        if all(any(c in group for c in password) for group in
+               (string.ascii_lowercase, string.ascii_uppercase, string.digits, special)):
+            return password
 
 
 def _load_json(path: str, label: str) -> dict:
@@ -92,6 +105,45 @@ def cmd_create_platform_admin(args):
     if created is None:
         raise SystemExit("a platform account already exists")
     print(json.dumps(created.public(), ensure_ascii=False))
+
+
+def cmd_reset_password(args):
+    generated = bool(getattr(args, "generate", False))
+    password = _generated_password() if generated else _required_env("KVMHUB_NEW_PASSWORD")
+    cfg, engine, factory, _ = _context(args)
+    with transaction(factory) as db:
+        stmt = select(User).where(User.username == args.username)
+        if args.tenant:
+            tenant = services.resolve_tenant(db, args.tenant)
+            stmt = stmt.where(User.tenant_id == tenant.id)
+        else:
+            stmt = stmt.where(User.tenant_id.is_(None))
+        user = db.scalar(stmt)
+        if user is None:
+            raise SystemExit("user not found (check --username and --tenant)")
+        target = user.id
+        services.set_user_password(db, target, password,
+                                   actor=args.actor, tenant_id=None)
+        public = user.public()
+
+    async def drop_sessions():
+        state = create_state(cfg.redis_url)
+        try:
+            for key in await state.keys(SESSION_PREFIX):
+                session = await state.get(key)
+                if session and session.get("user_id") == target:
+                    await state.delete(key)
+        finally:
+            await state.close()
+
+    asyncio.run(drop_sessions())
+    engine.dispose()
+    result = {"ok": True, "user": public["username"],
+              "tenant_id": public.get("tenant_id"),
+              "sessions_revoked": True}
+    if generated:
+        result["new_password"] = password
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_add_credential(args):
@@ -522,6 +574,12 @@ def parser():
     q = sub.add_parser("create-user"); q.add_argument("--username", required=True); q.add_argument("--role", default="viewer"); q.add_argument("--display-name"); q.add_argument("--tenant", default="default"); q.set_defaults(fn=cmd_create_user)
     q = sub.add_parser("create-platform-admin", help="create the cross-tenant operator (tenant_id NULL)")
     q.add_argument("--username", required=True); q.set_defaults(fn=cmd_create_platform_admin)
+    q = sub.add_parser("reset-password", help="reset an existing account's password out of band and revoke its sessions")
+    q.add_argument("--username", required=True, help="account to reset (platform or tenant)")
+    q.add_argument("--tenant", help="tenant code; omit for the platform (tenant_id NULL) account")
+    q.add_argument("--generate", action="store_true",
+                   help="mint a strong password locally and print it once; no env var needed")
+    q.set_defaults(fn=cmd_reset_password)
     q = sub.add_parser("add-credential"); q.add_argument("--label", required=True); q.set_defaults(fn=cmd_add_credential)
     q = sub.add_parser("add-asset")
     for name in ("name", "address"):

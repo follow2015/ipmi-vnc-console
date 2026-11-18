@@ -1,9 +1,12 @@
 """The Manager's internal API: the only listener a Worker may call."""
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from aiohttp import web
@@ -25,6 +28,7 @@ SECURITY_HEADERS = {
 MAX_BODY = 16384
 
 HOST_KEY = web.AppKey("expected_host", str)
+EXECUTOR_KEY = web.AppKey("store_executor", ThreadPoolExecutor)
 TRACE_KEY = web.RequestKey("trace", str)
 
 
@@ -65,6 +69,14 @@ async def _payload(request: web.Request) -> dict:
 def create_app(cfg, store: Store, *, expected_host: str | None = None) -> web.Application:
     private = load_pem_private_key(Path(cfg["signing_key"]).read_bytes(), password=None)
     public = private.public_key()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvmhub-store")
+
+    async def run_store(fn, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, partial(fn, *args, **kwargs))
+
+    async def shutdown(_app):
+        executor.shutdown(wait=True)
 
     @web.middleware
     async def guards(request: web.Request, handler):
@@ -96,17 +108,21 @@ def create_app(cfg, store: Store, *, expected_host: str | None = None) -> web.Ap
             claims = verify(public, body.get("ticket", ""), cfg["worker_id"], cfg["instance_id"])
             if claims["sid"] != sid:
                 raise Problem("invalid_ticket", 403)
-            return _json(trace, store.exchange(claims, trace))
+            return _json(trace, await run_store(store.exchange, claims, trace))
         if operation in ("active", "renew"):
-            return _json(trace, store.renew(sid, cfg["worker_id"], cfg["instance_id"],
-                                            operation == "active", trace=trace))
+            return _json(trace, await run_store(store.renew, sid, cfg["worker_id"],
+                                                cfg["instance_id"], operation == "active",
+                                                trace=trace))
         if operation == "finish":
-            store.finish(sid, cfg["worker_id"], cfg["instance_id"], body.get("cleanup"),
-                         body.get("reason"), trace=trace, evidence=body.get("evidence"))
+            await run_store(store.finish, sid, cfg["worker_id"], cfg["instance_id"],
+                            body.get("cleanup"), body.get("reason"), trace=trace,
+                            evidence=body.get("evidence"))
             return _json(trace, {"ok": True})
         raise Problem("unknown_operation", 404)
 
     app = web.Application(middlewares=[guards])
     app.router.add_post("/internal/v1/sessions/{sid}/{operation}", worker_api)
     app[HOST_KEY] = expected_host or f"localhost:{INTERNAL_PORT}"
+    app[EXECUTOR_KEY] = executor
+    app.on_cleanup.append(shutdown)
     return app

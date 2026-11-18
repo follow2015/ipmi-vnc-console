@@ -90,3 +90,14 @@ def test_console_script_never_hands_novnc_an_empty_port():
     script = worker_module.REAL_CONSOLE_JS
     assert "location.port || (location.protocol === 'https:' ? '443' : '80')" in script
     assert "rfb.connect(location.hostname, location.port," not in script
+
+
+def test_production_nginx_overwrites_forwarded_host():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    conf = (root / "deploy" / "nginx" / "platform.conf").read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in conf.splitlines()
+             if ln.strip().lower().startswith("proxy_set_header x-forwarded-host")]
+    assert lines, "platform.conf never sets X-Forwarded-Host"
+    assert all(ln.endswith("$host;") for ln in lines), lines

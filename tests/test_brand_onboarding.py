@@ -174,3 +174,32 @@ def test_profile_matches_spec_blocks_silent_code_reuse(factory, tmp_path):
         assert brand_onboarding.profile_matches_spec(profile, spec_data, evidence=str(evidence))
         drifted = dict(spec_data, rfb_version="RFB 055.008")
         assert not brand_onboarding.profile_matches_spec(profile, drifted, evidence=str(evidence))
+
+
+def test_validate_spec_records_evidence_digest(tmp_path):
+    import hashlib
+
+    spec, evidence = measured(tmp_path)
+    fields = brand_onboarding.validate_spec(spec, evidence=str(evidence))
+    assert fields["evidence_sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
+
+
+def test_validate_spec_rejects_oversized_model_pattern(tmp_path):
+    spec, evidence = measured(tmp_path)
+    bad = dict(spec, model_pattern="X" * 257)
+    with pytest.raises(brand_onboarding.SpecError, match="model_pattern"):
+        brand_onboarding.validate_spec(bad, evidence=str(evidence))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("login_path", "/cgi/login.cgi?next=/x"),
+    ("login_path", "/a/../b"),
+    ("logout_path", "not-absolute"),
+    ("asset_paths", ["/cgi/config.cgi"]),
+    ("asset_paths", ["/ok/*.js?x=1"]),
+])
+def test_validate_spec_rejects_unsafe_paths_early(tmp_path, field, value):
+    spec, evidence = measured(tmp_path)
+    bad = dict(spec, **{field: value})
+    with pytest.raises(brand_onboarding.SpecError):
+        brand_onboarding.validate_spec(bad, evidence=str(evidence))

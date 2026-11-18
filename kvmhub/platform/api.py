@@ -24,6 +24,13 @@ from .contracts import CONTRACT_RESPONSES, contract_components, response_schema
 MAX_BODY = 65536
 
 
+async def _drop_user_sessions(state: State, user_id: str) -> None:
+    for key in await state.keys(SESSION_PREFIX):
+        session = await state.get(key)
+        if session and session.get("user_id") == user_id:
+            await state.delete(key)
+
+
 def _build_plane(cfg: Settings, state: State):
     if not cfg.data_plane_store or not cfg.signing_key_path:
         return None
@@ -180,7 +187,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 raise services.PlatformError("csrf_rejected", "CSRF 校验失败", 403)
         if permission:
             with transaction(platform.factory) as db:
-                services.require(db, auth["user_id"], permission)
+                services.require(db, auth["user_id"], permission,
+                                 tenant_id=auth["tenant_id"])
         return auth
 
     async def current_platform(request: Request, *, mutate: bool = False,
@@ -201,7 +209,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 db, parts[1], request.client.host if request.client else "",
                 request.headers.get("x-forwarded-for", ""),
                 trusted_proxies=platform.cfg.integration_trusted_proxies)
-            services.require(db, auth["user_id"], "console.open")
+            services.require(db, auth["user_id"], "console.open",
+                             tenant_id=auth["tenant_id"])
         return auth
 
     @app.get("/api/v2/integration/ping")
@@ -376,7 +385,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             response.delete_cookie(platform.tenant_cookie_name, path="/")
             return response
         with transaction(platform.factory) as db:
-            perms = sorted(services.permissions_of(db, auth["user_id"]))
+            perms = sorted(services.effective_permissions(
+                db, auth["user_id"], auth["tenant_id"]))
         return {"user_id": auth["user_id"], "username": auth["username"],
                 "tenant_id": auth["tenant_id"], "roles": auth["roles"],
                 "permissions": perms, "csrf": auth["csrf"]}
@@ -415,10 +425,17 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             services.set_user_active(db, user_id, bool(body.get("active", False)),
                                      actor=auth["username"], tenant_id=auth["tenant_id"])
         if not bool(body.get("active", False)):
-            for key in await platform.state.keys(SESSION_PREFIX):
-                session = await platform.state.get(key)
-                if session and session.get("user_id") == user_id:
-                    await platform.state.delete(key)
+            await _drop_user_sessions(platform.state, user_id)
+        return {"ok": True}
+
+    @app.post("/api/v2/users/{user_id}/password")
+    async def reset_user_password(user_id: str, request: Request):
+        auth = await current(request, mutate=True, permission="user.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            services.set_user_password(db, user_id, str(body.get("password", "")),
+                                       actor=auth["username"], tenant_id=auth["tenant_id"])
+        await _drop_user_sessions(platform.state, user_id)
         return {"ok": True}
 
     @app.get("/api/v2/assets")
@@ -670,7 +687,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             if asset is None or asset.tenant_id != auth["tenant_id"]:
                 raise services.PlatformError("session_not_found", "会话不存在", 404)
         result = await plane.force_revoke(sid, tenant_id=auth["tenant_id"],
-                                          trace=request.state.trace)
+                                          trace=request.state.trace,
+                                          actor=auth["username"])
         with transaction(platform.factory) as db:
             services.audit(db, auth["username"], "session.force_revoked",
                            tenant_id=auth["tenant_id"],
@@ -746,6 +764,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             row = services.create_tenant(
                 db, code=str(body.get("code", "")), name=str(body.get("name", "")),
                 plan=str(body.get("plan", "standard")),
+                mode=str(body.get("mode", "manager")),
                 quotas=body.get("quotas") if isinstance(body.get("quotas"), dict) else None,
                 actor=auth["username"])
             return row.public()
@@ -765,15 +784,72 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         body = await _json(request)
         name = body.get("name")
         plan = body.get("plan")
+        mode = body.get("mode")
         quotas = body.get("quotas")
         with transaction(platform.factory) as db:
             row = services.update_tenant(
                 db, tenant_id,
                 name=name if isinstance(name, str) else None,
                 plan=plan if isinstance(plan, str) else None,
+                mode=mode if isinstance(mode, str) else None,
                 quotas=quotas if isinstance(quotas, dict) else None,
                 actor=auth["username"], now=time.time())
             return row.public()
+
+    @app.get("/api/v2/platform/users")
+    async def platform_users(request: Request, tenant_id: str = ""):
+        await current_platform(request, permission="platform.user.read")
+        if not tenant_id:
+            raise services.PlatformError("tenant_id_required", "请指定租户", 400)
+        with transaction(platform.factory) as db:
+            if db.get(Tenant, tenant_id) is None:
+                raise services.PlatformError("tenant_not_found", "租户不存在", 404)
+            return services.list_users(db, tenant_id=tenant_id)
+
+    @app.post("/api/v2/platform/tenants/{tenant_id}/users")
+    async def platform_create_user(tenant_id: str, request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.user.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            if db.get(Tenant, tenant_id) is None:
+                raise services.PlatformError("tenant_not_found", "租户不存在", 404)
+            user = services.create_user(
+                db, str(body.get("username", "")), str(body.get("password", "")),
+                str(body.get("role", "viewer")), actor=auth["username"],
+                display_name=str(body.get("display_name", "")), tenant_id=tenant_id)
+            return {**user.public(), "roles": services.roles_of(db, user.id)}
+
+    @app.post("/api/v2/platform/users/{user_id}/active")
+    async def platform_set_user_active(user_id: str, request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.user.write")
+        body = await _json(request)
+        active = bool(body.get("active", False))
+        with transaction(platform.factory) as db:
+            services.set_user_active(db, user_id, active, actor=auth["username"], tenant_id=None)
+        if not active:
+            await _drop_user_sessions(platform.state, user_id)
+        return {"ok": True}
+
+    @app.patch("/api/v2/platform/users/{user_id}/role")
+    async def platform_set_user_role(user_id: str, request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.user.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            user = services.set_user_role(db, user_id, str(body.get("role", "")),
+                                          actor=auth["username"], tenant_id=None)
+            result = {**user.public(), "roles": services.roles_of(db, user_id)}
+        await _drop_user_sessions(platform.state, user_id)
+        return result
+
+    @app.post("/api/v2/platform/users/{user_id}/password")
+    async def platform_reset_user_password(user_id: str, request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.user.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            services.set_user_password(db, user_id, str(body.get("password", "")),
+                                       actor=auth["username"], tenant_id=None)
+        await _drop_user_sessions(platform.state, user_id)
+        return {"ok": True}
 
     @app.get("/api/v2/platform/workers")
     async def platform_workers(request: Request):
@@ -856,7 +932,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     async def platform_revoke_session(sid: str, request: Request):
         auth = await current_platform(request, mutate=True,
                                       permission="platform.session.revoke")
-        result = await require_plane().force_revoke(sid, trace=request.state.trace)
+        result = await require_plane().force_revoke(sid, trace=request.state.trace,
+                                                    actor=auth["username"])
         tenant_of_record = result.get("tenant_id")
         if tenant_of_record is None and result.get("asset_id"):
             with transaction(platform.factory) as db:

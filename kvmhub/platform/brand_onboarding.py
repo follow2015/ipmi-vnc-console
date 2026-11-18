@@ -1,6 +1,7 @@
 """Out-of-band onboarding for a new brand/firmware family."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -11,6 +12,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import services
+from .data_plane import _template_regex
+from ..capability import parse_logout_path
 from .models import PROFILE_DRAFT, VendorProfile, json_field
 
 MESSAGE_PROFILES = frozenset({"standard", "insyde", "smc"})
@@ -79,6 +82,8 @@ def validate_spec(spec: dict, *, evidence: str) -> dict:
         raise SpecError("rfb_version must look like 'RFB 003.008'")
 
     model_pattern = _text(spec, "model_pattern", required=True)
+    if len(model_pattern) > 256:
+        raise SpecError("model_pattern must be at most 256 characters")
     try:
         re.compile(model_pattern)
     except re.error as exc:
@@ -108,6 +113,25 @@ def validate_spec(spec: dict, *, evidence: str) -> dict:
     path = Path(evidence)
     if not path.exists() or not path.is_file():
         raise SpecError("--evidence must point at an existing measured evidence file")
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise SpecError(f"evidence file is not readable: {exc}") from exc
+
+    login_path = _text(spec, "login_path")
+    logout_path = _text(spec, "logout_path")
+    for name, value in (("login_path", login_path), ("logout_path", logout_path)):
+        if value:
+            try:
+                parse_logout_path(value)
+            except ValueError as exc:
+                raise SpecError(f"{name} is not a valid BMC path: {exc}") from exc
+    asset_paths = _list(spec, "asset_paths")
+    for template in asset_paths:
+        try:
+            _template_regex(template)
+        except Exception as exc:
+            raise SpecError(f"asset_paths entry is not a safe template: {template}") from exc
 
     return {
         "code": code,
@@ -118,15 +142,16 @@ def validate_spec(spec: dict, *, evidence: str) -> dict:
         "firmware_max": _text(spec, "firmware_max"),
         "rfb_version": rfb_version,
         "message_profile": message_profile,
-        "asset_paths": _list(spec, "asset_paths"),
-        "login_path": _text(spec, "login_path"),
-        "logout_path": _text(spec, "logout_path"),
+        "asset_paths": asset_paths,
+        "login_path": login_path,
+        "logout_path": logout_path,
         "console_impl": console_impl,
         "licence": _text(spec, "licence"),
         "concurrency_limit": _int(spec, "concurrency_limit", 1, minimum=1),
         "input_shaping": shaping,
         "priority": _int(spec, "priority", 100),
         "evidence": str(evidence),
+        "evidence_sha256": digest,
     }
 
 
@@ -170,6 +195,7 @@ def create_draft_profile(session: Session, *, spec: dict, evidence: str,
     services.audit(session, actor, "vendor_profile_draft_created",
                    detail={"profile_id": row.id, "code": row.code,
                            "vendor": row.vendor, "evidence": fields["evidence"],
+                           "evidence_sha256": fields["evidence_sha256"],
                            "rfb_version": row.rfb_version},
                    now=stamp)
     return row

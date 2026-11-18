@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from kvmhub.common import PASSTHROUGH_ADAPTER_ID
+from kvmhub.common import PASSTHROUGH_ADAPTER_ID, Problem
 from kvmhub.platform import services, vendor_registry
 from kvmhub.platform.api import create_app
 from kvmhub.platform.bus import AssemblyBus
@@ -518,3 +518,94 @@ def test_the_revocation_subscription_has_no_read_timeout():
     assert command["socket_timeout"] == 3
     assert subscription.get("socket_timeout") is None
     assert subscription["socket_connect_timeout"] == 3
+
+
+def test_force_revoke_persists_state_even_if_pubsub_lost(tmp_path):
+    bus = AssemblyBus(MemoryState())
+    store = Store(str(tmp_path / "r1.db"), KEY)
+    store.seed_mock("127.0.0.1:5900", "0" * 64, "synthetic", "synthetic")
+    plane = ConsolePlane(store=store, private_key=Ed25519PrivateKey.generate(), bus=bus)
+
+    async def run():
+        await bus.register_worker("w1", instance_id="i1", capacity=4,
+                                  metadata={"address": "127.0.0.1", "port": 9443})
+        row = store.allocate("mock-1", "local-admin", "w1", "i1", "0" * 32)
+        sid = row["id"]
+        claims = {"sid": sid, "sub": row["user_id"], "aid": row["asset_id"],
+                  "wid": row["worker_id"], "iid": row["instance_id"], "jti": row["jti"]}
+        store.exchange(claims, "0" * 32)
+        store.renew(sid, "w1", "i1", activate=True)
+        await bus.claim_session("w1", sid, 3600)
+        await bus.reserve_tenant_quota("review-tenant", sid, 1, 3600)
+
+        await plane.force_revoke(sid, tenant_id="review-tenant")
+
+        assert store.get(sid)["status"] in ("closed", "closing"), "revoke not persisted"
+        with pytest.raises(Problem) as exc:
+            store.renew(sid, "w1", "i1")
+        assert exc.value.code == "session_revoked"
+        with pytest.raises(services.PlatformError):
+            await plane.route(f"w1-{sid}.kvm.localhost")
+        assert store.db.execute("SELECT 1 FROM asset_slot WHERE session_id=?", (sid,)).fetchone()
+        assert len(await bus.claims("w1")) == 0
+        assert await bus.tenant_quota_usage("review-tenant") == 0
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_force_revoke_is_idempotent_on_a_closed_session(tmp_path):
+    bus = AssemblyBus(MemoryState())
+    store = Store(str(tmp_path / "r1b.db"), KEY)
+    store.seed_mock("127.0.0.1:5900", "0" * 64, "synthetic", "synthetic")
+    plane = ConsolePlane(store=store, private_key=Ed25519PrivateKey.generate(), bus=bus)
+
+    async def run():
+        await bus.register_worker("w1", instance_id="i1", capacity=4,
+                                  metadata={"address": "127.0.0.1", "port": 9443})
+        row = store.allocate("mock-1", "local-admin", "w1", "i1", "0" * 32)
+        sid = row["id"]
+        await plane.force_revoke(sid, tenant_id="review-tenant")
+        first = store.get(sid)["status"]
+        again = await plane.force_revoke(sid, tenant_id="review-tenant")
+        assert again["was_live"] is False
+        assert store.get(sid)["status"] == first
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_failed_open_compensates_allocation(tmp_path):
+    bus = AssemblyBus(MemoryState())
+    store = Store(str(tmp_path / "r4.db"), KEY)
+    store.seed_mock("127.0.0.1:5900", "0" * 64, "synthetic", "synthetic")
+    plane = ConsolePlane(store=store, private_key=Ed25519PrivateKey.generate(), bus=bus)
+
+    async def run():
+        await bus.register_worker("w1", instance_id="i1", capacity=4,
+                                  metadata={"address": "127.0.0.1", "port": 9443})
+
+        original = bus.put_assembly
+
+        async def failing(*args, **kwargs):
+            raise RuntimeError("synthetic Redis failure")
+
+        bus.put_assembly = failing
+        try:
+            with pytest.raises(RuntimeError):
+                await plane.open({"ready": True, "asset_id": "mock-1",
+                                  "tenant_id": "r4-tenant"},
+                                 user_id="local-admin", concurrent_limit=1)
+        finally:
+            bus.put_assembly = original
+
+        assert store.db.execute(
+            "SELECT 1 FROM asset_slot WHERE asset_id='mock-1'").fetchone() is None
+        rows = store.db.execute(
+            "SELECT status FROM session WHERE asset_id='mock-1'").fetchall()
+        assert all(row["status"] in ("closed", "failed") for row in rows), rows
+        assert len(await bus.claims("w1")) == 0
+        assert await bus.tenant_quota_usage("r4-tenant") == 0
+
+    asyncio.run(run())
+    store.close()

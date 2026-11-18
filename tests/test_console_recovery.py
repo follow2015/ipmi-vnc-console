@@ -193,3 +193,11 @@ def test_driver_probes_health_and_reports_a_resume_point():
     for comparison in ("canvas.width <", "canvas.height <", "canvas.width >", "canvas.height >"):
         assert comparison not in source, f"{comparison} 把画布尺寸变成了断线判据"
     assert "session_rebuild_blocked_by_cleanup_pending" in (ROOT / "tools" / "console_ops.py").read_text(encoding="utf-8")
+
+
+def test_repeated_geometry_reload_is_bounded(harness_result):
+    data = harness_result["real_geometry_flood"]
+    assert data["reloads"] < 12, "geometry reloads must be bounded"
+    assert data["health_state"] == "exhausted", data
+    assert data["exhausted"] is True, data
+    assert "重连" in data["status"] or "重载" in data["status"], data["status"]
