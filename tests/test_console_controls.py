@@ -31,12 +31,20 @@ def _chrome():
 def test_input_block_starts_as_one_button():
     html = worker.REAL_CONSOLE_HTML
     js = worker.REAL_CONSOLE_JS
-    assert '<aside id="inputpanel" class="collapsed">' in html, "the dock is a left rail"
+    assert '<aside id="inputpanel" class="collapsed show-keys">' in html, \
+        "one shared panel, collapsed at first with the keyboard tab active"
     assert '<div id="work">' in html, "the picture owns its own column"
     assert 'id="input-toggle"' in html
+    assert 'id="tab-keys"' in html and 'id="tab-paste"' in html, \
+        "the sheet switches between keyboard and long command via two tabs"
+    assert "#inputpanel.show-keys #pastebar,#inputpanel.show-paste #softkey{display:none}" in html, \
+        "the two panes are mutually exclusive so the text box stays visible"
     assert "#inputpanel.collapsed #input-body{display:none}" in html
-    assert "#inputpanel:not(.collapsed){flex-basis:300px}" in html, "expansion steals width"
+    assert "#inputpanel:not(.collapsed){height:var(--sheet-h)}" in html, \
+        "expansion is a bottom sheet driven by one variable"
     assert "inputPanel.classList.toggle('collapsed')" in js
+    assert "classList.toggle('sheet-open'" in js, \
+        "opening the sheet makes the stage give up its height"
     block = js[js.index("inputToggle.onclick"):js.index("skRoot.addEventListener")]
     assert "loadKeymap();" in block, "the first expansion is what loads the table"
     assert "inputOpened" in block, "and it must happen once, not on every toggle"
@@ -63,6 +71,17 @@ def test_zoom_button_switches_between_fit_and_raw_pixels():
     assert "rfb._mouse._scale = 1" in js, "the pointer path must follow the new scale"
     fit = js[js.index("function fitPicture()"):js.index("function setZoomMode(")]
     assert "_display.autoscale(availW, availH, true)" in fit, "fit still uses the vendor tool"
+
+
+def test_console_page_is_touch_friendly():
+    html = worker.REAL_CONSOLE_HTML
+    js = worker.REAL_CONSOLE_JS
+    assert 'name="viewport"' in html and "width=device-width" in html
+    assert "touch-action:none" in html, "touch gestures belong to noVNC, not the page"
+    assert "@media (pointer:coarse)" in html
+    assert "min-height:44px" in html, "tablet hit targets must be touch sized"
+    assert "(pointer: coarse)" in js
+    assert "setZoomMode('fit');" in js, "tablets open with the whole framebuffer visible"
 
 
 def test_no_signal_comes_from_the_vendor_client():
@@ -143,7 +162,8 @@ def test_controls_behave_in_a_browser():
     assert initial["inputBodyVisible"] is False
     assert initial["toggleVisible"] is True
     assert initial["panelCollapsed"] is True
-    assert initial["panelWidth"] <= 50, "the collapsed rail must not steal width"
+    assert initial["sheetOpen"] is False
+    assert initial["stageWidth"] == 1280, "collapsed sheet leaves the full width"
     assert initial["label"] == "192.0.2.11"
     assert initial["title"].endswith("192.0.2.11")
     assert initial["scale"] == pytest.approx(1.0, abs=0.001), "crisp 1:1 on first paint"
@@ -151,15 +171,8 @@ def test_controls_behave_in_a_browser():
     assert initial["cssWidth"] == 1024 and initial["cssHeight"] == 768
     assert initial["stageOverflow"] == "auto", "a small window scrolls at 1:1"
 
-    opened = steps["opened"]
-    assert opened["keymapRequests"] == 1
-    assert opened["inputBodyVisible"] is True
-    assert opened["keyEnabled"] is True
-    assert opened["panelCollapsed"] is False
-    assert opened["panelWidth"] > 200, "the expanded dock shows the keyboard"
-    assert opened["scale"] == pytest.approx(1.0, abs=0.001), "the dock never rescales the picture"
-
     fit = steps["fit"]
+    assert fit["sheetOpen"] is False
     assert fit["scale"] < 0.995, "fit shows the whole framebuffer when asked"
     assert fit["stageOverflow"] != "auto"
     assert fit["zoom"].endswith("%")
@@ -170,9 +183,29 @@ def test_controls_behave_in_a_browser():
     assert steps["signal"]["overlayVisible"] is False
 
     oneone = steps["oneone"]
+    assert oneone["sheetOpen"] is False
     assert oneone["scale"] == pytest.approx(1.0, abs=0.001)
     assert oneone["mouseScale"] == pytest.approx(1.0, abs=0.001)
     assert oneone["cssWidth"] == 1024 and oneone["cssHeight"] == 768
     assert oneone["stageOverflow"] == "auto"
     assert oneone["stageScrollHeight"] > oneone["stageClientHeight"]
     assert oneone["zoom"] == "100%"
+
+    opened = steps["opened"]
+    assert opened["keymapRequests"] == 1
+    assert opened["inputBodyVisible"] is True
+    assert opened["keyEnabled"] is True
+    assert opened["panelCollapsed"] is False
+    assert opened["sheetOpen"] is True
+    assert opened["panelWidth"] > 200, "the expanded sheet shows the keyboard"
+    assert opened["scale"] < 1.0, "the picture fits above the sheet"
+    assert opened["stageBottom"] <= opened["panelTop"], \
+        "the picture is not hidden behind the keyboard"
+    assert opened["mouseScale"] == pytest.approx(opened["scale"], abs=0.001), \
+        "pointer mapping tracks the sheet-time scale exactly"
+
+    closed = steps["closed"]
+    assert closed["sheetOpen"] is False
+    assert closed["scale"] == pytest.approx(1.0, abs=0.001), \
+        "closing the sheet restores the operator's 100% choice"
+    assert closed["mouseScale"] == pytest.approx(1.0, abs=0.001)

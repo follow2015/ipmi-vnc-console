@@ -17,13 +17,13 @@ from typing import Any
 from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.orm import Session
 
-from .models import (AccessGrant, Asset, AuditLog, Capability, Credential,
-                     DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID, PERMISSIONS, Permission,
-                     Role, RolePermission, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER,
-                     ROLE_PLATFORM_ADMIN, TENANT_ACTIVE, TENANT_MODE_CONSUMER,
-                     TENANT_MODE_MANAGER, TENANT_MODE_PERMISSIONS, TENANT_MODES,
-                     QuotaUsage, ServiceToken, Tenant, User, UserRole, VendorProfile,
-                     json_field, parse_json)
+from .models import (AccessGrant, Asset, AssetGroup, AssetGroupMember, AuditLog,
+                     Capability, Credential, DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID,
+                     PERMISSIONS, Permission, GrantSource, Role, RolePermission,
+                     ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER, ROLE_PLATFORM_ADMIN,
+                     TENANT_ACTIVE, TENANT_MODE_CONSUMER, TENANT_MODE_MANAGER,
+                     TENANT_MODE_PERMISSIONS, TENANT_MODES, QuotaUsage, ServiceToken,
+                     Tenant, User, UserRole, VendorProfile, json_field, parse_json)
 from .security import (CredentialCipher, hash_password, verify_password)
 from ..sql_backend import open_store, parse_store_dsn
 
@@ -128,11 +128,19 @@ def effective_permissions(session: Session, user_id: str,
     return granted & set(tenant_mode_permissions(session, tenant_id))
 
 
-def require(session: Session, user_id: str, code: str,
-            *, tenant_id: str | None = None) -> None:
-    granted = (effective_permissions(session, user_id, tenant_id)
-               if tenant_id is not None else permissions_of(session, user_id))
-    if code not in granted:
+def require(session: Session, user_id: str, code: str, *, tenant_id: str) -> None:
+    if not tenant_id:
+        raise ValueError("require() needs a tenant_id; use require_platform() for platform codes")
+    if code.startswith("platform."):
+        raise ValueError(f"{code} is a platform permission; use require_platform()")
+    if code not in effective_permissions(session, user_id, tenant_id):
+        raise PlatformError("permission_denied", f"缺少权限：{code}", 403)
+
+
+def require_platform(session: Session, user_id: str, code: str) -> None:
+    if not code.startswith("platform."):
+        raise ValueError(f"{code} is not a platform permission; use require(tenant_id=...)")
+    if code not in permissions_of(session, user_id):
         raise PlatformError("permission_denied", f"缺少权限：{code}", 403)
 
 
@@ -177,7 +185,8 @@ def list_users(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID) -> list[
 
 
 def set_user_active(session: Session, user_id: str, active: bool, *, actor: str,
-                    tenant_id: str | None = DEFAULT_TENANT_ID) -> None:
+                    tenant_id: str | None = DEFAULT_TENANT_ID,
+                    plane: Any | None = None) -> None:
     user = session.get(User, user_id)
     if user is None or user.tenant_id is None:
         raise PlatformError("user_not_found", "用户不存在", 404)
@@ -187,10 +196,15 @@ def set_user_active(session: Session, user_id: str, active: bool, *, actor: str,
     audit(session, actor, "user_activation_changed", tenant_id=user.tenant_id,
           detail={"user_id": user_id, "active": active})
     session.commit()
+    if plane is not None and not active:
+        plane.revoke_subject(user_id, trace="")
+
+
+_ROLE_RANK = {ROLE_VIEWER: 0, ROLE_OPERATOR: 1, ROLE_ADMIN: 2}
 
 
 def set_user_role(session: Session, user_id: str, role: str, *, actor: str,
-                  tenant_id: str | None = None) -> User:
+                  tenant_id: str | None = None, plane: Any | None = None) -> User:
     if role not in (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER):
         raise PlatformError("unknown_role", f"未知角色：{role}", 400)
     user = session.get(User, user_id)
@@ -202,12 +216,15 @@ def set_user_role(session: Session, user_id: str, role: str, *, actor: str,
     if role_row is None:
         raise PlatformError("unknown_role", f"未知角色：{role}")
     before = roles_of(session, user_id)
+    before_rank = max((_ROLE_RANK.get(code, -1) for code in before), default=-1)
     session.execute(delete(UserRole).where(UserRole.user_id == user_id))
     session.add(UserRole(user_id=user_id, role_id=role_row.id))
     audit(session, actor, "user_role_changed", tenant_id=user.tenant_id,
           actor_type="platform",
           detail={"user_id": user_id, "before": before, "after": [role]})
     session.commit()
+    if plane is not None and _ROLE_RANK.get(role, -1) < before_rank:
+        plane.bump_subject_epoch(user_id, trace="")
     return user
 
 
@@ -294,7 +311,7 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
 
 def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor: str,
                  name: str = "", reassign: bool = False,
-                 now: float | None = None) -> dict:
+                 now: float | None = None, plane: Any | None = None) -> dict:
     stamp = time.time() if now is None else now
     addr = (address or "").strip()
     if not addr:
@@ -372,6 +389,17 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
                   detail={"credential_id": credential.id,
                           "to": tenant.code if tenant is not None else None}, now=stamp)
     action = "unassigned" if target is None else ("moved" if origin_code else "assigned")
+    old_grantees = [row[0] for row in session.execute(
+        select(AccessGrant.user_id).where(AccessGrant.asset_id == asset.id)).all()]
+    if plane is not None:
+        plane.delete_grants_for_asset(asset.id, trace="")
+        for uid in old_grantees:
+            plane.bump_subject_epoch(uid, trace="")
+    session.execute(delete(AccessGrant).where(AccessGrant.asset_id == asset.id))
+    session.execute(delete(GrantSource).where(GrantSource.asset_id == asset.id))
+    if old_grantees:
+        audit(session, actor, "asset_grants_cleared", asset_id=asset.id, tenant_id=target,
+              detail={"from": origin_code, "users": old_grantees}, now=stamp)
     audit(session, actor, f"asset_{action}", asset_id=asset.id, tenant_id=target,
           detail={"address": addr, "from": origin_code,
                   "to": tenant.code if tenant is not None else None}, now=stamp)
@@ -404,9 +432,26 @@ def all_assets(session: Session, user_id: str, *, now: float | None = None,
     return [{**asset.public(), "grant_expires": expires} for asset, expires in rows]
 
 
+def _assert_grantor_authorized(session: Session, *, actor_user_id: str | None,
+                               asset_id: str, tenant_id: str, stamp: float) -> None:
+    if not actor_user_id:
+        return
+    grantor = session.get(User, actor_user_id)
+    if grantor is None:
+        raise PlatformError("grantor_not_found", "授权人账号不存在", 404)
+    if grantor.tenant_id is None:
+        return
+    held = session.scalar(select(func.count()).select_from(AccessGrant).where(
+        AccessGrant.user_id == actor_user_id, AccessGrant.asset_id == asset_id,
+        AccessGrant.tenant_id == tenant_id, AccessGrant.expires > stamp))
+    if not held:
+        raise PlatformError("grantor_not_authorized", "授权人尚未获得该资产的一级授权", 403)
+
+
 def grant_asset(session: Session, *, user_id: str, asset_id: str, actor: str,
                 ttl_seconds: int = 86400 * 30, now: float | None = None,
-                tenant_id: str = DEFAULT_TENANT_ID) -> None:
+                tenant_id: str = DEFAULT_TENANT_ID,
+                actor_user_id: str | None = None, plane: Any | None = None) -> None:
     stamp = time.time() if now is None else now
     user = session.get(User, user_id)
     asset = session.get(Asset, asset_id)
@@ -414,21 +459,169 @@ def grant_asset(session: Session, *, user_id: str, asset_id: str, actor: str,
         raise PlatformError("grant_target_missing", "用户或资产不存在", 404)
     if asset is None or asset.tenant_id != tenant_id:
         raise PlatformError("grant_target_missing", "用户或资产不存在", 404)
+    _assert_grantor_authorized(session, actor_user_id=actor_user_id, asset_id=asset_id,
+                               tenant_id=tenant_id, stamp=stamp)
+    if plane is not None:
+        plane.write_grant(user_id, asset_id, stamp + ttl_seconds, trace="")
+    grantor = session.get(User, actor_user_id) if actor_user_id else None
+    level = 1 if grantor is None or grantor.tenant_id is None else 2
     session.merge(AccessGrant(tenant_id=tenant_id, user_id=user_id, asset_id=asset_id,
                               expires=stamp + ttl_seconds, granted_by=actor, created=stamp))
+    hand = session.scalar(select(func.count()).select_from(GrantSource).where(
+        GrantSource.user_id == user_id, GrantSource.asset_id == asset_id,
+        GrantSource.group_id.is_(None)))
+    if not hand:
+        session.add(GrantSource(id=str(uuid.uuid4()), user_id=user_id, asset_id=asset_id,
+                                group_id=None))
     audit(session, actor, "grant_created", asset_id=asset_id, tenant_id=tenant_id,
-          detail={"user_id": user_id, "expires": stamp + ttl_seconds}, now=stamp)
+          detail={"user_id": user_id, "expires": stamp + ttl_seconds, "level": level},
+          now=stamp)
     session.commit()
 
 
 def revoke_grant(session: Session, *, user_id: str, asset_id: str, actor: str,
-                 tenant_id: str = DEFAULT_TENANT_ID) -> None:
+                 tenant_id: str = DEFAULT_TENANT_ID,
+                 plane: Any | None = None) -> None:
+    if plane is not None:
+        plane.delete_grant(user_id, asset_id, trace="")
+        plane.bump_subject_epoch(user_id, trace="")
     session.execute(delete(AccessGrant).where(AccessGrant.user_id == user_id,
                                               AccessGrant.asset_id == asset_id,
                                               AccessGrant.tenant_id == tenant_id))
+    session.execute(delete(GrantSource).where(GrantSource.user_id == user_id,
+                                              GrantSource.asset_id == asset_id))
     audit(session, actor, "grant_revoked", asset_id=asset_id, tenant_id=tenant_id,
           detail={"user_id": user_id})
     session.commit()
+
+
+
+MAX_GROUP_EXPANSION = 500
+
+
+def _group_in_tenant(session: Session, group_id: str, tenant_id: str) -> AssetGroup:
+    group = session.get(AssetGroup, group_id)
+    if group is None or group.tenant_id != tenant_id:
+        raise PlatformError("group_not_found", "资产组不存在", 404)
+    return group
+
+
+def create_asset_group(session: Session, *, name: str, actor: str,
+                       tenant_id: str, now: float | None = None) -> AssetGroup:
+    label = (name or "").strip()
+    if not label:
+        raise PlatformError("invalid_group_name", "资产组名称不能为空")
+    stamp = time.time() if now is None else now
+    group = AssetGroup(id=str(uuid.uuid4()), tenant_id=tenant_id, name=label,
+                       created=stamp, updated=stamp)
+    session.add(group)
+    audit(session, actor, "asset_group_created", tenant_id=tenant_id,
+          detail={"group_id": group.id, "name": label}, now=stamp)
+    session.commit()
+    return group
+
+
+def list_asset_groups(session: Session, tenant_id: str) -> list[dict]:
+    rows = session.execute(
+        select(AssetGroup, func.count(AssetGroupMember.asset_id))
+        .outerjoin(AssetGroupMember, AssetGroupMember.group_id == AssetGroup.id)
+        .where(AssetGroup.tenant_id == tenant_id)
+        .group_by(AssetGroup.id).order_by(AssetGroup.name)).all()
+    return [{**group.public(), "member_count": count} for group, count in rows]
+
+
+def set_group_members(session: Session, *, group_id: str, asset_ids: list[str],
+                      actor: str, tenant_id: str,
+                      now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    group = _group_in_tenant(session, group_id, tenant_id)
+    wanted = list(dict.fromkeys(asset_ids))
+    if wanted:
+        owned = set(session.scalars(select(Asset.id).where(
+            Asset.id.in_(wanted), Asset.tenant_id == tenant_id)).all())
+        if len(owned) != len(wanted):
+            raise PlatformError("group_asset_foreign", "资产组只能包含本租户资产", 403)
+    existing = set(session.scalars(select(AssetGroupMember.asset_id).where(
+        AssetGroupMember.group_id == group_id)).all())
+    target = set(wanted)
+    for aid in existing - target:
+        session.execute(delete(AssetGroupMember).where(
+            AssetGroupMember.group_id == group_id, AssetGroupMember.asset_id == aid))
+    for aid in target - existing:
+        session.add(AssetGroupMember(group_id=group_id, asset_id=aid))
+    group.updated = stamp
+    audit(session, actor, "asset_group_members_changed", tenant_id=tenant_id,
+          detail={"group_id": group_id, "added": sorted(target - existing),
+                  "removed": sorted(existing - target)}, now=stamp)
+    session.commit()
+    return {"group": group.public(), "members": sorted(target)}
+
+
+def delete_asset_group(session: Session, *, group_id: str, actor: str,
+                       tenant_id: str) -> None:
+    group = _group_in_tenant(session, group_id, tenant_id)
+    session.execute(update(GrantSource).where(GrantSource.group_id == group_id)
+                    .values(group_id=None))
+    session.execute(delete(AssetGroupMember).where(AssetGroupMember.group_id == group_id))
+    session.delete(group)
+    audit(session, actor, "asset_group_deleted", tenant_id=tenant_id,
+          detail={"group_id": group_id, "name": group.name})
+    session.commit()
+
+
+def grant_group(session: Session, *, group_id: str, user_id: str, actor: str,
+                tenant_id: str, plane: Any | None = None,
+                ttl_seconds: int = 86400 * 30,
+                now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    group = _group_in_tenant(session, group_id, tenant_id)
+    user = session.get(User, user_id)
+    if user is None or user.tenant_id != tenant_id:
+        raise PlatformError("grant_target_missing", "用户不存在", 404)
+    member_ids = list(session.scalars(select(AssetGroupMember.asset_id).where(
+        AssetGroupMember.group_id == group_id)).all())
+    if len(member_ids) > MAX_GROUP_EXPANSION:
+        raise PlatformError("group_expansion_too_large",
+                            f"单次展开不能超过 {MAX_GROUP_EXPANSION} 台资产", 413)
+
+    stale = [row[0] for row in session.execute(
+        select(GrantSource.asset_id).where(GrantSource.user_id == user_id,
+                                           GrantSource.group_id == group_id)).all()
+        if row[0] not in set(member_ids)]
+    for aid in stale:
+        session.execute(delete(GrantSource).where(
+            GrantSource.user_id == user_id, GrantSource.asset_id == aid,
+            GrantSource.group_id == group_id))
+        other_sources = session.scalar(select(func.count()).select_from(GrantSource).where(
+            GrantSource.user_id == user_id, GrantSource.asset_id == aid))
+        if not other_sources:
+            if plane is not None:
+                plane.delete_grant(user_id, aid, trace="")
+            session.execute(delete(AccessGrant).where(
+                AccessGrant.user_id == user_id, AccessGrant.asset_id == aid,
+                AccessGrant.tenant_id == tenant_id))
+            audit(session, actor, "group_grant_revoked", asset_id=aid, tenant_id=tenant_id,
+                  detail={"user_id": user_id, "group_id": group_id}, now=stamp)
+
+    granted = 0
+    for aid in member_ids:
+        expires = stamp + ttl_seconds
+        if plane is not None:
+            plane.write_grant(user_id, aid, expires, trace="")
+        session.merge(AccessGrant(tenant_id=tenant_id, user_id=user_id, asset_id=aid,
+                                  expires=expires, granted_by=actor, created=stamp))
+        exists = session.scalar(select(func.count()).select_from(GrantSource).where(
+            GrantSource.user_id == user_id, GrantSource.asset_id == aid,
+            GrantSource.group_id == group_id))
+        if not exists:
+            session.add(GrantSource(id=str(uuid.uuid4()), user_id=user_id, asset_id=aid,
+                                    group_id=group_id))
+        audit(session, actor, "group_grant_expanded", asset_id=aid, tenant_id=tenant_id,
+              detail={"user_id": user_id, "group_id": group_id, "expires": expires}, now=stamp)
+        granted += 1
+    session.commit()
+    return {"group_id": group_id, "user_id": user_id, "granted": granted,
+            "revoked_stale": len(stale)}
 
 
 def capability_draft(session: Session, profile: VendorProfile, *, detection: dict,
@@ -578,7 +771,7 @@ def create_tenant(session: Session, *, code: str, name: str, plan: str = "standa
 
 
 def set_tenant_status(session: Session, tenant_id: str, status: str, *, actor: str,
-                      now: float | None = None) -> Tenant:
+                      now: float | None = None, plane: Any | None = None) -> Tenant:
     if status not in ("active", "suspended"):
         raise PlatformError("invalid_status", "status 只能是 active 或 suspended", 400)
     row = session.get(Tenant, tenant_id)
@@ -591,6 +784,9 @@ def set_tenant_status(session: Session, tenant_id: str, status: str, *, actor: s
           detail={"tenant_id": tenant_id, "code": row.code, "status": status},
           now=now)
     session.commit()
+    if plane is not None and status == "suspended":
+        for uid in session.scalars(select(User.id).where(User.tenant_id == tenant_id)).all():
+            plane.revoke_subject(uid, trace="")
     return row
 
 

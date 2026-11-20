@@ -132,6 +132,8 @@ async function main() {
   await page.click('#zoom-mode');
   await page.waitForTimeout(200);
 
+  await page.click('#softkey-toggle');
+  await page.waitForTimeout(150);
   steps.push(await measure('900-keyboard-collapsed'));
 
   await page.click('#softkey-toggle');

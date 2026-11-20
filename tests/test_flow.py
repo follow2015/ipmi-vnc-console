@@ -9,6 +9,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 import httpx
@@ -32,6 +33,13 @@ class LoopbackResolver(AbstractResolver):
 
 @pytest.fixture(scope="module")
 def services(tmp_path_factory):
+    ui_port = urlsplit(UI_ORIGIN).port or 443
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", ui_port))
+        except OSError as exc:
+            pytest.skip(f"UI test port {ui_port} unavailable: {exc}")
+
     folder = tmp_path_factory.mktemp("flow") / "local"
     subprocess.run([sys.executable, str(ROOT/"tools/bootstrap.py"), "--directory", str(folder),
                     "--impostor"],

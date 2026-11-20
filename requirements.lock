@@ -27,6 +27,8 @@ opentelemetry-api==1.45.2
 packaging==26.3
 pluggy==1.7.0
 propcache==0.5.4
+pyghmi==1.6.19
+python-dateutil==4.0.0
 pycparser==3.12
 pydantic==2.14.3
 pydantic_core==2.50.4
@@ -39,6 +41,7 @@ python-dotenv==1.2.2
 redis==8.0.0
 sqlalchemy==2.0.50
 starlette==1.10.0
+tzdata==2026.6
 typing-inspection==0.4.5
 typing_extensions==4.16.0
 uvloop==0.23.0

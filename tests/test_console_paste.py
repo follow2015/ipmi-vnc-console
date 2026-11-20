@@ -67,3 +67,16 @@ def test_worker_serves_the_keymap_route_from_the_single_source():
             or 'path == "/_platform/keymap"' in text)
     assert "web.json_response(keymap_document())" in text
     assert "from .platform.text_input import keymap_document" in text
+
+
+def test_dangerous_commands_are_flagged_with_red_warning_and_second_confirm():
+    html = worker.REAL_CONSOLE_HTML
+    js = worker.REAL_CONSOLE_JS
+    assert 'id="paste-danger"' in html
+    assert 'paste-danger' in worker.REAL_CONSOLE_CSS if hasattr(worker, 'REAL_CONSOLE_CSS') else True
+    for token in ('rm\\s', 'mkfs', 'dd\\s', 'shutdown', 'reboot', 'chmod'):
+        assert token in js, token
+    assert '危险命令预检' in js
+    assert 'pasteDangerConfirmed' in js
+    assert '确认发送危险命令' in js
+    assert 'pasteDangers.length' in js

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
+from kvmhub.common import IDRAC8_ADAPTER_ID
 from kvmhub.platform import brand_onboarding, services
 from kvmhub.platform.db import init_schema, make_engine, seed_roles, session_factory, transaction
 from kvmhub.platform.models import PROFILE_DRAFT, AuditLog, Capability, VendorProfile
@@ -67,6 +68,9 @@ def test_validate_spec_rejects_typos_and_missing_evidence(tmp_path):
     bad = dict(spec, console_impl="executable-adapter")
     with pytest.raises(brand_onboarding.SpecError, match="console_impl"):
         brand_onboarding.validate_spec(bad, evidence=str(evidence))
+    measured_idrac8 = brand_onboarding.validate_spec(
+        dict(spec, console_impl=IDRAC8_ADAPTER_ID), evidence=str(evidence))
+    assert measured_idrac8["console_impl"] == IDRAC8_ADAPTER_ID
     with pytest.raises(brand_onboarding.SpecError, match="evidence"):
         brand_onboarding.validate_spec(spec, evidence=str(tmp_path / "absent.json"))
 
@@ -203,3 +207,32 @@ def test_validate_spec_rejects_unsafe_paths_early(tmp_path, field, value):
     bad = dict(spec, **{field: value})
     with pytest.raises(brand_onboarding.SpecError):
         brand_onboarding.validate_spec(bad, evidence=str(evidence))
+
+
+def test_validate_spec_accepts_registered_protocol_and_rejects_unknown(tmp_path):
+    spec, evidence = measured(tmp_path)
+    ok = dict(spec, protocol="supermicro-ikvm-html5")
+    assert brand_onboarding.validate_spec(ok, evidence=str(evidence))["protocol"] == (
+        "supermicro-ikvm-html5")
+    bad = dict(spec, protocol="dell-idrac8-not-registered")
+    with pytest.raises(brand_onboarding.SpecError, match="protocol"):
+        brand_onboarding.validate_spec(bad, evidence=str(evidence))
+
+
+def test_create_draft_profile_persists_protocol(factory, tmp_path):
+    spec, evidence = measured(tmp_path)
+    spec = dict(spec, protocol="supermicro-ikvm-html5")
+    with transaction(factory) as db:
+        row = brand_onboarding.create_draft_profile(
+            db, spec=spec, evidence=str(evidence), actor="ops")
+        assert row.protocol == "supermicro-ikvm-html5"
+        assert brand_onboarding.profile_matches_spec(row, spec, evidence=str(evidence))
+
+
+def test_profile_matches_spec_detects_protocol_drift(factory, tmp_path):
+    spec, evidence = measured(tmp_path)
+    with transaction(factory) as db:
+        row = brand_onboarding.create_draft_profile(
+            db, spec=spec, evidence=str(evidence), actor="ops")
+        drifted = dict(spec, protocol="supermicro-ikvm-html5")
+        assert not brand_onboarding.profile_matches_spec(row, drifted, evidence=str(evidence))

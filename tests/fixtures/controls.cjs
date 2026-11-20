@@ -103,6 +103,10 @@ async function main() {
       toggleVisible: tbox.width > 0 && tbox.height > 0,
       inputBodyVisible: body.getBoundingClientRect().height > 0,
       panelCollapsed: panel.classList.contains('collapsed'),
+      sheetOpen: document.body.classList.contains('sheet-open'),
+      stageWidth: Math.round(stage.getBoundingClientRect().width),
+      stageBottom: Math.round(stage.getBoundingClientRect().bottom),
+      panelTop: Math.round(panel.getBoundingClientRect().top),
       keyEnabled: !!key && !key.disabled,
       label: labelEl ? labelEl.textContent : null,
       title: document.title,
@@ -128,13 +132,6 @@ async function main() {
   await page.waitForTimeout(100);
   steps.push(await measure('initial'));
 
-  await page.click('#input-toggle');
-  await page.waitForFunction(() => {
-    const key = document.querySelector('#softkey [data-send]');
-    return !!key && !key.disabled;
-  }, null, { timeout: 20000 });
-  steps.push(await measure('opened'));
-
   await page.click('#zoom-mode');
   await page.waitForTimeout(150);
   steps.push(await measure('fit'));
@@ -147,6 +144,17 @@ async function main() {
   await page.click('#zoom-mode');
   await page.waitForTimeout(150);
   steps.push(await measure('oneone'));
+
+  await page.click('#input-toggle');
+  await page.waitForFunction(() => {
+    const key = document.querySelector('#softkey [data-send]');
+    return !!key && !key.disabled;
+  }, null, { timeout: 20000 });
+  steps.push(await measure('opened'));
+
+  await page.click('#input-toggle');
+  await page.waitForTimeout(150);
+  steps.push(await measure('closed'));
 
   console.log(JSON.stringify({ steps, errors }));
   await browser.close();

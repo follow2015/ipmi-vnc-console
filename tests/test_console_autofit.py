@@ -42,15 +42,21 @@ def test_the_height_handle_is_gone():
     assert "setPointerCapture" not in js
 
 
-def test_the_input_dock_takes_width_not_height():
+def test_the_input_panel_is_one_shared_bottom_sheet():
     rule = _rule(worker.REAL_CONSOLE_HTML, "#inputpanel")
     html = worker.REAL_CONSOLE_HTML
-    assert "flex:0 0 44px" in rule, "the collapsed rail is a narrow left strip"
-    assert "#inputpanel:not(.collapsed){flex-basis:300px}" in html, \
-        "expansion steals width, never the picture's height"
+    assert "position:fixed" in rule and "bottom:0" in rule, \
+        "the panel is a fixed bottom sheet on all devices"
+    assert "left:0;right:0" in rule, "the expanded sheet spans the full width"
+    assert ":root{--sheet-h:min(48vh,430px)}" in html, \
+        "one variable drives the sheet height on every resolution"
+    assert "body.sheet-open #stage{margin-bottom:var(--sheet-h)}" in html, \
+        "the picture gives up exactly the sheet's height so nothing is covered"
+    assert "flex:0 0 44px" not in html and "flex-basis:300px" not in html, \
+        "no left-dock second layout remains"
     body_rule = _rule(html, "#input-body")
     assert "max-height" not in body_rule, f"a cap is what clipped the keyboard: {body_rule}"
-    assert "<aside id=\"inputpanel\"" in html, "the dock is a sibling of the picture column"
+    assert "<aside id=\"inputpanel\"" in html, "the panel is a sibling of the picture column"
 
 
 def test_the_picture_area_does_not_scroll_either():

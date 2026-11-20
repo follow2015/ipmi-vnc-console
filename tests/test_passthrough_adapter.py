@@ -340,3 +340,24 @@ def test_an_unapproved_greeting_keeps_the_narrow_standard_profile():
     allowed, sizes = client_message_profile("RFB 004.001")
     assert 7 not in allowed and 25 not in allowed
     assert sizes[4] == 8 and sizes[5] == 6
+
+
+
+def test_adapter_defaults_to_supermicro_protocol():
+    from kvmhub.rfb_protocol import SupermicroProtocol
+
+    adapter = PassthroughAdapter(info())
+    assert isinstance(adapter.protocol, SupermicroProtocol)
+
+
+def test_adapter_selects_protocol_by_id():
+    from kvmhub.rfb_protocol import SupermicroProtocol
+
+    adapter = PassthroughAdapter(info(protocol="supermicro-ikvm-html5"))
+    assert isinstance(adapter.protocol, SupermicroProtocol)
+
+
+def test_adapter_rejects_unknown_protocol_id():
+    with pytest.raises(Problem) as exc:
+        PassthroughAdapter(info(protocol="dell-idrac8-not-registered"))
+    assert exc.value.code == "invalid_target_policy"

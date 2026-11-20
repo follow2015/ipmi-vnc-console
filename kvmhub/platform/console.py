@@ -47,6 +47,69 @@ class ConsolePlane:
     def accept_url(self, *, worker_id: str, sid: str) -> str:
         return self.accept_template.format(worker_id=worker_id, sid=sid, port=self.port)
 
+
+    def write_grant(self, user_id: str, asset_id: str, expires: float, *, trace: str = "") -> None:
+        store, dispose = self._connect()
+        try:
+            with store.tx():
+                store.put_grant(user_id, asset_id, expires)
+                store.event("platform", "grant_written", detail={"user": user_id, "asset": asset_id},
+                            trace=trace or None)
+        finally:
+            if dispose:
+                store.close()
+
+    def delete_grant(self, user_id: str, asset_id: str, *, trace: str = "") -> None:
+        store, dispose = self._connect()
+        try:
+            with store.tx():
+                store.delete_grant(user_id, asset_id)
+                store.event("platform", "grant_removed", detail={"user": user_id, "asset": asset_id},
+                            trace=trace or None)
+        finally:
+            if dispose:
+                store.close()
+
+    def delete_grants_for_asset(self, asset_id: str, *, trace: str = "") -> None:
+        store, dispose = self._connect()
+        try:
+            with store.tx():
+                store.delete_grants_for_asset(asset_id)
+                store.event("platform", "asset_grants_cleared", detail={"asset": asset_id},
+                            trace=trace or None)
+        finally:
+            if dispose:
+                store.close()
+
+    def set_subject_authz(self, user_id: str, console_allowed: int, epoch: int,
+                          *, trace: str = "") -> None:
+        store, dispose = self._connect()
+        try:
+            with store.tx():
+                store.set_subject_authz(user_id, console_allowed, epoch)
+                store.event("platform", "subject_authz_set",
+                            detail={"user": user_id, "allowed": console_allowed, "epoch": epoch},
+                            trace=trace or None)
+        finally:
+            if dispose:
+                store.close()
+
+    def bump_subject_epoch(self, user_id: str, *, console_allowed: int | None = None,
+                           trace: str = "") -> int:
+        store, dispose = self._connect()
+        try:
+            with store.tx():
+                new_epoch = store.bump_subject_epoch(user_id, console_allowed=console_allowed)
+                store.event("platform", "subject_epoch_bumped",
+                            detail={"user": user_id, "epoch": new_epoch}, trace=trace or None)
+            return new_epoch
+        finally:
+            if dispose:
+                store.close()
+
+    def revoke_subject(self, user_id: str, *, trace: str = "") -> None:
+        self.bump_subject_epoch(user_id, console_allowed=0, trace=trace)
+
     @staticmethod
     def _worker_upstream(worker: dict) -> str:
         metadata = worker.get("metadata") or {}

@@ -570,8 +570,26 @@ def test_force_revoke_is_idempotent_on_a_closed_session(tmp_path):
         again = await plane.force_revoke(sid, tenant_id="review-tenant")
         assert again["was_live"] is False
         assert store.get(sid)["status"] == first
+        assert store.db.execute("SELECT 1 FROM asset_slot WHERE session_id=?", (sid,)).fetchone() is None
 
     asyncio.run(run())
+    store.close()
+
+
+def test_sweep_releases_legacy_pending_slot(tmp_path):
+    store = Store(str(tmp_path / "sweep-stale.db"), KEY)
+    store.seed_mock("127.0.0.1:5900", "0" * 64, "synthetic", "synthetic")
+    row = store.allocate("mock-1", "local-admin", "w1", "i1", "0" * 32)
+    sid = row["id"]
+    with store.tx():
+        store.db.execute(
+            "UPDATE session SET status='closed',reason='revoked',cleanup='not_needed' "
+            "WHERE id=?", (sid,))
+    assert store.db.execute("SELECT 1 FROM asset_slot WHERE session_id=?", (sid,)).fetchone()
+
+    store.sweep()
+
+    assert store.db.execute("SELECT 1 FROM asset_slot WHERE session_id=?", (sid,)).fetchone() is None
     store.close()
 
 

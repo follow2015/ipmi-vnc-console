@@ -58,6 +58,37 @@ def path_segment_is_safe(path: str) -> bool:
     return "//" not in stripped
 
 PASSTHROUGH_ADAPTER_ID = "supermicro-x10-passthrough"
+IDRAC8_ADAPTER_ID = "dell-idrac8-html5"
+IDRAC_VNC_ADAPTER_ID = "dell-idrac-vnc-tcp"
+
+BMC_ALLOWED_NETWORKS_ENV = "KVMHUB_BMC_ALLOWED_NETWORKS"
+
+
+def bmc_allowed_networks_from_env() -> tuple[str, ...]:
+    raw = os.environ.get(BMC_ALLOWED_NETWORKS_ENV, "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def parse_controlled_networks(raw) -> tuple:
+    import ipaddress
+    if isinstance(raw, str):
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        items = [str(item).strip() for item in (raw or ()) if str(item).strip()]
+    return tuple(ipaddress.ip_network(item, strict=False) for item in items)
+
+
+def require_controlled_host(host: str, networks, *, adapter_id: str = IDRAC_VNC_ADAPTER_ID) -> None:
+    import ipaddress
+    parsed = parse_controlled_networks(networks)
+    if not parsed:
+        raise Problem("bmc_network_not_allowed", 403)
+    try:
+        address = ipaddress.ip_address(host)
+    except (ValueError, TypeError):
+        raise Problem("bmc_network_not_allowed", 403) from None
+    if not any(address in network for network in parsed):
+        raise Problem("bmc_network_not_allowed", 403)
 
 
 def _env_port(name: str, default: int) -> int:
@@ -96,6 +127,7 @@ ERROR_STATUS = {
     "invalid_ticket": 401, "ticket_expired": 401, "invalid_request": 400,
     "csrf_rejected": 403, "route_denied": 403, "worker_request_rejected": 403, "permission_denied": 403,
     "adapter_not_verified": 403, "asset_busy": 409, "ticket_consumed_or_expired": 409,
+    "bmc_network_not_allowed": 403,
     "cleanup_not_pending": 409, "console_already_connected": 409,
     "session_revoked": 410, "request_too_large": 413, "invalid_report": 400,
     "capability_withdrawn": 410, "capability_not_found": 404, "capability_state": 409,
@@ -123,6 +155,7 @@ USER_MESSAGES = {
     "session_not_found": "找不到该会话，可能已被清理。",
     "permission_denied": "没有该资产的访问权限。",
     "adapter_not_verified": "该资产的适配器未通过核验、已过期或未获批准。",
+    "bmc_network_not_allowed": "该 BMC 不在允许的管理网段内，明文 VNC 控制台已被拒绝。",
     "authentication_required": "会话已失效，请重新登录。",
 }
 
@@ -161,6 +194,7 @@ END_REASON_MESSAGES = {
     "client_closed": "操作员结束了会话。",
     "revoked": "会话已被撤销。",
     "capability_withdrawn": "该资产的能力在会话期间被收回，会话随之结束。",
+    "role_downgraded": "账号权限被下调或该资产授权被撤销，会话已结束；请联系管理员重新授权。",
     "upstream_error": "与 BMC 的连接异常中断。",
     "upstream_unresponsive": "BMC 长时间没有响应，连接已判定失效。",
     "upstream_reconnect_failed": "BMC 连接断开，自动重建控制台没有成功，会话已结束。",

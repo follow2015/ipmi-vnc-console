@@ -13,11 +13,12 @@ from sqlalchemy import func, select
 
 from .config import Settings, settings as load_settings
 from .db import init_schema, make_engine, seed_roles, session_factory, transaction
-from .models import Asset, Capability, Tenant, User, VendorProfile, parse_json
+from .models import (Asset, Capability, Credential, ROLE_ADMIN, Tenant, User,
+                     VendorProfile, parse_json)
 from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
-from . import connection, governance, services, text_input, vendor_registry
+from . import bmc_reset, connection, governance, services, text_input, vendor_registry
 from .bus import AssemblyBus, BusError
 from .contracts import CONTRACT_RESPONSES, contract_components, response_schema
 
@@ -45,10 +46,12 @@ def _build_plane(cfg: Settings, state: State):
 
     private = load_pem_private_key(Path(cfg.signing_key_path).read_bytes(), password=None)
     targets = tuple(item.strip() for item in cfg.passthrough_targets.split(",") if item.strip())
+    networks = tuple(item.strip() for item in cfg.bmc_allowed_networks.split(",") if item.strip())
 
     def connect() -> Store:
         return Store(cfg.data_plane_store, cfg.data_plane_key,
-                     passthrough_targets=targets)
+                     passthrough_targets=targets, strict_grants=cfg.strict_grants,
+                     bmc_allowed_networks=networks)
 
     return ConsolePlane(store_factory=connect, private_key=private,
                         bus=AssemblyBus(state),
@@ -197,7 +200,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                              platform_only=True, admin=True)
         code = permission or "platform.tenant.read"
         with transaction(platform.factory) as db:
-            services.require(db, auth["user_id"], code)
+            services.require_platform(db, auth["user_id"], code)
         return auth
 
     async def current_integration(request: Request) -> dict:
@@ -320,7 +323,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                                          str(body.get("password", "")))
             if user.tenant_id is not None:
                 raise services.PlatformError("platform_access_denied", "该入口仅限平台管理员", 403)
-            services.require(db, user.id, "platform.tenant.read")
+            services.require_platform(db, user.id, "platform.tenant.read")
             roles = services.roles_of(db, user.id)
         token, csrf = new_session_token(), new_session_token()
         await platform.state.put_session(
@@ -423,7 +426,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         body = await _json(request)
         with transaction(platform.factory) as db:
             services.set_user_active(db, user_id, bool(body.get("active", False)),
-                                     actor=auth["username"], tenant_id=auth["tenant_id"])
+                                     actor=auth["username"], tenant_id=auth["tenant_id"],
+                                     plane=platform.plane)
         if not bool(body.get("active", False)):
             await _drop_user_sessions(platform.state, user_id)
         return {"ok": True}
@@ -442,14 +446,14 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     async def assets(request: Request, scope: str = "tenant"):
         if scope not in ("tenant", "granted", "all"):
             raise services.PlatformError("scope_invalid", "scope 只能是 tenant、granted 或 all", 400)
-        if scope == "granted":
-            auth = await current(request, permission="asset.read")
-            with transaction(platform.factory) as db:
-                rows = services.assets_for_user(db, auth["user_id"], tenant_id=auth["tenant_id"])
-        else:
-            auth = await current(request, permission="asset.write" if scope == "all" else "asset.read")
-            with transaction(platform.factory) as db:
-                rows = services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"])
+        auth = await current(request, mutate=False,
+                             permission="asset.write" if scope == "all" else "asset.read")
+        is_admin = ROLE_ADMIN in (auth.get("roles") or [])
+        narrow = scope == "granted" or (platform.cfg.strict_grants and not is_admin)
+        with transaction(platform.factory) as db:
+            rows = (services.assets_for_user(db, auth["user_id"], tenant_id=auth["tenant_id"])
+                    if narrow else
+                    services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"]))
         occupancy = platform.plane.asset_occupancy(
             [row["id"] for row in rows], auth["user_id"], manage=scope == "all") if platform.plane else {}
         with transaction(platform.factory) as db:
@@ -487,6 +491,15 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 tenant_id=auth["tenant_id"])
             return asset.public()
 
+    @app.get("/api/v2/credentials")
+    async def list_credentials(request: Request):
+        auth = await current(request, permission="credential.write")
+        with transaction(platform.factory) as db:
+            rows = db.scalars(select(Credential)
+                              .where(Credential.tenant_id == auth["tenant_id"])
+                              .order_by(Credential.created)).all()
+            return [row.public() for row in rows]
+
     @app.post("/api/v2/credentials")
     async def create_credential(request: Request):
         auth = await current(request, mutate=True, permission="credential.write")
@@ -502,12 +515,63 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     async def grant(request: Request):
         auth = await current(request, mutate=True, permission="grant.write")
         body = await _json(request)
+        plane = platform.plane
         with transaction(platform.factory) as db:
-            services.grant_asset(db, user_id=str(body.get("user_id", "")),
-                                 asset_id=str(body.get("asset_id", "")), actor=auth["username"],
-                                 ttl_seconds=int(body.get("ttl_seconds", 86400 * 30)),
-                                 tenant_id=auth["tenant_id"])
+            services.grant_asset(
+                db, user_id=str(body.get("user_id", "")),
+                asset_id=str(body.get("asset_id", "")), actor=auth["username"],
+                ttl_seconds=int(body.get("ttl_seconds", 86400 * 30)),
+                tenant_id=auth["tenant_id"],
+                actor_user_id=auth["user_id"] if platform.cfg.strict_grants else None,
+                plane=plane)
         return {"ok": True}
+
+    @app.get("/api/v2/asset-groups")
+    async def list_groups(request: Request):
+        auth = await current(request, permission="grant.write")
+        with transaction(platform.factory) as db:
+            return services.list_asset_groups(db, auth["tenant_id"])
+
+    @app.post("/api/v2/asset-groups")
+    async def create_group(request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            row = services.create_asset_group(db, name=str(body.get("name", "")),
+                                              actor=auth["username"],
+                                              tenant_id=auth["tenant_id"])
+            return row.public()
+
+    @app.put("/api/v2/asset-groups/{group_id}/members")
+    async def set_group_members(group_id: str, request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        ids = body.get("asset_ids")
+        if not isinstance(ids, list):
+            raise services.PlatformError("invalid_request", "asset_ids 必须是数组")
+        with transaction(platform.factory) as db:
+            return services.set_group_members(
+                db, group_id=group_id, asset_ids=[str(x) for x in ids],
+                actor=auth["username"], tenant_id=auth["tenant_id"])
+
+    @app.delete("/api/v2/asset-groups/{group_id}")
+    async def delete_group(group_id: str, request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        with transaction(platform.factory) as db:
+            services.delete_asset_group(db, group_id=group_id, actor=auth["username"],
+                                        tenant_id=auth["tenant_id"])
+        return {"ok": True}
+
+    @app.post("/api/v2/asset-groups/{group_id}/grant")
+    async def grant_group(group_id: str, request: Request):
+        auth = await current(request, mutate=True, permission="grant.write")
+        body = await _json(request)
+        plane = platform.plane
+        with transaction(platform.factory) as db:
+            return services.grant_group(
+                db, group_id=group_id, user_id=str(body.get("user_id", "")),
+                actor=auth["username"], tenant_id=auth["tenant_id"], plane=plane,
+                ttl_seconds=int(body.get("ttl_seconds", 86400 * 30)))
 
     @app.get("/api/v2/vendor-profiles")
     async def profiles(request: Request):
@@ -659,7 +723,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             if asset is None or asset.tenant_id != auth["tenant_id"]:
                 raise services.PlatformError("session_not_found", "会话不存在", 404)
             try:
-                services.require(db, auth["user_id"], "asset.write")
+                services.require(db, auth["user_id"], "asset.write",
+                                 tenant_id=auth["tenant_id"])
                 manage = True
             except services.PlatformError:
                 manage = False
@@ -775,7 +840,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         body = await _json(request)
         with transaction(platform.factory) as db:
             row = services.set_tenant_status(db, tenant_id, str(body.get("status", "")),
-                                             actor=auth["username"])
+                                             actor=auth["username"], plane=platform.plane)
             return row.public()
 
     @app.patch("/api/v2/platform/tenants/{tenant_id}")
@@ -825,7 +890,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         body = await _json(request)
         active = bool(body.get("active", False))
         with transaction(platform.factory) as db:
-            services.set_user_active(db, user_id, active, actor=auth["username"], tenant_id=None)
+            services.set_user_active(db, user_id, active, actor=auth["username"],
+                                     tenant_id=None, plane=platform.plane)
         if not active:
             await _drop_user_sessions(platform.state, user_id)
         return {"ok": True}
@@ -836,7 +902,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         body = await _json(request)
         with transaction(platform.factory) as db:
             user = services.set_user_role(db, user_id, str(body.get("role", "")),
-                                          actor=auth["username"], tenant_id=None)
+                                          actor=auth["username"], tenant_id=None,
+                                          plane=platform.plane)
             result = {**user.public(), "roles": services.roles_of(db, user_id)}
         await _drop_user_sessions(platform.state, user_id)
         return result
@@ -898,13 +965,71 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     async def platform_assign_asset(request: Request):
         auth = await current_platform(request, mutate=True, permission="platform.asset.write")
         body = await _json(request)
+        plane = platform.plane
         with transaction(platform.factory) as db:
             result = services.assign_asset(
                 db, address=str(body.get("address", "")),
                 tenant_id=str(body.get("tenant_id", "") or ""),
                 name=str(body.get("name", "") or ""), actor=auth["username"],
-                reassign=bool(body.get("reassign", False)))
+                reassign=bool(body.get("reassign", False)), plane=plane)
         return result
+
+    @app.post("/api/v2/platform/assets/grant")
+    async def platform_grant_asset(request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.asset.write")
+        plane = require_plane()
+        body = await _json(request)
+        tenant_id = str(body.get("tenant_id", "") or "")
+        user_id = str(body.get("user_id", "") or "")
+        asset_id = str(body.get("asset_id", "") or "")
+        with transaction(platform.factory) as db:
+            tenant = db.get(Tenant, tenant_id)
+            asset = db.get(Asset, asset_id)
+            user = db.get(User, user_id)
+            if tenant is None or asset is None or user is None \
+                    or asset.tenant_id != tenant_id or user.tenant_id != tenant_id:
+                raise services.PlatformError("grant_target_missing", "租户、用户或资产不存在", 404)
+            services.grant_asset(
+                db, user_id=user_id, asset_id=asset_id, actor=auth["username"],
+                ttl_seconds=int(body.get("ttl_seconds", 86400 * 30)),
+                tenant_id=tenant_id, actor_user_id=auth["user_id"], plane=plane)
+        return {"ok": True, "level": 1, "user_id": user_id, "asset_id": asset_id}
+
+    @app.post("/api/v2/platform/assets/{asset_id}/reset")
+    async def platform_reset_asset(asset_id: str, request: Request):
+        auth = await current_platform(request, mutate=True,
+                                      permission="platform.asset.write")
+        with transaction(platform.factory) as db:
+            asset = db.get(Asset, asset_id)
+            if asset is None or not asset.address:
+                raise services.PlatformError("asset_not_found", "资产不存在或未配置地址", 404)
+            address = asset.address
+            tenant_of_record = asset.tenant_id
+            cred_id = asset.credential_id
+            if not cred_id:
+                raise services.PlatformError("credential_not_found", "该资产未配置 BMC 凭据", 404)
+            cred = services.read_credential(db, platform.cipher, cred_id, tenant_id=None)
+
+        try:
+            result = await bmc_reset.cold_reset_bmc(
+                address, cred["username"], cred["password"])
+        except bmc_reset.ResetError as exc:
+            with transaction(platform.factory) as db:
+                services.audit(db, auth["username"], "asset.bmc_reset_failed",
+                               tenant_id=tenant_of_record, actor_type="platform",
+                               detail={"asset_id": asset_id, "code": exc.code,
+                                       "scope": "platform"},
+                               trace=request.state.trace)
+            raise services.PlatformError(exc.code, exc.message, 502) from None
+
+        with transaction(platform.factory) as db:
+            services.audit(db, auth["username"], "asset.bmc_reset",
+                           tenant_id=tenant_of_record, actor_type="platform",
+                           detail={"asset_id": asset_id, "code": "ok",
+                                   "scope": "platform"},
+                           trace=request.state.trace)
+        return {"ok": True, "asset_id": asset_id, "address": address,
+                "method": "ipmi-cold-reset", "accepted": result["accepted"]}
 
     @app.get("/api/v2/platform/audit")
     async def platform_audit(request: Request, limit: int = 100, tenant_id: str = ""):

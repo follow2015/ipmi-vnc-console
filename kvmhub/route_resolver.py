@@ -144,19 +144,23 @@ async def proxy_websocket(request: web.Request, sid: str, upstream: str) -> web.
     try:
         worker_cm = client_of(request.app).ws_connect(
             target, protocols=offered, headers=headers,
-            autoping=False, heartbeat=None)
+            autoping=True, heartbeat=None)
         worker = await worker_cm.__aenter__()
     except WSServerHandshakeError as exc:
+        log.warning("worker websocket handshake rejected sid=%s status=%s message=%s",
+                    sid, exc.status, str(exc.message)[:256])
         if exc.status == 401:
             raise web.HTTPUnauthorized(text="worker rejected the console") from None
         if exc.status == 403:
             raise web.HTTPForbidden(text="worker rejected the console") from None
         raise web.HTTPBadGateway(text="worker unavailable") from None
-    except (ClientError, OSError):
+    except (ClientError, OSError) as exc:
+        log.warning("worker websocket unavailable sid=%s error=%s", sid,
+                    str(exc)[:256])
         raise web.HTTPBadGateway(text="worker unavailable") from None
     try:
         agreed = (worker.protocol,) if worker.protocol else ()
-        browser = web.WebSocketResponse(protocols=agreed, autoping=False,
+        browser = web.WebSocketResponse(protocols=agreed, autoping=True,
                                         heartbeat=None)
         await browser.prepare(request)
         tasks = [asyncio.ensure_future(browser_to_worker()),

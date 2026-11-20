@@ -15,6 +15,8 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 from . import common
 from .adapter import MockAdapter
+from .adapters.idrac8 import Idrac8Adapter
+from .adapters.idrac_vnc import IdracVncAdapter
 from .adapters.passthrough import ASSET_PATH as PASSTHROUGH_ASSET_PATH
 from .adapters.passthrough import PassthroughAdapter
 from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, PATH_SESSION,
@@ -152,10 +154,16 @@ document.querySelector('#close').onclick=async()=>{
 connect();"""
 
 REAL_CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<!-- Without a viewport meta a tablet uses a 980px virtual viewport and scales
+     the whole console down; canvas coordinates and touch targets both drift. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>真机 KVM 控制台</title>
 <style>
 :root{color-scheme:dark}
-body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:row;height:100vh;overflow:hidden}
+body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:row;height:100vh;overflow:hidden;-webkit-text-size-adjust:100%}
+/* iOS Chrome/Safari reports the browser chrome inside 100vh; 100dvh keeps the
+   canvas inside the visible area when the address bar collapses. */
+@supports (height:100dvh){body{height:100dvh}}
 /* The picture owns a column of its own. Docking the input controls on the
    left keeps them out of the framebuffer's width and height entirely: even
    collapsed they used to eat the bottom of the window, forcing the picture
@@ -168,8 +176,14 @@ header strong{font-weight:600;white-space:nowrap}
 #frame-age.stale{color:#e8c26a}
 #zoom{color:#7288a6;font-size:12px;white-space:nowrap}
 #spacer{flex:1}
-#stage{flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:8px;min-height:0;position:relative}
-canvas{background:#000;outline:none;flex:none;display:block}
+#stage{flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:8px;min-height:0;position:relative;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+/* Narrow phones cannot read a whole 1024px framebuffer (~31%); a short hint
+   tells the operator how to zoom and pan the local view. It never eats input. */
+#phone-hint{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);background:rgba(9,18,34,.9);border:1px solid #3b5a86;border-radius:14px;padding:5px 12px;color:#cfe0f5;font-size:12px;white-space:nowrap;pointer-events:none;z-index:6;max-width:94vw;overflow:hidden;text-overflow:ellipsis}
+#phone-hint[hidden]{display:none}
+/* noVNC owns mouse/touch gestures on the framebuffer. Without touch-action:none
+   the tablet scrolls or pinch-zooms the page instead of sending a mouse move. */
+canvas{background:#000;outline:none;flex:none;display:block;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
 /* The firmware reports a lost video signal itself. This overlay explains the
    black canvas instead of letting the operator blame the VNC link. It never
    eats pointer events: if the signal returns, the canvas still receives them. */
@@ -178,24 +192,41 @@ canvas{background:#000;outline:none;flex:none;display:block}
 #nosignal .card{max-width:min(560px,82%);padding:18px 22px;border:1px solid #c8a24a;border-radius:10px;background:#141d2b;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)}
 #nosignal .card strong{display:block;font-size:18px;color:#f0cf82;margin-bottom:8px}
 #nosignal .card span{font-size:13px;color:#b9c8dc;line-height:1.6}
-/* The input block docks on the left as a narrow rail. Collapsed it is a
-   44px strip showing only the toggle; expanded it becomes a 300px column.
-   Either way it steals width, never height, so the picture keeps the whole
-   window height and a 100% framebuffer is never squeezed vertically. */
-#inputpanel{flex:0 0 44px;background:#0e192b;border-right:1px solid #24344d;display:flex;flex-direction:column;min-height:0;overflow:hidden}
-#inputpanel:not(.collapsed){flex-basis:300px}
+/* The input panel is a bottom sheet on EVERY device: collapsed it floats as a
+   corner button, expanded it covers the lower part of the window while the
+   framebuffer keeps its FULL width (a side dock squeezed a phone to ~108px).
+   When open, the stage gives up the same height via margin-bottom, so the
+   picture is scaled into the visible top portion instead of hiding its lower
+   half. Desktop, tablet and phone now share one layout and one interaction. */
+:root{--sheet-h:min(48vh,430px)}
+#inputpanel{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:20;background:#0e192b;border-top:1px solid #3b5a86;box-shadow:0 -8px 26px rgba(0,0,0,.55);display:flex;flex-direction:column;min-height:0;overflow:hidden}
+#inputpanel:not(.collapsed){height:var(--sheet-h)}
+#inputpanel.collapsed{left:auto;width:auto;right:16px;bottom:20px;height:auto;background:transparent;border:0;box-shadow:none}
 #inputpanel.collapsed #input-body{display:none}
-#inputpanel.collapsed #input-bar{padding:8px 0;justify-content:center}
-#inputpanel.collapsed #input-toggle{writing-mode:vertical-rl;padding:10px 5px}
+#inputpanel.collapsed #input-bar{background:#1d2f4a;border:1px solid #4a6d9e;border-radius:24px;padding:5px}
+#inputpanel.collapsed #input-toggle{padding:10px 20px}
 #inputpanel.collapsed #input-hint{display:none}
-button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap}
+body.sheet-open #stage{margin-bottom:var(--sheet-h)}
+button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap;touch-action:manipulation}
 button:hover{background:#25405f}
 footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* The input block starts as a single button. Nothing inside it is loaded
    until that button is pressed: the picture gets the whole window first. */
-#input-bar{display:flex;gap:10px;align-items:center;padding:8px 10px;background:#0e192b;border-bottom:1px solid #24344d;flex:0 0 auto}
+#input-bar{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;padding:8px 10px;background:#0e192b;border-bottom:1px solid #24344d;flex:0 0 auto}
 #input-hint{font-size:12px;color:#7288a6;line-height:1.5}
-#input-body{flex:1 1 auto;min-height:0;overflow:auto}
+/* Two sibling tabs switch the sheet between the soft keyboard and the long
+   command box. Only one is mounted at a time, so the text box stays in FULL
+   view at the top of the sheet instead of being pushed below a tall keyboard
+   into a scroll well (where it was effectively unreachable). One layout for
+   every device, no per-resolution branching. */
+#input-tabs{display:flex;gap:6px}
+#input-tabs button{padding:5px 14px;font-size:12px;border-radius:6px;background:#132039;border-color:#2c4266;color:#93a8c4}
+#input-tabs button.on{background:#2b5a86;border-color:#4d8fd0;color:#fff}
+#inputpanel.collapsed #input-tabs{display:none}
+#inputpanel.show-keys #pastebar,#inputpanel.show-paste #softkey{display:none}
+#input-body{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column}
+#softkey{order:1}
+#pastebar{order:2}
 /* Below this the header, the input block and the footer no longer fit at all.
    Nothing can be scaled to make room, so the page scrolls rather than hiding
    the bottom of the keyboard. Pointer mapping survives it: the client measures
@@ -211,40 +242,70 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 #paste-preview-box .ok{color:#8fd6a8}#paste-preview-box .warn{color:#e8c26a;background:#4a3c1a}
 #paste-preview-box .bad{color:#ff9d9d;background:#5a1f1f}#paste-preview-box .skip{color:#8a94a6;text-decoration:line-through}
 #paste-status{margin-top:4px;color:#8fb6e8;min-height:1.4em}
+#paste-danger{margin-top:6px;padding:6px 8px;border:1px solid #a33;border-radius:6px;background:#2a0f12;color:#ff9d9d;font:12px/1.5 ui-monospace,Consolas,monospace}
+#paste-danger:empty{display:none}#paste-danger strong{color:#ffd0d0}
 #pastebar button{padding:4px 10px;font-size:13px}#pastebar button:disabled{opacity:.45;cursor:not-allowed}
-#softkey{border-top:1px solid #24344d;background:#0a1424;padding:5px 12px 6px}
-#softkey .head{display:flex;gap:10px;align-items:center;font-size:12px;color:#7288a6;margin-bottom:5px}
+#softkey{border-top:1px solid #24344d;background:#0a1424;padding:8px 12px 8px}
+#softkey .head{display:flex;gap:10px;align-items:center;font-size:12px;color:#7288a6;margin-bottom:6px}
 #softkey .head strong{color:#e6eef8;font-size:13px;white-space:nowrap}
 #softkey .head .grow{flex:1}
 #softkey .head .hint{color:#8a94a6}
-/* In the left dock the column is only 300px, so the long hint would stack
-   one word per line. Keep the label, drop the prose. */
-#inputpanel:not(.collapsed) #softkey .head .hint{display:none}
-#inputpanel:not(.collapsed) #input-hint{display:none}
-#softkey button{font:12px/1.2 ui-monospace,Consolas,monospace}
+#sk-modstate.on{color:#7fe0a6;font-weight:600}
+#input-hint{display:none}
+#softkey button{font:13px/1.2 ui-monospace,Consolas,monospace}
 #sk-body.hidden{display:none}
-.skrow{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:3px}
-.skrow.macros{flex-wrap:wrap;gap:4px;margin-bottom:4px}
-.skrow.macros .sk{flex:0 0 auto;padding:4px 10px}
-/* A fixed minimum width lets keys wrap into a readable grid in the narrow
-   dock instead of being squeezed into vertical slivers; --u still widens the
-   space/shift keys, and flex-grow shares any leftover width evenly. */
-.sk{flex:var(--u,1) 1 26px;min-width:26px;padding:5px 2px;border:1px solid #2f4568;background:#182a44;color:#dbe7f6;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center}
-.sk:hover:enabled{background:#23405f}
-.sk:active:enabled{background:#2e577f}
+/* Page tabs. The keyboard used to stack every group into one tiny grid;
+   splitting into pages keeps each key large and the panel short. */
+.sktabs{display:flex;gap:4px;margin-bottom:8px;border-bottom:1px solid #24344d;padding-bottom:6px}
+.sktab{flex:1;padding:6px 2px;font:600 12px/1.2 system-ui,sans-serif;border:1px solid #2b4266;background:#12223a;color:#9ab4d6;border-radius:6px;min-height:32px}
+.sktab:hover{background:#1a2f4d}
+.sktab.on{background:#21528a;border-color:#3f7cc0;color:#fff;box-shadow:inset 0 -2px 0 #6fb0ff}
+#sk-body .skrow{display:none}
+#sk-body[data-page="chars"] .skrow[data-skpage="chars"],
+#sk-body[data-page="symbols"] .skrow[data-skpage="symbols"],
+#sk-body[data-page="func"] .skrow[data-skpage="func"],
+#sk-body[data-page="nav"] .skrow[data-skpage="nav"],
+#sk-body[data-page="macros"] .skrow[data-skpage="macros"]{display:flex}
+.skrow{flex-wrap:wrap;gap:5px;margin-bottom:5px}
+.skrow.macros{gap:6px;margin-bottom:2px}
+/* Keys share leftover width evenly; --u still widens space/shift. No
+   ellipsis: a truncated label reads as a broken key. */
+.sk{flex:var(--u,1) 1 0;min-width:0;min-height:34px;padding:6px 2px;border:1px solid #36507a;background:#1b2f4d;color:#eaf1fb;border-radius:6px;cursor:pointer;text-align:center;transition:background .08s,transform .05s}
+.sk:hover:enabled{background:#2a4a75}
+.sk:active:enabled{background:#37699f;transform:translateY(1px)}
 .sk:disabled{opacity:.4;cursor:not-allowed}
-.sk[data-mod].on{background:#2f6d4f;border-color:#4fbf87;color:#eafff3;box-shadow:inset 0 0 0 1px #4fbf87}
-.sk[data-level=unverified]{border-bottom:1px dotted #c8a24a}
-.sk[data-level=known_broken]{border-color:#a2473f;color:#ffc9c4}
-#sk-status{font-size:12px;color:#8fb6e8;min-height:1.4em}
+.sk[data-mod]{background:#243b60;border-color:#41659a;color:#d9e8ff}
+.sk[data-mod].on{background:#2f8a5f;border-color:#5fd39a;color:#eafff3;box-shadow:inset 0 0 0 1px #5fd39a}
+.skrow[data-skpage="func"] .sk{background:#2b2a52;border-color:#4b4880;color:#e4e1ff}
+.skrow[data-skpage="nav"] .sk{background:#153a48;border-color:#2f6f86;color:#dffaff}
+.skrow.macros .sk{flex:0 0 auto;padding:6px 12px;background:#3a2a52;border-color:#6a4f9a;color:#f0e7ff;font-size:12px}
+.sk[data-level=unverified]{border-bottom:2px dotted #c8a24a}
+.sk[data-level=known_broken]{border-color:#b05148;color:#ffc9c4}
+#sk-status{font-size:12px;color:#8fb6e8;min-height:1.4em;margin-top:2px}
+/* Touch targets stay large and the iOS address bar must not trigger input
+   zoom (all inputs are >=16px). */
+@media (pointer:coarse){
+  header{padding:8px 10px;gap:8px}
+  #status{font-size:12px}
+  button{min-height:44px;padding:8px 14px}
+  input,textarea,select{font-size:16px}
+  input[type=number]{width:72px}
+}
+/* Phones: bigger touch targets and keep the hint clear of the floating
+   toggle. Layout itself is shared by every device (see #inputpanel above). */
+@media (pointer:coarse) and (max-width:700px){
+  .sk{min-height:44px;padding:10px 2px;font-size:15px}
+  .skrow.macros .sk{padding:10px;font-size:13px}
+  #phone-hint{bottom:74px}
+}
 </style>
 <div id="work">
 <header><strong id="asset-label">真机 KVM 控制台</strong><span id="status">正在连接…</span><span id="frame-age" title="最近一次从主机侧收到数据距今多久。这台固件即使在画面静止时也会持续回送小包，所以这个数字持续上涨通常说明链路出了问题；反过来，数字正常但画面不动，说明是主机自己停住了（例如卡在 POST）。"></span><span id="zoom" title="画面按这个比例显示。自适应时窗口放不下 1:1 的帧缓冲，画面会等比缩小以完整显示；缩小时鼠标坐标仍按原比例换算。"></span><span id="spacer"></span><button id="zoom-mode" title="在完整显示与 100% 原始像素之间切换。默认 100% 原始像素最清晰；窗口放不下时画面区可滚动，鼠标坐标仍随滚动换算。">画面自适应</button><button id="close">结束会话</button></header>
-<div id="stage"><canvas id="screen" width="1024" height="768" tabindex="0"></canvas><div id="nosignal" hidden><div class="card"><strong>无视频信号 · 系统可能未开机</strong><span>主机没有输出画面。这不是 VNC 链路故障；本页未接入电源状态，请到 BMC 电源管理页确认设备是否已上电。</span></div></div></div>
+<div id="stage"><canvas id="screen" width="1024" height="768" tabindex="0"></canvas><div id="phone-hint" hidden>双指捏合缩放 · 双指拖动画面 · 单指操作远端</div><div id="nosignal" hidden><div class="card"><strong>无视频信号 · 系统可能未开机</strong><span>主机没有输出画面。这不是 VNC 链路故障；本页未接入电源状态，请到 BMC 电源管理页确认设备是否已上电。</span></div></div></div>
 <footer title="画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。">画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。</footer>
 </div><!-- /work -->
-<aside id="inputpanel" class="collapsed">
-<div id="input-bar"><button id="input-toggle" type="button" title="展开长命令输入与软键盘（首次点击才加载键位表）">⌨ 输入</button><span id="input-hint">输入控制停靠在左侧，点击展开</span></div>
+<aside id="inputpanel" class="collapsed show-keys">
+<div id="input-bar"><button id="input-toggle" type="button" title="展开输入面板（首次点击才加载键位表）">⌨ 输入</button><span id="input-tabs"><button type="button" id="tab-keys" class="on">软键盘</button><button type="button" id="tab-paste">长命令</button></span><span id="input-hint">点击展开</span></div>
 <div id="input-body">
 <div id="pastebar">
 <div class="row"><strong>长命令输入</strong><span>粘贴后先预检；字符按实测可靠性着色</span><span class="grow"></span>
@@ -252,35 +313,42 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 <label>按住 <input id="paste-hold" type="number" value="20" min="0" max="200"> ms</label>
 <button id="paste-preview">预检</button><button id="paste-send" disabled>发送到 KVM</button><button id="paste-stop" disabled>停止</button><button id="paste-clear">清空</button></div>
 <textarea id="paste-text" rows="2" placeholder="把长命令粘贴到这里。含管道符的命令在该固件上会变形，预检会指出。"></textarea>
-<div id="paste-preview-box"></div><div id="paste-status"></div>
+<div id="paste-preview-box"></div><div id="paste-status"></div><div id="paste-danger"></div>
 </div>
 <div id="softkey">
-<div class="head"><strong>软键盘（US QWERTY）</strong><span class="hint">画面上直接键入会丢 Shift（两台真机实测），大写与符号请用这里或上面的输入框</span><span class="grow"></span><button id="softkey-toggle">收起</button></div>
+<div class="head"><strong>软键盘</strong><span class="hint" id="sk-modstate">画面上直接键入会丢 Shift · 请用下方按键输入</span><span class="grow"></span><button id="softkey-toggle">收起</button></div>
+<div class="sktabs" id="sk-tabs"><button type="button" class="sktab on" data-skpage="chars">字符</button><button type="button" class="sktab" data-skpage="symbols">符号</button><button type="button" class="sktab" data-skpage="func">功能</button><button type="button" class="sktab" data-skpage="nav">导航</button><button type="button" class="sktab" data-skpage="macros">宏</button></div>
 <div id="sk-body">
-<div class="skrow macros" id="sk-macros"></div>
-<div class="skrow">
+<div class="skrow macros" id="sk-macros" data-skpage="macros"></div>
+<div class="skrow" data-skpage="func">
 <button type="button" class="sk" data-send="esc" style="--u:1.3">Esc</button>
 <button type="button" class="sk" data-send="f1">F1</button><button type="button" class="sk" data-send="f2">F2</button><button type="button" class="sk" data-send="f3">F3</button><button type="button" class="sk" data-send="f4">F4</button><button type="button" class="sk" data-send="f5">F5</button><button type="button" class="sk" data-send="f6">F6</button><button type="button" class="sk" data-send="f7">F7</button><button type="button" class="sk" data-send="f8">F8</button><button type="button" class="sk" data-send="f9">F9</button><button type="button" class="sk" data-send="f10">F10</button><button type="button" class="sk" data-send="f11">F11</button><button type="button" class="sk" data-send="f12">F12</button>
 </div>
-<div class="skrow">
+<div class="skrow" data-skpage="symbols">
+<button type="button" class="sk" data-send="!">!</button><button type="button" class="sk" data-send="@">@</button><button type="button" class="sk" data-send="#">#</button><button type="button" class="sk" data-send="$">$</button><button type="button" class="sk" data-send="%">%</button><button type="button" class="sk" data-send="^">^</button><button type="button" class="sk" data-send="&">&amp;</button><button type="button" class="sk" data-send="*">*</button><button type="button" class="sk" data-send="(">(</button><button type="button" class="sk" data-send=")">)</button><button type="button" class="sk" data-send="_">_</button><button type="button" class="sk" data-send="+">+</button>
+</div>
+<div class="skrow" data-skpage="symbols">
+<button type="button" class="sk" data-send="{">{</button><button type="button" class="sk" data-send="}">}</button><button type="button" class="sk" data-send="[">[</button><button type="button" class="sk" data-send="]">]</button><button type="button" class="sk" data-send="|">|</button><button type="button" class="sk" data-send="\\">\\</button><button type="button" class="sk" data-send=":">:</button><button type="button" class="sk" data-send=";">;</button><button type="button" class="sk" data-send="'">'"</button><button type="button" class="sk" data-send="&quot;">&quot;</button><button type="button" class="sk" data-send="<">&lt;</button><button type="button" class="sk" data-send=">">&gt;</button><button type="button" class="sk" data-send="?">?</button><button type="button" class="sk" data-send="~">~</button>
+</div>
+<div class="skrow" data-skpage="chars">
 <button type="button" class="sk" data-send="`">`</button><button type="button" class="sk" data-send="1">1</button><button type="button" class="sk" data-send="2">2</button><button type="button" class="sk" data-send="3">3</button><button type="button" class="sk" data-send="4">4</button><button type="button" class="sk" data-send="5">5</button><button type="button" class="sk" data-send="6">6</button><button type="button" class="sk" data-send="7">7</button><button type="button" class="sk" data-send="8">8</button><button type="button" class="sk" data-send="9">9</button><button type="button" class="sk" data-send="0">0</button><button type="button" class="sk" data-send="-">-</button><button type="button" class="sk" data-send="=">=</button><button type="button" class="sk" data-send="bksp" style="--u:2">Bksp</button>
 </div>
-<div class="skrow">
+<div class="skrow" data-skpage="chars">
 <button type="button" class="sk" data-send="tab" style="--u:1.6">Tab</button>
 <button type="button" class="sk" data-send="q">q</button><button type="button" class="sk" data-send="w">w</button><button type="button" class="sk" data-send="e">e</button><button type="button" class="sk" data-send="r">r</button><button type="button" class="sk" data-send="t">t</button><button type="button" class="sk" data-send="y">y</button><button type="button" class="sk" data-send="u">u</button><button type="button" class="sk" data-send="i">i</button><button type="button" class="sk" data-send="o">o</button><button type="button" class="sk" data-send="p">p</button><button type="button" class="sk" data-send="[">[</button><button type="button" class="sk" data-send="]">]</button>
 <button type="button" class="sk" data-send="\\" style="--u:1.4">\\</button>
 </div>
-<div class="skrow">
+<div class="skrow" data-skpage="chars">
 <button type="button" class="sk" data-send="caps" style="--u:1.8">Caps</button>
 <button type="button" class="sk" data-send="a">a</button><button type="button" class="sk" data-send="s">s</button><button type="button" class="sk" data-send="d">d</button><button type="button" class="sk" data-send="f">f</button><button type="button" class="sk" data-send="g">g</button><button type="button" class="sk" data-send="h">h</button><button type="button" class="sk" data-send="j">j</button><button type="button" class="sk" data-send="k">k</button><button type="button" class="sk" data-send="l">l</button><button type="button" class="sk" data-send=";">;</button><button type="button" class="sk" data-send="'">'</button>
 <button type="button" class="sk" data-send="enter" style="--u:1.8">Enter</button>
 </div>
-<div class="skrow">
+<div class="skrow" data-skpage="chars">
 <button type="button" class="sk" data-send="lshift" data-mod="1" style="--u:2.2">Shift</button>
 <button type="button" class="sk" data-send="z">z</button><button type="button" class="sk" data-send="x">x</button><button type="button" class="sk" data-send="c">c</button><button type="button" class="sk" data-send="v">v</button><button type="button" class="sk" data-send="b">b</button><button type="button" class="sk" data-send="n">n</button><button type="button" class="sk" data-send="m">m</button><button type="button" class="sk" data-send=",">,</button><button type="button" class="sk" data-send=".">.</button><button type="button" class="sk" data-send="/">/</button>
 <button type="button" class="sk" data-send="rshift" data-mod="1" style="--u:2.2">Shift</button>
 </div>
-<div class="skrow">
+<div class="skrow" data-skpage="chars">
 <button type="button" class="sk" data-send="lctrl" data-mod="1" style="--u:2.2">Ctrl</button>
 <button type="button" class="sk" data-send="lwin" data-mod="1" style="--u:2.2">Win</button>
 <button type="button" class="sk" data-send="lalt" data-mod="1" style="--u:2.2">Alt</button>
@@ -288,7 +356,7 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 <button type="button" class="sk" data-send="ralt" data-mod="1" style="--u:2.2">Alt</button>
 <button type="button" class="sk" data-send="rctrl" data-mod="1" style="--u:2.2">Ctrl</button>
 </div>
-<div class="skrow">
+<div class="skrow" data-skpage="nav">
 <button type="button" class="sk" data-send="ins">Ins</button><button type="button" class="sk" data-send="home">Home</button><button type="button" class="sk" data-send="pgup">PgUp</button><button type="button" class="sk" data-send="pgdn">PgDn</button><button type="button" class="sk" data-send="del">Del</button><button type="button" class="sk" data-send="end">End</button><button type="button" class="sk" data-send="left">&#8592;</button><button type="button" class="sk" data-send="down">&#8595;</button><button type="button" class="sk" data-send="up">&#8593;</button><button type="button" class="sk" data-send="right">&#8594;</button>
 </div>
 <div id="sk-status"></div>
@@ -321,6 +389,8 @@ REAL_CONSOLE_JS = """'use strict';
   var nosignalEl = document.getElementById('nosignal');
   var inputPanel = document.getElementById('inputpanel');
   var inputToggle = document.getElementById('input-toggle');
+  var tabKeys = document.getElementById('tab-keys');
+  var tabPaste = document.getElementById('tab-paste');
   var zoomModeBtn = document.getElementById('zoom-mode');
   var assetLabel = '真机 KVM';
   var desktopName = '';
@@ -330,6 +400,13 @@ REAL_CONSOLE_JS = """'use strict';
   // and the left dock no longer steals window height, so the only cost is a
   // scrollable stage on small windows -- which the pointer path handles.
   var zoomMode = 'oneone';   // 'fit' or 'oneone'
+  // A phone's viewport is ~390px; fitting a whole 1024px framebuffer there
+  // shrinks it to ~31%, which is unreadable. iPad (768px+) is unaffected.
+  // On a narrow touch device open at a readable zoom and let the operator pan
+  // with two fingers; one finger still drives the remote pointer as before.
+  var phoneMode = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches
+    && Math.min(window.innerWidth || 9999, window.innerHeight || 9999) < 700);
+  var phoneZoom = 0.64;      // fraction of native pixels on a phone; <=1 keeps text crisp
   var ended = false;
   var explained = false;
   // The gateway closes this socket with 4001 when the BMC came back from a
@@ -419,16 +496,42 @@ REAL_CONSOLE_JS = """'use strict';
   // while an unbroken pattern is reported as exhausted instead of looping.
   var MAX_GEOMETRY_RELOADS = 4;
   var GEOMETRY_WINDOW_MS = 60000;
-  var KEY = '__kvm_recovery_v1';
+  var LEGACY_KEY = '__kvm_recovery_v1';
+  // Path mode puts every ticket under the same origin, and on tablets the
+  // same tab/window is routinely reused for successive tickets. A single
+  // shared key makes a fresh ticket inherit the previous ticket's closed or
+  // exhausted flag, so start() never runs and no socket is ever opened. Scope
+  // the stored marker to a per-session key so tickets are physically isolated,
+  // not merely compared by a field that a reused browsing context can preserve.
+  function currentSessionId() {
+    var path = location.pathname || '';
+    var match = path.match(/\\/s\\/([0-9a-f]{32})(?:\\/|$)/);
+    if (match) return match[1];
+    var label = (location.hostname || '').split('.')[0] || '';
+    match = label.match(/^w[0-9a-z-]{1,32}-([0-9a-f]{32})$/);
+    if (match) return match[1];
+    return location.host || '';
+  }
+  var SESSION_ID = currentSessionId();
+  // One key per ticket. An unknown id still gets a stable fallback so the
+  // host-mode harness (which has no /s/<sid> path) keeps its single bucket.
+  var KEY = '__kvm_recovery_v2_' + (SESSION_ID || 'host');
   var EXHAUSTED_TEXT = '连接已断开，自动重连已用尽。请返回 Manager 查看会话状态并重新申请。';
   function readRecovery() {
     try { return JSON.parse(sessionStorage.getItem(KEY) || '{}') || {}; }
     catch (error) { return {}; }
   }
   function writeRecovery(data) {
+    if (SESSION_ID) data.sid = SESSION_ID;
     try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (error) {}
   }
+  // Drop the pre-v2 shared key so an old marker can never be picked up again.
+  try { sessionStorage.removeItem(LEGACY_KEY); } catch (error) {}
   var rec = readRecovery();
+  if (SESSION_ID && rec.sid !== SESSION_ID) {
+    rec = { sid: SESSION_ID };
+    writeRecovery(rec);
+  }
   var stopped = false;
   // localize_console() flips this on only under /s/{sid}/. Host mode keeps
   // the historical reload-only path and its existing behavioural harness.
@@ -714,6 +817,28 @@ REAL_CONSOLE_JS = """'use strict';
   var pasteKeymap = null;
   var pastePlan = null;
   var pasteAbort = false;
+  // Destructive-command preflight. Detection is client-side only: the pasted
+  // text is NEVER sent to the platform or recorded in audit — only a character
+  // count and the matched rule names are kept (design §6). A match is a loud
+  // red warning + a second-confirm on send, not a hard block.
+  var pasteDangerRules = [
+    { re: /(^|[\\s;&|])rm\\s+(-[a-zA-Z]*f[a-zA-Z]*\\s+)+(\\/|--no-preserve-root|\\*)/i,
+      why: '递归强制删除根目录或整盘文件，可能瞬间摧毁系统' },
+    { re: /(^|[\\s;&|])rm\\s+-rf?\\s+\\//i,
+      why: '强制递归删除根目录，机器将无法启动' },
+    { re: /mkfs(\\.[a-z0-9]+)?\\s+/i,
+      why: '格式化磁盘分区，设备上所有数据将被清除' },
+    { re: /dd\\s+[^;&|]*of=\\/dev\\//i,
+      why: '直接写原始块设备，可能覆盖分区表或整块磁盘' },
+    { re: /(^|[\\s;&|])(shutdown|poweroff|halt)\\b/i,
+      why: '关闭系统，会中断当前 BMC 会话与业务' },
+    { re: /(^|[\\s;&|])reboot\\b/i,
+      why: '重启系统，会中断当前 BMC 会话与业务' },
+    { re: /chmod\\s+-R\\s+777\\s+\\//i,
+      why: '递归放开根目录权限，会破坏系统安全边界' }
+  ];
+  var pasteDangers = [];
+  var pasteDangerConfirmed = false;
   // One paced queue serves both input surfaces. The text box and the soft
   // keyboard emit the same 18-byte KeyEvent frames; sharing the queue means a
   // click during a long paste cannot interleave with it. On a shell, characters
@@ -726,6 +851,7 @@ REAL_CONSOLE_JS = """'use strict';
   var pasteText = document.getElementById('paste-text');
   var pasteBox = document.getElementById('paste-preview-box');
   var pasteStatus = document.getElementById('paste-status');
+  var pasteDanger = document.getElementById('paste-danger');
   var pastePreviewBtn = document.getElementById('paste-preview');
   var pasteSendBtn = document.getElementById('paste-send');
   var pasteStopBtn = document.getElementById('paste-stop');
@@ -819,7 +945,26 @@ REAL_CONSOLE_JS = """'use strict';
     pastePlan.warnings.forEach(function (w) { lines.push('· ' + w.message); });
     if (!pasteReady()) lines.push('· 控制台尚未就绪，发送按钮保持禁用。');
     pasteStatusText(lines.join(' '));
+    // Destructive-command semantics: list each matched rule in red with its
+    // risk. This is additive to the per-character colouring above.
+    pasteDangers = [];
+    for (var d = 0; d < pasteDangerRules.length; d += 1) {
+      if (pasteDangerRules[d].re.test(text)) pasteDangers.push(pasteDangerRules[d]);
+    }
+    pasteDangerConfirmed = false;
+    if (pasteDangers.length) {
+      var dhtml = '<strong>危险命令预检：命中 ' + pasteDangers.length + ' 项，请确认后再发送</strong>';
+      pasteDangers.forEach(function (rule) {
+        dhtml += '<br>· ' + pasteEscapeSafe(rule.why);
+      });
+      pasteDanger.innerHTML = dhtml;
+    } else {
+      pasteDanger.textContent = '';
+    }
     pasteSendBtn.disabled = pastePlan.strokes.length === 0 || !pasteReady();
+  }
+  function pasteEscapeSafe(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
   function pasteFrame(usage, down) {
     // Same wire layout as insyde_messages.build_key_event: 18 bytes, type 4.
@@ -906,6 +1051,15 @@ REAL_CONSOLE_JS = """'use strict';
       return;
     }
     if (pasteActive) { pasteStatusText('上一次发送还在进行，请先停止'); return; }
+    // Dangerous commands need an explicit second confirmation before any
+    // frame leaves the browser. The text itself is never echoed or audited.
+    if (pasteDangers.length && !pasteDangerConfirmed) {
+      pasteDangerConfirmed = true;
+      pasteSendBtn.textContent = '确认发送危险命令';
+      pasteStatusText('命中危险命令：再次点「确认发送危险命令」才真正发送；修改文本会取消确认。');
+      return;
+    }
+    pasteSendBtn.textContent = '发送到 KVM';
     var frames = pasteFrames();
     pasteAbort = false;
     pasteActive = true;
@@ -930,15 +1084,41 @@ REAL_CONSOLE_JS = """'use strict';
   document.getElementById('paste-clear').onclick = function () {
     pasteText.value = '';
     pastePlan = null;
+    pasteDangers = [];
+    pasteDangerConfirmed = false;
+    pasteDanger.textContent = '';
+    pasteSendBtn.textContent = '发送到 KVM';
     pasteSendBtn.disabled = true;
     pasteBox.textContent = '';
     pasteStatusText('已清空输入内容');
   };
   pasteText.addEventListener('input', function () {
     pastePlan = null;
+    pasteDangers = [];
+    pasteDangerConfirmed = false;
+    pasteDanger.textContent = '';
+    pasteSendBtn.textContent = '发送到 KVM';
     pasteSendBtn.disabled = true;
     pasteBox.textContent = '';
   });
+  // The vendor noVNC client attaches its keyboard handler to `document` and
+  // turns every keydown into a KeyEvent for the remote host. Without a guard,
+  // typing into our own text fields is swallowed (the key goes to the remote
+  // machine, not the field) while paste still works — reported as "cannot type
+  // any text, but paste works, and send stays disabled". Stop these fields'
+  // key events from bubbling to that global handler. We deliberately do NOT
+  // preventDefault, so the character is still inserted normally, and we do NOT
+  // touch window/document or the canvas, so real remote keyboard input (which
+  // needs canvas focus) keeps working exactly as before.
+  function isolateFieldKeys(field) {
+    if (!field) return;
+    ['keydown', 'keyup', 'keypress'].forEach(function (type) {
+      field.addEventListener(type, function (event) { event.stopPropagation(); }, false);
+    });
+  }
+  isolateFieldKeys(pasteText);
+  isolateFieldKeys(document.getElementById('paste-gap'));
+  isolateFieldKeys(document.getElementById('paste-hold'));
   var keymapRequested = false;
   function loadKeymap() {
     if (keymapRequested) return;
@@ -977,6 +1157,9 @@ REAL_CONSOLE_JS = """'use strict';
   var skToggle = document.getElementById('softkey-toggle');
   var skMacroRow = document.getElementById('sk-macros');
   var skStatusEl = document.getElementById('sk-status');
+  var skModStateEl = document.getElementById('sk-modstate');
+  var skTabs = document.getElementById('sk-tabs');
+  var SK_PAGE_KEY = 'kvmhub.softkey.page';
   var skKeys = [].slice.call(document.querySelectorAll('#softkey [data-send]'));
   var skLatched = {};
   var SK_OPEN_KEY = 'kvmhub.softkey.open';
@@ -1058,6 +1241,13 @@ REAL_CONSOLE_JS = """'use strict';
       if (skLatched[token]) button.classList.add('on');
       else button.classList.remove('on');
     });
+    var down = skModifiersDown();
+    if (skModStateEl) {
+      skModStateEl.textContent = down.length
+        ? '已按住 ' + down.map(skPretty).join(' + ') + ' · 再点一个键生效'
+        : '画面上直接键入会丢 Shift · 请用下方按键输入';
+      skModStateEl.className = down.length ? 'hint on' : 'hint';
+    }
   }
   function skRelease() {
     Object.keys(skLatched).forEach(function (name) { skLatched[name] = false; });
@@ -1119,6 +1309,31 @@ REAL_CONSOLE_JS = """'use strict';
       button.disabled = !live;
     });
   }
+  // Tabs replace the old single tall grid: one group is visible at a time so
+  // keys stay large and the panel stays short. The choice is remembered.
+  function skSetPage(page) {
+    var tabNodes = skTabs.querySelectorAll
+      ? skTabs.querySelectorAll('[data-skpage]')
+      : document.querySelectorAll('#sk-tabs [data-skpage]');
+    var tabs = [].slice.call(tabNodes);
+    if (!tabs.some(function (t) { return t.getAttribute('data-skpage') === page; })) page = 'chars';
+    skBody.setAttribute('data-page', page);
+    tabs.forEach(function (t) {
+      if (t.getAttribute('data-skpage') === page) t.classList.add('on');
+      else t.classList.remove('on');
+    });
+    try { localStorage.setItem(SK_PAGE_KEY, page); } catch (error) {}
+  }
+  var rememberedPage = 'chars';
+  try { rememberedPage = localStorage.getItem(SK_PAGE_KEY) || 'chars'; } catch (error) {}
+  skSetPage(rememberedPage);
+  skTabs.addEventListener('click', function (event) {
+    var tab = event.target && event.target.closest ? event.target.closest('[data-skpage]') : null;
+    if (!tab) return;
+    skSetPage(tab.getAttribute('data-skpage'));
+    skRelease();
+    fitPicture();
+  });
   function skSetOpen(open) {
     if (open) skBody.classList.remove('hidden');
     else skBody.classList.add('hidden');
@@ -1144,21 +1359,57 @@ REAL_CONSOLE_JS = """'use strict';
     try { localStorage.setItem(SK_OPEN_KEY, open ? '1' : '0'); } catch (error) {}
     fitPicture();
   };
+  // The keyboard and the long-command box share the sheet but are mutually
+  // exclusive: only one is mounted at a time. That keeps the text area in full
+  // view (instead of below a tall keyboard, out of reach) and gives each pane
+  // the whole sheet height on every device. One interaction, no branching.
+  function showInputTab(tab) {
+    var paste = tab === 'paste';
+    inputPanel.classList.toggle('show-paste', paste);
+    inputPanel.classList.toggle('show-keys', !paste);
+    tabPaste.classList.toggle('on', paste);
+    tabKeys.classList.toggle('on', !paste);
+    // The long-command box needs the HID table for preflight too; the first
+    // sheet expansion already loads it, but a direct tab click must be safe.
+    if (paste && !inputOpened) {
+      inputOpened = true;
+      loadKeymap();
+    }
+    fitPicture();
+  }
+  tabKeys.onclick = function () { showInputTab('keys'); };
+  tabPaste.onclick = function () { showInputTab('paste'); };
+
   // The whole input block starts as this one button. Fetching the HID table
   // here means an operator who never types never spends a request on it, and
   // the buttons cannot be pressed before the table that defines them exists.
   inputToggle.onclick = function () {
     var collapsed = inputPanel.classList.toggle('collapsed');
     inputToggle.textContent = collapsed ? '⌨ 输入' : '⌨ 收起';
+    // The sheet shares the window with the picture: when it opens the stage
+    // gives up the same height so the framebuffer scales into the top area and
+    // stays fully visible (never hidden behind the keyboard).
+    document.body.classList.toggle('sheet-open', !collapsed);
+    // Restore the operator's normal stage alignment when the sheet closes;
+    // the sheet-open fit branch had forced centred/fixed for the short view.
+    if (collapsed) setZoomMode(zoomMode);
     var hint = document.getElementById('input-hint');
     if (hint) hint.textContent = collapsed
-      ? '停靠在左侧，点击展开（首次点击才加载键位表）'
-      : '长命令输入与软键盘只发按键帧';
+      ? '点此展开键盘（首次点击才加载键位表）'
+      : '用「软键盘 / 长命令」切换；画面缩到上方';
     if (!collapsed && !inputOpened) {
       inputOpened = true;
       loadKeymap();
+      // Opening the sheet is an explicit intent to type: show the keys right
+      // away instead of leaving a second collapsed layer to discover. Only
+      // relevant on the keyboard tab; the long-command tab needs no keys open.
+      if (inputPanel.classList.contains('show-keys')) {
+        skSetOpen(true);
+        try { localStorage.setItem(SK_OPEN_KEY, '1'); } catch (error) {}
+      }
     }
     fitPicture();
+    requestAnimationFrame(fitPicture);
   };
   skRoot.addEventListener('click', function (event) {
     var target = event.target;
@@ -1279,6 +1530,27 @@ REAL_CONSOLE_JS = """'use strict';
   var lastScale = 1;
   function fitPicture() {
     if (!rfb || !rfb._display || !rfb._display._fb_width) return;
+    // While the bottom sheet is open the stage has already shrunk (margin on
+    // the stage). Fit the framebuffer into whatever space is left so the WHOLE
+    // picture stays visible above the keyboard, on every device, regardless of
+    // the remembered zoom mode or the phone readable-zoom floor. Closing the
+    // sheet restores the operator's normal mode on the next fitPicture().
+    if (document.body.classList.contains('sheet-open')) {
+      var sW = stage.clientWidth - STAGE_PAD * 2;
+      var sH = stage.clientHeight - STAGE_PAD * 2;
+      if (sW < 32 || sH < 32) return;
+      var sRatio = 0;
+      try { sRatio = rfb._display.autoscale(sW, sH, true); }
+      catch (error) { return; }
+      if (rfb._mouse) rfb._mouse._scale = sRatio;
+      lastScale = sRatio || 1;
+      stage.setAttribute('data-scale', lastScale.toFixed(3));
+      stage.style.overflow = 'hidden';
+      stage.style.justifyContent = 'center';
+      stage.style.alignItems = 'center';
+      if (zoomEl) zoomEl.textContent = lastScale < 0.995 ? '画面 ' + Math.round(lastScale * 100) + '%' : '';
+      return;
+    }
     if (zoomMode === 'oneone') {
       // The vendor client's autoscale wrote CSS width/height only. Clearing
       // them restores 1:1 without touching the bitmap. The vendor pointer
@@ -1300,7 +1572,19 @@ REAL_CONSOLE_JS = """'use strict';
     if (availW < 32 || availH < 32) return;
     var ratio = 0;
     try {
-      ratio = rfb._display.autoscale(availW, availH, true);
+      if (phoneMode) {
+        // Fit is a floor, not the ceiling. Feed the vendor's own autoscale a
+        // virtual viewport at least as large as the readable phone zoom, so
+        // it still computes the CSS size AND the ratio with its own arithmetic
+        // (no hand-rolled mapping that could drift from the pointer path).
+        var fbW = rfb._display._fb_width;
+        var fbH = rfb._display._fb_height;
+        var vw = Math.max(availW, Math.round(fbW * phoneZoom));
+        var vh = Math.max(availH, Math.round(fbH * phoneZoom));
+        ratio = rfb._display.autoscale(vw, vh, true);
+      } else {
+        ratio = rfb._display.autoscale(availW, availH, true);
+      }
       if (rfb._mouse) rfb._mouse._scale = ratio;
     } catch (error) { return; }
     lastScale = ratio || 1;
@@ -1311,27 +1595,36 @@ REAL_CONSOLE_JS = """'use strict';
   }
   function setZoomMode(mode) {
     zoomMode = mode;
-    if (mode === 'oneone') {
-      // Flex centring a child larger than its container makes the top and
-      // left unreachable. Align to the origin and let the stage scroll.
+    // A phone at readable zoom (0.64 => 655px wide canvas) is larger than the
+    // ~337px stage, so it must scroll from the origin like the 100% mode does;
+    // centring would make the top and left edges unreachable. A tablet fit
+    // still centres, as before.
+    if (mode === 'oneone' || phoneMode) {
       stage.style.overflow = 'auto';
       stage.style.justifyContent = 'flex-start';
       stage.style.alignItems = 'flex-start';
       stage.scrollLeft = 0;
       stage.scrollTop = 0;
-      zoomModeBtn.textContent = '画面自适应';
     } else {
       stage.style.overflow = '';
       stage.style.justifyContent = '';
       stage.style.alignItems = '';
-      zoomModeBtn.textContent = '画面 100%';
     }
+    // The label always names the mode the click will switch TO, regardless of
+    // how the stage is aligned in the current mode.
+    zoomModeBtn.textContent = mode === 'oneone' ? '画面自适应' : '画面 100%';
     fitPicture();
   }
   zoomModeBtn.onclick = function () {
     setZoomMode(zoomMode === 'fit' ? 'oneone' : 'fit');
   };
   setZoomMode('oneone');
+  // On a tablet, a 1024x768 framebuffer at native pixels needs panning and
+  // looks like a blank/clipped picture. Open scaled to fit so the whole KVM
+  // image is visible on first load; the toggle still reaches native pixels.
+  if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
+    setZoomMode('fit');
+  }
   // The panel changes height when the keyboard opens, when the operator drags
   // the paste box's own resize grip, and when the window changes. One observer
   // on the picture's box catches all three, because the box is what is left
@@ -1351,6 +1644,55 @@ REAL_CONSOLE_JS = """'use strict';
   })();
   window.addEventListener('resize', fitPicture);
 
+  // On a phone, zoomed canvas is wider than the stage and must be panned, and
+  // the readable default still needs a way to reach a closer look. noVNC owns
+  // single-finger gestures on the canvas (they drive the remote pointer), so
+  // only a two-finger gesture is intercepted here, in the capture phase, with
+  // preventDefault: pinch changes phoneZoom, drag scrolls the stage. Nothing
+  // here touches the pointer->BMC path, so clicks stay exact at any zoom.
+  if (phoneMode) {
+    var hint = document.getElementById('phone-hint');
+    var pinch = null;
+    function dist2(a, b) {
+      var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    function center2(touches) {
+      return { x: (touches[0].clientX + touches[1].clientX) / 2,
+               y: (touches[0].clientY + touches[1].clientY) / 2 };
+    }
+    stage.addEventListener('touchstart', function (event) {
+      if (event.touches.length !== 2) return;
+      event.preventDefault();
+      event.stopPropagation();
+      var c = center2(event.touches);
+      pinch = { d: dist2(event.touches[0], event.touches[1]),
+                x: c.x, y: c.y, zoom: phoneZoom,
+                sl: stage.scrollLeft, st: stage.scrollTop };
+      if (hint) hint.hidden = true;
+    }, { capture: true, passive: false });
+    stage.addEventListener('touchmove', function (event) {
+      if (!pinch || event.touches.length !== 2) return;
+      event.preventDefault();
+      event.stopPropagation();
+      var d = dist2(event.touches[0], event.touches[1]);
+      var c = center2(event.touches);
+      // Pinch scales the readable zoom within [fit floor, 1:1].
+      phoneZoom = Math.max(0.2, Math.min(1, pinch.zoom * (d / (pinch.d || 1))));
+      fitPicture();
+      // Dragging the pair pans the enlarged canvas.
+      stage.scrollLeft = pinch.sl - (c.x - pinch.x);
+      stage.scrollTop = pinch.st - (c.y - pinch.y);
+    }, { capture: true, passive: false });
+    stage.addEventListener('touchend', function (event) {
+      if (event.touches.length < 2) pinch = null;
+    }, { capture: true, passive: false });
+    if (hint) {
+      hint.hidden = false;
+      setTimeout(function () { hint.hidden = true; }, 6000);
+    }
+  }
+
   document.getElementById('close').onclick = endSession;
   window.addEventListener('beforeunload', function () {
     stopped = true;
@@ -1366,6 +1708,10 @@ def make_adapter(info):
         return MockAdapter(info)
     if info["adapter"] == PASSTHROUGH_ADAPTER_ID:
         return PassthroughAdapter(info)
+    if info["adapter"] == common.IDRAC8_ADAPTER_ID:
+        return Idrac8Adapter(info)
+    if info["adapter"] == common.IDRAC_VNC_ADAPTER_ID:
+        return IdracVncAdapter(info)
     raise Problem("adapter_not_verified", 403)
 
 
@@ -1704,7 +2050,8 @@ class Gateway:
             hard_until = info["hard_until"]
             adapter = wire_recovery(make_adapter(info), self.recovery)
             deadline = started + info["lease_seconds"]
-            async with asyncio.timeout(max(0.01, min(10, deadline-time.monotonic()))):
+            login_budget = float(getattr(adapter, "login_budget", 10.0))
+            async with asyncio.timeout(max(0.01, min(login_budget, deadline-time.monotonic()))):
                 await adapter.login(info.pop("username"), info.pop("password"))
                 sent = time.monotonic()
                 result = await self.call(claims["sid"], "active")
@@ -1747,7 +2094,9 @@ class Gateway:
         if sess.closing:
             raise Problem("session_revoked", 410)
         offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
-        if not offered and isinstance(sess.adapter, PassthroughAdapter):
+        browser_offered = bool(offered)
+        if not offered and isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
+                                                      IdracVncAdapter)):
             offered = ["binary"]
         if "binary" not in offered:
             raise Problem("subprotocol_required", 400)
@@ -1766,8 +2115,10 @@ class Gateway:
             raise
         finally:
             sess.opening -= 1
-        client = web.WebSocketResponse(protocols=(upstream.protocol,), heartbeat=20, max_msg_size=1024*1024,
-                                       writer_limit=65536, compress=False, timeout=2)
+        client = web.WebSocketResponse(
+            protocols=(upstream.protocol,) if browser_offered else (),
+            heartbeat=20, max_msg_size=1024*1024,
+            writer_limit=65536, compress=False, timeout=2)
         pumps = []
         try:
             if sess.closing or time.monotonic() >= sess.lease_end:
@@ -1846,12 +2197,14 @@ class Gateway:
             return web.json_response(keymap_document())
         if path == "/_platform/meta" and request.method == "GET":
             cfg = getattr(sess.adapter, "cfg", None)
-            host = getattr(cfg, "host", "") if cfg is not None else ""
+            host = (getattr(cfg, "host", "") if cfg is not None
+                    else getattr(sess.adapter, "host", ""))
             return web.json_response({"address": host or "未接入",
                                       "asset_id": getattr(sess, "asset_id", "")})
         if request.method != "GET" or request.query_string:
             raise Problem("route_denied", 403)
-        real = isinstance(sess.adapter, PassthroughAdapter)
+        real = isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
+                                        IdracVncAdapter))
         asset_pattern = getattr(sess.adapter, "asset_pattern", PASSTHROUGH_ASSET_PATH)
         if real and asset_pattern.fullmatch(path):
             content_type, body = await sess.adapter.fetch_asset(path)

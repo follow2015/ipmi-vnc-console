@@ -145,6 +145,19 @@ def test_connection_limit_answered_before_connecting(harness_result):
     assert "连接已达上限" in at_limit["status"]
 
 
+def test_fresh_ticket_ignores_previous_session_recovery(harness_result):
+    fresh = harness_result["real_fresh_ticket"]
+    assert fresh["total_rfbs"] == 1
+    assert fresh["health_state"] != "closed"
+    assert "已用尽" not in fresh["status"]
+    assert fresh["legacy_cleared"] is True
+    saved = fresh["storage"]
+    assert saved["sid"] == "b" * 32
+    assert saved.get("closed") is not True
+    assert saved.get("exhausted") is not True
+    assert saved.get("attempts", 0) == 0
+
+
 def test_successful_reconnect_resets_consecutive_attempts(harness_result):
     recovery = harness_result["real_recovery"]
     assert recovery["afterNormal"] == {

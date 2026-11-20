@@ -4,7 +4,9 @@ from __future__ import annotations
 import re
 
 from .. import capability as poc_capability
-from ..common import PASSTHROUGH_ADAPTER_ID, Problem
+from ..common import (IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
+                      PASSTHROUGH_ADAPTER_ID, Problem)
+from ..rfb_protocol import PROTOCOLS
 
 DEFAULT_ASSET_PATHS = (
     "/novnc/include/*.js",
@@ -97,9 +99,11 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
     data_plane = assembly.get("data_plane") or {}
     entry = data_plane.get("capability_entry") or {}
     plan = assembly.get("plan") or {}
-    if data_plane.get("adapter") not in (None, PASSTHROUGH_ADAPTER_ID):
+    allowed_adapters = (PASSTHROUGH_ADAPTER_ID, IDRAC8_ADAPTER_ID,
+                        IDRAC_VNC_ADAPTER_ID)
+    if data_plane.get("adapter") not in (None, *allowed_adapters):
         raise Problem("invalid_target_policy", 502)
-    if entry.get("adapter") and entry["adapter"] != PASSTHROUGH_ADAPTER_ID:
+    if entry.get("adapter") and entry["adapter"] not in allowed_adapters:
         raise Problem("invalid_target_policy", 502)
 
     declared = poc_capability.parse_protocol_versions(entry.get("protocol_versions"))
@@ -109,10 +113,15 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
     if rfb_version and rfb_version not in declared:
         raise Problem("invalid_target_policy", 502)
     message_profile = str(plan.get("message_profile") or "").strip()
-    if rfb_version and message_profile:
+    adapter = data_plane.get("adapter") or entry.get("adapter") or ""
+    if adapter != IDRAC_VNC_ADAPTER_ID and rfb_version and message_profile:
         expected = MESSAGE_PROFILE_BY_VERSION.get(rfb_version)
         if expected and expected != message_profile:
             raise Problem("invalid_target_policy", 502)
+
+    protocol = str(plan.get("protocol") or "").strip()
+    if protocol and protocol not in PROTOCOLS:
+        raise Problem("invalid_target_policy", 502)
 
     try:
         shaping = poc_capability.parse_input_shaping(entry.get("input_shaping") or {})
@@ -134,6 +143,7 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
         "asset_pattern": asset_pattern,
         "message_profile": message_profile,
         "rfb_version": rfb_version,
+        "protocol": protocol,
         "assembly_id": assembly.get("assembly_id"),
         "assembly_profile": (assembly.get("profile") or {}).get("code"),
     })

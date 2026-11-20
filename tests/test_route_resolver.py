@@ -103,6 +103,43 @@ async def test_proxy_relays_websocket_cookie_and_frames():
         await upstream.close()
 
 
+async def test_proxy_answers_worker_heartbeat_when_the_picture_is_frozen():
+    pong_seen = asyncio.Event()
+
+    async def upstream_ws(request):
+        socket = web.WebSocketResponse(protocols=("binary",), autoping=False)
+        await socket.prepare(request)
+        await socket.send_bytes(b"first-frame")
+        await socket.ping(b"liveness")
+        async for message in socket:
+            if message.type is WSMsgType.PONG:
+                pong_seen.set()
+                break
+            if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                break
+        await socket.close()
+        return socket
+
+    upstream_app = web.Application()
+    upstream_app.router.add_get("/{tail:.*}", upstream_ws)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+    bus = AssemblyBus(MemoryState())
+    await bus.put_route(SID, {"upstream": f"{upstream.host}:{upstream.port}"}, 60)
+    try:
+        async with await _client(bus) as resolver:
+            async with resolver.ws_connect(
+                    f"/s/{SID}/console", protocols=("binary",),
+                    headers={"Cookie": "session=unit-test-token",
+                             "Origin": "https://example.test"}) as ws:
+                message = await ws.receive()
+                assert message.type is WSMsgType.BINARY
+                assert message.data == b"first-frame"
+                await asyncio.wait_for(pong_seen.wait(), 3)
+    finally:
+        await upstream.close()
+
+
 async def test_session_prefix_must_start_the_path():
     bus = AssemblyBus(MemoryState())
     await bus.put_route(SID, {"upstream": "127.0.0.1:29443"}, 60)

@@ -393,6 +393,54 @@ async def test_geometry_reload_closes_browser_with_4001_and_keeps_session(identi
         await gateway.finish(runtime, "test_cleanup")
 
 
+async def test_real_console_accepts_bare_websocket_without_subprotocol(identities):
+    _, cfg = identities
+
+    class Relay:
+        protocol = "binary"
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def send_bytes(self, data):
+            return None
+
+        async def close(self, code=1000):
+            return None
+
+    class Adapter(worker_module.PassthroughAdapter):
+        async def connect(self, offered):
+            assert offered == ["binary"]
+            return Relay()
+
+        async def close(self):
+            return True
+
+    app = create_worker(cfg)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+    gateway = app[GATEWAY_KEY]
+    gateway.call = lambda sid, op, data=None: asyncio.sleep(0, result={"ok": True})
+    sid = "b" * 32
+    runtime = Runtime(sid, digest("browser-secret"), Adapter.__new__(Adapter),
+                      time.monotonic() + 30)
+    gateway.sessions[sid] = runtime
+    host = f"w1-{sid}.kvm.localhost:{WORKER_PORT}"
+    headers = {"Host": host, "Origin": f"https://{host}",
+               "Cookie": "__Host-kvm_sid=browser-secret"}
+    try:
+        async with TestServer(app) as server:
+            async with aiohttp.ClientSession() as browser:
+                ws = await browser.ws_connect(server.make_url("/console"), headers=headers)
+                assert ws.protocol is None, "bare browser socket must get a bare 101"
+                await ws.close()
+    finally:
+        await gateway.finish(runtime, "test_cleanup")
+
+
 async def test_an_upstream_close_is_not_reported_as_a_client_close(identities):
     directory, cfg = identities
     logged_out = []

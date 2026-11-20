@@ -58,6 +58,18 @@ BUILTIN_PROFILES = (
      "licence": "IKVM HTML5", "concurrency_limit": 1,
      "evidence": "docs/implementation/evidence/real-bmc-fleet-greetings-20261117.json",
      "priority": 110},
+    {"code": "dell-idrac-vnc-tcp", "vendor": "dell",
+     "vendor_aliases": ["dell", "dell inc.", "dell emc", "idrac"],
+     "model_pattern": r"(?i)iDRAC8|C6320|iDRAC7|12G|13G",
+     "firmware_min": "", "firmware_max": "",
+     "rfb_version": "RFB 003.008", "message_profile": "standard",
+     "asset_paths": ["/novnc/include/*.js"],
+     "login_path": "", "logout_path": "",
+     "console_impl": "dell-idrac-vnc-tcp",
+     "licence": "iDRAC 内置 VNC Server（需 Enterprise 许可，VNC 密码由 RACADM 设置）",
+     "concurrency_limit": 1,
+     "evidence": "docs/implementation/evidence/idrac8-vnc-tcp-20261120.json",
+     "priority": 80},
 )
 
 
@@ -97,24 +109,39 @@ def firmware_in_window(version: str, low: str, high: str) -> bool:
 
 def detect_from_redfish(inventory: dict) -> dict:
     if not isinstance(inventory, dict):
-        return {"vendor": "", "model": "", "firmware": "", "raw": {}}
+        return {"vendor": "", "model": "", "firmware": "", "raw": {},
+                "source": None, "vendor_source": None}
     resources = inventory.get("resources") or {}
-    for group in ("Managers", "Systems", "Chassis"):
+    groups = ("Managers", "Systems", "Chassis")
+
+    primary = None
+    primary_group = None
+    vendor = ""
+    vendor_source = None
+    for group in groups:
         items = resources.get(group) or []
         if not isinstance(items, list):
             continue
         for item in items:
             if not isinstance(item, dict):
                 continue
-            vendor = normalize_vendor(item.get("Manufacturer"))
-            model = str(item.get("Model") or "")
-            firmware = str(item.get("FirmwareVersion") or "")
-            if vendor or model or firmware:
-                return {"vendor": vendor, "model": model, "firmware": firmware,
-                        "raw": {k: item.get(k) for k in ("Id", "Name", "Manufacturer",
-                                                         "Model", "FirmwareVersion")},
-                        "source": group}
-    return {"vendor": "", "model": "", "firmware": "", "raw": {}, "source": None}
+            if primary is None and (item.get("Model") or item.get("FirmwareVersion")):
+                primary, primary_group = item, group
+            if not vendor:
+                found = normalize_vendor(item.get("Manufacturer"))
+                if found:
+                    vendor, vendor_source = found, group
+
+    if primary is None:
+        return {"vendor": vendor, "model": "", "firmware": "", "raw": {},
+                "source": None, "vendor_source": vendor_source}
+
+    model = str(primary.get("Model") or "")
+    firmware = str(primary.get("FirmwareVersion") or "")
+    return {"vendor": vendor, "model": model, "firmware": firmware,
+            "raw": {k: primary.get(k) for k in ("Id", "Name", "Manufacturer",
+                                                 "Model", "FirmwareVersion")},
+            "source": primary_group, "vendor_source": vendor_source}
 
 
 def seed_builtin_profiles(session: Session, *, now: float | None = None) -> int:
@@ -213,6 +240,7 @@ def connection_plan(profile: VendorProfile) -> dict:
             "login_path": profile.login_path,
             "logout_path": profile.logout_path,
             "console_impl": profile.console_impl,
+            "protocol": getattr(profile, "protocol", "") or "",
             "input_shaping": parse_json(profile.input_shaping, {}),
             "concurrency_limit": int(profile.concurrency_limit or 1),
             "licence": profile.licence}

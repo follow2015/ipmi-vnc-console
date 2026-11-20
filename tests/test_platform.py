@@ -164,7 +164,8 @@ def test_role_permission_matrix(ctx):
     assert viewer_perms == {"asset.read", "vendor.read", "audit.read"}
     with transaction(factory) as db:
         with pytest.raises(services.PlatformError, match="permission_denied"):
-            services.require(db, viewer.id, "console.open")
+            services.require(db, viewer.id, "console.open",
+                             tenant_id=viewer.tenant_id)
 
 
 
@@ -260,6 +261,29 @@ def test_detect_prefers_the_bmc_over_the_host():
     assert result["source"] == "Managers"
 
 
+def test_detect_fills_vendor_from_host_when_bmc_row_has_no_manufacturer():
+    inventory = {"resources": {
+        "Managers": [{"Id": "iDRAC.Embedded.1", "Model": "13G DCS",
+                      "FirmwareVersion": "2.83.83.83"}],
+        "Systems": [{"Id": "System.1", "Manufacturer": "Dell Inc.",
+                     "Model": "PowerEdge C6320"}],
+        "Chassis": [{"Id": "Chassis.1", "Manufacturer": "Dell Inc.",
+                     "Model": "PowerEdge C6320"}]}}
+    result = vendor_registry.detect_from_redfish(inventory)
+    assert result["vendor"] == "dell"
+    assert result["vendor_source"] == "Systems"
+
+
+def test_detect_keeps_bmc_model_and_firmware_when_vendor_comes_from_host():
+    inventory = {"resources": {
+        "Managers": [{"Model": "ASPEED", "FirmwareVersion": "8.78"}],
+        "Systems": [{"Manufacturer": "Inspur", "Model": "SA5248M4"}]}}
+    result = vendor_registry.detect_from_redfish(inventory)
+    assert result["model"] == "ASPEED" and result["firmware"] == "8.78"
+    assert result["source"] == "Managers"
+    assert result["vendor"] == "supermicro" and result["vendor_source"] == "Systems"
+
+
 def test_matched_draft_is_not_usable_and_unknown_brand_never_falls_back(ctx):
     _, _, factory, _ = ctx
     with transaction(factory) as db:
@@ -291,6 +315,7 @@ def test_approved_profile_yields_a_connection_plan_and_a_draft_capability(ctx):
         assert match.usable is True
         assert plan["rfb_version"] == "RFB 003.008" and plan["message_profile"] == "insyde"
         assert "/cgi/logout.cgi" == plan["logout_path"]
+        assert plan["protocol"] == "", "measured profile keeps the implicit Supermicro default"
         assert draft.status == "draft" and draft.approver == ""
         assert "awaiting" in draft.status_reason
 

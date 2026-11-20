@@ -22,7 +22,7 @@ from kvmhub.platform.bus import AssemblyBus, BusError
 from kvmhub.platform.config import Settings
 from kvmhub.platform.console import ConsolePlane
 from kvmhub.platform.db import init_schema, seed_roles, session_factory, transaction
-from kvmhub.platform.models import DEFAULT_TENANT_ID, Capability, VendorProfile
+from kvmhub.platform.models import DEFAULT_TENANT_ID, Capability, Tenant, VendorProfile
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher
 from kvmhub.store import Store
@@ -462,6 +462,34 @@ def test_the_management_view_exposes_the_session_it_has_to_release(rig):
         assert released.status_code == 200, released.text
 
 
+def test_consumer_tenant_admin_cannot_confirm_another_users_cleanup(rig):
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        with transaction(rig.platform.factory) as db:
+            services.create_user(db, "ops3", VIEWER_PASSWORD, "operator", actor="test")
+            ops_id = db.scalar(select(services.User.id).where(services.User.username == "ops3"))
+            services.grant_asset(db, user_id=ops_id, asset_id=rig.ids["asset"], actor="test")
+        store = rig.connect()
+        try:
+            store.db.execute("INSERT INTO access_grant(user_id,asset_id,expires) VALUES(?,?,?)",
+                             (ops_id, rig.ids["asset"], time.time() + 3600))
+            store.db.commit()
+        finally:
+            store.close()
+        ops_csrf = login(c, "ops3", VIEWER_PASSWORD)
+        sid = _pending_session(c, ops_csrf, rig)
+        with transaction(rig.platform.factory) as db:
+            db.get(Tenant, DEFAULT_TENANT_ID).mode = "consumer"
+        admin_csrf = login(c)
+        r = c.post(f"/api/v2/consoles/{sid}/cleanup", headers=headers(admin_csrf))
+        assert r.status_code == 403 and r.json()["error"] == "permission_denied", r.text
+        store = rig.connect()
+        try:
+            assert store.get(sid)["cleanup"] == "pending", "a refused caller must change nothing"
+        finally:
+            store.close()
+
+
 def test_viewer_cannot_open_a_console(rig):
     with TestClient(rig.app, base_url=ORIGIN) as c:
         csrf = login(c, "viewer", VIEWER_PASSWORD)
@@ -526,3 +554,28 @@ def test_a_session_the_worker_ended_frees_its_slot(rig):
         store.close()
     assert asyncio.run(rig.plane.reconcile_claims()) == 1
     assert asyncio.run(rig.bus.worker_load("w1")) == 0
+
+
+def test_brand_plan_protocol_reaches_worker_settings(rig):
+    assembly = dict(rig.assembly)
+    assembly["plan"] = {**rig.assembly["plan"], "protocol": "supermicro-ikvm-html5"}
+    info = data_plane.assembled_info(
+        {"target": TARGET, "fingerprint": FINGERPRINT,
+         "adapter": PASSTHROUGH_ADAPTER_ID, "protocol_versions": (),
+         "input_shaping": None, "logout_path": None}, assembly)
+    assert info["protocol"] == "supermicro-ikvm-html5"
+
+
+def test_unknown_brand_protocol_fails_the_exchange(rig):
+    assembly = dict(rig.assembly)
+    assembly["plan"] = {**rig.assembly["plan"], "protocol": "dell-idrac8-unregistered"}
+    with pytest.raises(Problem, match="invalid_target_policy"):
+        data_plane.assembled_info({"target": TARGET}, assembly)
+
+
+def test_absent_protocol_keeps_the_measured_default(rig):
+    info = data_plane.assembled_info(
+        {"target": TARGET, "fingerprint": FINGERPRINT,
+         "adapter": PASSTHROUGH_ADAPTER_ID, "protocol_versions": (),
+         "input_shaping": None, "logout_path": None}, rig.assembly)
+    assert info["protocol"] == ""

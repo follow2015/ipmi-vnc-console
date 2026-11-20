@@ -162,6 +162,7 @@ class VendorProfile(Base):
     login_path: Mapped[str] = mapped_column(String(128), default="")
     logout_path: Mapped[str] = mapped_column(String(128), default="")
     console_impl: Mapped[str] = mapped_column(String(128), default="")
+    protocol: Mapped[str] = mapped_column(String(96), default="", nullable=False)
     licence: Mapped[str] = mapped_column(String(128), default="")
     concurrency_limit: Mapped[int] = mapped_column(Integer, default=1)
     input_shaping: Mapped[str] = mapped_column(Text, default="{}")
@@ -184,6 +185,7 @@ class VendorProfile(Base):
                 "asset_paths": parse_json(self.asset_paths, []),
                 "login_path": self.login_path, "logout_path": self.logout_path,
                 "console_impl": self.console_impl, "licence": self.licence,
+                "protocol": getattr(self, "protocol", "") or "",
                 "concurrency_limit": self.concurrency_limit,
                 "input_shaping": parse_json(self.input_shaping, {}),
                 "priority": self.priority, "status": self.status,
@@ -274,6 +276,38 @@ class AccessGrant(Base):
     expires: Mapped[float] = mapped_column(Float, nullable=False)
     granted_by: Mapped[str] = mapped_column(String(128), default="")
     created: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class AssetGroup(Base):
+    __tablename__ = "kvm_asset_group"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    updated: Mapped[float] = mapped_column(Float, nullable=False)
+
+    def public(self) -> dict:
+        return {"id": self.id, "tenant_id": self.tenant_id, "name": self.name,
+                "created": self.created, "updated": self.updated}
+
+
+class AssetGroupMember(Base):
+    __tablename__ = "kvm_asset_group_member"
+    group_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("kvm_asset_group.id", ondelete="CASCADE"), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("kvm_asset.id", ondelete="CASCADE"), primary_key=True)
+
+
+class GrantSource(Base):
+    __tablename__ = "kvm_grant_source"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    group_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("kvm_asset_group.id", ondelete="SET NULL"), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "asset_id", "group_id",
+                                       name="uq_grant_source"),)
 
 
 class AuditLog(Base):

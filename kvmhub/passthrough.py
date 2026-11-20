@@ -388,6 +388,16 @@ class RfbPassthroughSession:
                 await self.upstream.send_raw(payload)
 
     async def send_str(self, data: str) -> None:
+        if (getattr(self.handshake, "accepts_text", False)
+                and not self.handshake.completed):
+            try:
+                raw = data.encode("latin-1")
+            except UnicodeEncodeError:
+                self.error = "unexpected_text_frame"
+                await self.close(code=1003)
+                return
+            await self.send_bytes(raw)
+            return
         self.error = "unexpected_text_frame"
         await self.close(code=1003)
 

@@ -71,7 +71,9 @@ class Settings:
     signing_key_path: str = ""
     worker_url_template: str = ""
     passthrough_targets: str = ""
+    bmc_allowed_networks: str = ""
     iframe_mode: str = "off"
+    strict_grants: bool = False
     integration_trusted_proxies: str = ""
 
     @property
@@ -116,6 +118,12 @@ class Settings:
             for item in self.integration_trusted_proxies.split(","):
                 if item.strip():
                     ipaddress.ip_network(item.strip(), strict=False)
+        if self.bmc_allowed_networks:
+            import ipaddress
+            for item in self.bmc_allowed_networks.split(","):
+                if not item.strip():
+                    raise ValueError("KVMHUB_BMC_ALLOWED_NETWORKS has an empty CIDR entry")
+                ipaddress.ip_network(item.strip(), strict=False)
 
 
 def _decode_key(raw: str, name: str) -> bytes | None:
@@ -151,7 +159,9 @@ def settings(env_path: str | os.PathLike[str] | None = None) -> Settings:
         signing_key_path=os.getenv("KVMHUB_SIGNING_KEY", ""),
         worker_url_template=os.getenv("KVMHUB_WORKER_URL_TEMPLATE", ""),
         passthrough_targets=os.getenv("KVMHUB_PASSTHROUGH_TARGETS", ""),
+        bmc_allowed_networks=os.getenv("KVMHUB_BMC_ALLOWED_NETWORKS", "").strip(),
         iframe_mode=os.getenv("KVMHUB_IFRAME_MODE", "off").strip().lower(),
+        strict_grants=_bool("KVMHUB_STRICT_GRANTS", False),
         integration_trusted_proxies=os.getenv("KVMHUB_TRUSTED_PROXIES", "").strip(),
     )
     cfg.validate()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.client
 import ipaddress
@@ -49,6 +50,7 @@ class Redfish:
     def __init__(self, host: str, port: int = 443, ca_bundle: str | None = None,
                  timeout: float = 5, cert_sha256: str | None = None, *,
                  max_requests: int = 20, total_timeout: float = 60,
+                 basic_auth: tuple[str, str] | None = None,
                  clock=time.monotonic):
         self.host = validate_host(host)
         if not 1 <= port <= 65535 or not math.isfinite(timeout) or not 0 < timeout <= 30:
@@ -59,6 +61,12 @@ class Redfish:
             raise RedfishError("conflicting_tls_modes")
         self.port, self.timeout = port, timeout
         self.cert_sha256 = normalize_fingerprint(cert_sha256)
+        if basic_auth is not None:
+            user, password = basic_auth
+            self.basic_header = "Basic " + base64.b64encode(
+                f"{user}:{password}".encode("utf-8")).decode("ascii")
+        else:
+            self.basic_header = None
         try:
             self.context = ssl.create_default_context(cafile=ca_bundle)
         except (OSError, ssl.SSLError):
@@ -112,6 +120,8 @@ class Redfish:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["X-Auth-Token"] = self.token
+        if self.basic_header:
+            headers["Authorization"] = self.basic_header
         conn = http.client.HTTPSConnection(self.host, self.port, timeout=timeout, context=self.context)
         cleanup_deadline = self.clock()+timeout
 
@@ -177,6 +187,8 @@ class Redfish:
         return result
 
     def login(self, username: str, password: str) -> None:
+        if self.basic_header:
+            raise RedfishError("session_login_conflicts_with_basic_auth")
         status, _, _ = self.request("/redfish/v1/SessionService/Sessions", "POST",
                                     {"UserName": username, "Password": password})
         if status not in (200, 201) or not self.token:
@@ -264,6 +276,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-members", type=int, default=12, help="global member-detail limit across collections")
     p.add_argument("--inventory", action="store_true", help="also read bounded inventory without creating a session")
     p.add_argument("--authenticate", action="store_true", help="create a session using BMC_USER/BMC_PASSWORD, then read inventory")
+    p.add_argument("--basic-auth", action="store_true",
+                   help="use HTTP Basic auth (BMC_USER/BMC_PASSWORD) on each read; no session (for BMCs that reject session creation)")
     return p
 
 
@@ -275,14 +289,19 @@ def main(argv=None) -> int:
         normalize_fingerprint(args.cert_sha256)
         if not 1 <= args.max_members <= 50:
             raise RedfishError("invalid_member_budget")
-        if args.show_cert_fingerprint and (args.authenticate or args.inventory or args.ca_bundle is not None or args.cert_sha256 is not None):
+        if args.show_cert_fingerprint and (args.authenticate or args.basic_auth or args.inventory or args.ca_bundle is not None or args.cert_sha256 is not None):
             raise RedfishError("fingerprint_only_conflicting_options")
+        if args.authenticate and args.basic_auth:
+            raise RedfishError("conflicting_auth_modes")
+        basic = ((os.environ.get("BMC_USER", ""), os.environ.get("BMC_PASSWORD", "")) if args.basic_auth else None)
         client = Redfish(args.host, args.port, args.ca_bundle, args.timeout, args.cert_sha256,
-                         max_requests=args.max_requests, total_timeout=args.total_timeout)
+                         max_requests=args.max_requests, total_timeout=args.total_timeout,
+                         basic_auth=basic)
     except RedfishError as exc:
         p.error(str(exc))
-    if args.authenticate and (not os.environ.get("BMC_USER") or not os.environ.get("BMC_PASSWORD")):
-        p.error("--authenticate requires BMC_USER and BMC_PASSWORD")
+    for flag in ("--authenticate", "--basic-auth"):
+        if getattr(args, flag[2:].replace("-", "_")) and (not os.environ.get("BMC_USER") or not os.environ.get("BMC_PASSWORD")):
+            p.error(f"{flag} requires BMC_USER and BMC_PASSWORD")
     report = {"probe": "redfish", "host": args.host, "authentication": "not_requested", "session_cleanup": "not_needed"}
     try:
         if args.show_cert_fingerprint:
@@ -300,7 +319,9 @@ def main(argv=None) -> int:
                 report["authentication"] = "failed_or_unconfirmed"
                 client.login(os.environ["BMC_USER"], os.environ["BMC_PASSWORD"])
                 report["authentication"] = "ok"
-            if args.inventory or args.authenticate:
+            if args.basic_auth:
+                report["authentication"] = "basic"
+            if args.inventory or args.authenticate or args.basic_auth:
                 report["inventory"] = inventory(client, root, args.max_members)
         exit_code = 0
     except (RedfishError, OSError, http.client.HTTPException) as exc:

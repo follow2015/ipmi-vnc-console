@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete as sa_delete, select
 
 from kvmhub import capability as poc_capability
-from kvmhub.common import PASSTHROUGH_ADAPTER_ID
+from kvmhub.common import IDRAC8_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID
 from kvmhub.platform import connection, services, vendor_registry
 from kvmhub.platform.api import create_app
 from kvmhub.platform.config import Settings
@@ -119,6 +119,25 @@ def test_entry_carries_the_measured_protocol_and_logout_path(world):
     assert entry["id"].startswith("auto-")
     assert _entry(world)["id"] == entry["id"]
     assert poc_capability.window_parses(entry)
+
+
+def test_idrac8_profile_produces_the_idrac8_data_plane_adapter(world):
+    with transaction(world.factory) as db:
+        profile = connection.approved_profile(db, PROFILE_CODE)
+        profile.console_impl = IDRAC8_ADAPTER_ID
+        db.flush()
+        asset = db.get(Asset, world.ids["asset"])
+        entry = connection.capability_entry(
+            profile, asset=asset,
+            detection={"model": asset.model, "firmware": asset.firmware,
+                       "raw": {"Manufacturer": MANUFACTURER}})
+        assert entry["adapter"] == IDRAC8_ADAPTER_ID
+        assert entry["protocol_versions"] == ["RFB 003.008"]
+        result = connection.assembly(db, asset_id=asset.id, user_id=world.ids["admin"],
+                                     actor="admin")
+    assert result["ready"] is True
+    assert result["data_plane"]["adapter"] == IDRAC8_ADAPTER_ID
+    assert result["plan"]["console_impl"] == IDRAC8_ADAPTER_ID
 
 
 def test_entry_is_accepted_and_approved_by_the_real_poc_store(world):

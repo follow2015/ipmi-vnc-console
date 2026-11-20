@@ -1,6 +1,7 @@
 """The on-screen keyboard must send the same frames the text box already proved."""
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -97,8 +98,8 @@ def test_a_chord_can_carry_a_shifted_character():
     assert insyde_messages.build_key_event(doc["plain"]["\\"], True) in down
 
 
-def _served_tokens(html: str) -> list[str]:
-    return re.findall(r'data-send="([^"]+)"', html)
+def _served_tokens(page: str) -> list[str]:
+    return [html.unescape(t) for t in re.findall(r'data-send="([^"]+)"', page)]
 
 
 def test_the_page_draws_only_keys_the_table_declares():

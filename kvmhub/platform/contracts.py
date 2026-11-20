@@ -20,6 +20,42 @@ class OkResult(Contract):
     ok: bool
 
 
+class AssetGroup(Contract):
+    id: str
+    tenant_id: str
+    name: str
+    created: float
+    updated: float
+    member_count: int = 0
+
+
+class GroupMembers(Contract):
+    group: AssetGroup
+    members: list[str]
+
+
+class GroupGrantResult(Contract):
+    group_id: str
+    user_id: str
+    granted: int
+    revoked_stale: int
+
+
+class PlatformGrantResult(Contract):
+    ok: bool
+    level: int
+    user_id: str
+    asset_id: str
+
+
+class AssetResetResult(Contract):
+    ok: bool
+    asset_id: str
+    address: str
+    method: str
+    accepted: bool
+
+
 class Healthz(Contract):
     status: str
     env: str
@@ -429,8 +465,12 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/users/{user_id}/active": {"post": "OkResult"},
     "/api/v2/users/{user_id}/password": {"post": "OkResult"},
     "/api/v2/assets": {"get": "list:Asset", "post": "Asset"},
-    "/api/v2/credentials": {"post": "CredentialCreated"},
+    "/api/v2/credentials": {"get": "list:CredentialCreated", "post": "CredentialCreated"},
     "/api/v2/grants": {"post": "OkResult"},
+    "/api/v2/asset-groups": {"get": "list:AssetGroup", "post": "AssetGroup"},
+    "/api/v2/asset-groups/{group_id}": {"delete": "OkResult"},
+    "/api/v2/asset-groups/{group_id}/members": {"put": "GroupMembers"},
+    "/api/v2/asset-groups/{group_id}/grant": {"post": "GroupGrantResult"},
     "/api/v2/vendor-profiles": {"get": "list:VendorProfile"},
     "/api/v2/detect": {"post": "DetectResult"},
     "/api/v2/consoles/assembly": {"post": "ConnectionAssembly"},
@@ -458,6 +498,8 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/platform/capabilities": {"get": "list:CapabilityView"},
     "/api/v2/platform/assets": {"get": "list:PlatformAsset"},
     "/api/v2/platform/assets/assign": {"post": "AssetAssignment"},
+    "/api/v2/platform/assets/grant": {"post": "PlatformGrantResult"},
+    "/api/v2/platform/assets/{asset_id}/reset": {"post": "AssetResetResult"},
     "/api/v2/platform/audit": {"get": "list:AuditRow"},
     "/api/v2/platform/quota-usage": {"get": "list:QuotaUsage"},
     "/api/v2/platform/sessions": {"get": "list:SessionView"},

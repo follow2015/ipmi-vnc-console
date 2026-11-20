@@ -22,9 +22,7 @@ from .ast2100_protocol import (
     IncompleteFrame,
     ProtocolError,
     RfbHandshake,
-    client_init,
     client_protocol_version,
-    client_security_scheme,
     framebuffer_update_request,
     key_event,
     pointer_event,
@@ -224,7 +222,11 @@ class RelayStats:
 class RfbUpstream:
 
     def __init__(self, cfg: UpstreamConfig, *, session: aiohttp.ClientSession | None = None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, protocol=None):
+        if protocol is None:
+            from .rfb_protocol import SupermicroProtocol
+            protocol = SupermicroProtocol()
+        self.protocol = protocol
         self.cfg = cfg
         self.clock = clock
         self.stats = RelayStats()
@@ -268,14 +270,15 @@ class RfbUpstream:
             async with asyncio.timeout(self.cfg.request_timeout):
                 async with self.http.post(
                         self.cfg.url(self.cfg.login_path),
-                        data={"name": username, "pwd": password},
+                        data=self.protocol.login_fields(username, password),
                         headers={"Content-Type": "application/x-www-form-urlencoded",
                                  "Referer": self.cfg.base_url + "/",
                                  "Origin": self.cfg.base_url},
                         allow_redirects=False) as response:
                     status = response.status
                     await self._read_body(response, MAX_HTML_BYTES)
-                    absorbed = absorb_set_cookie(response.headers.getall("Set-Cookie", []))
+                    absorbed = self.protocol.absorb_cookies(
+                        response.headers.getall("Set-Cookie", []))
         except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError):
             raise Problem("upstream_unavailable", 502) from None
         if 300 <= status < 400:
@@ -323,7 +326,7 @@ class RfbUpstream:
             raise Problem("upstream_unavailable", 502) from None
         if len(body) > MAX_HTML_BYTES:
             raise Problem("upstream_invalid_response", 502)
-        self._ticket = extract_ticket(body)
+        self._ticket = self.protocol.extract_ticket(body)
         return self._ticket
 
     async def open(self, *, request_frames: bool = True) -> None:
@@ -353,12 +356,12 @@ class RfbUpstream:
                 self.protocol_version = event["version"]
                 await self._send(client_protocol_version(event["version"]))
             elif expected == "Security":
-                await self._send(client_security_scheme())
+                await self._send(bytes([self.protocol.security_type()]))
             elif expected == "Authentication":
-                await self._send(encode_auth_response(self._ticket or ""))
+                await self._send(self.protocol.auth_response(self._ticket or ""))
                 self._ticket = None
             elif expected == "SecurityResult":
-                await self._send(client_init(shared=True))
+                await self._send(self.protocol.client_init())
             else:
                 self.server_init = parser.server_init
                 self.server_init_raw = parser.server_init_raw

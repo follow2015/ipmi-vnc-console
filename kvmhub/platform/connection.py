@@ -8,7 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import capability as poc_capability
-from ..common import PASSTHROUGH_ADAPTER_ID
+from ..common import (IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
+                      PASSTHROUGH_ADAPTER_ID)
 from . import services, vendor_registry
 from .models import (CAPABILITY_VERIFIED, DEFAULT_TENANT_ID, PROFILE_APPROVED,
                      TENANT_ACTIVE, Asset, Capability, Tenant, VendorProfile,
@@ -33,7 +34,8 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
     if profile.status != PROFILE_APPROVED:
         raise ConnectionRefused("profile_not_approved",
                                 f"品牌档案 {profile.code} 未审批，不能生成连接配置")
-    if (profile.console_impl or "passthrough") != "passthrough":
+    impl = str(profile.console_impl or "passthrough").strip()
+    if impl not in ("passthrough", IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID):
         raise ConnectionRefused("adapter_unavailable",
                                 f"档案声明的适配器 {profile.console_impl} 尚未接入数据面")
 
@@ -64,7 +66,9 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
         "vendor": vendor,
         "model": model,
         "firmware": firmware,
-        "adapter": PASSTHROUGH_ADAPTER_ID,
+        "adapter": {"passthrough": PASSTHROUGH_ADAPTER_ID,
+                    IDRAC8_ADAPTER_ID: IDRAC8_ADAPTER_ID,
+                    IDRAC_VNC_ADAPTER_ID: IDRAC_VNC_ADAPTER_ID}[impl],
         "models": [model],
         "firmware_min": str(profile.firmware_min or "").strip(),
         "firmware_max": str(profile.firmware_max or "").strip(),
@@ -90,7 +94,7 @@ def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
         raise ConnectionRefused("tenant_suspended", "租户已停用，无法开启新的控制台")
 
     try:
-        services.require(session, user_id, "console.open")
+        services.require(session, user_id, "console.open", tenant_id=tenant_id)
     except services.PlatformError:
         raise ConnectionRefused("not_permitted", "没有开启控制台的权限") from None
 

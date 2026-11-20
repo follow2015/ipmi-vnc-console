@@ -54,14 +54,23 @@ function makeStorage() {
   return {
     getItem: (key) => (key in data ? data[key] : null),
     setItem: (key, value) => { data[key] = String(value); },
+    removeItem: (key) => { delete data[key]; },
     raw: data,
   };
+}
+
+function readRecovery(raw) {
+  const v2 = Object.keys(raw).filter((k) => k.indexOf('__kvm_recovery_v2_') === 0);
+  const key = v2.length ? v2[0] : '__kvm_recovery_v1';
+  try { return JSON.parse(raw[key] || '{}') || {}; }
+  catch (e) { return {}; }
 }
 
 function makeSandbox(extra, options) {
   const settings = options || {};
   const timers = [];
   const storage = makeStorage();
+  Object.assign(storage.raw, settings.seedStorage || {});
   const status = makeElement('status');
   const canvas = makeElement('screen');
   const closeButton = makeElement('close');
@@ -150,6 +159,7 @@ function makeSandbox(extra, options) {
     clearInterval() {},
     addEventListener(type, fn) { state.listeners[type] = fn; },
   };
+  if (settings.location) Object.assign(sandbox.location, settings.location);
   Object.assign(sandbox, extra);
   vm.createContext(sandbox);
   sandbox.window = sandbox;
@@ -312,7 +322,7 @@ async function runReal() {
     exhausted: sandbox.__kvm_health.exhausted,
     status: state.status.textContent,
     fetch_urls: state.fetch_urls,
-    storage_attempts: JSON.parse(state.storage.raw.__kvm_recovery_v1 || '{}').attempts,
+    storage_attempts: readRecovery(state.storage.raw).attempts,
   };
 }
 
@@ -369,7 +379,7 @@ async function runRealGeometryReload() {
     reloads: state.reloads,
     delay,
     status: state.status.textContent,
-    storage_attempts: JSON.parse(state.storage.raw.__kvm_recovery_v1 || '{}').attempts || 0,
+    storage_attempts: readRecovery(state.storage.raw).attempts || 0,
     health_state: sandbox.__kvm_health && sandbox.__kvm_health.state,
   };
 }
@@ -393,7 +403,7 @@ async function runRealGeometryFlood() {
     health_state: sandbox.__kvm_health && sandbox.__kvm_health.state,
     exhausted: !!(sandbox.__kvm_health && sandbox.__kvm_health.exhausted),
     status: state.status.textContent,
-    storage: JSON.parse(state.storage.raw.__kvm_recovery_v1 || '{}'),
+    storage: readRecovery(state.storage.raw),
   };
 }
 
@@ -438,6 +448,33 @@ async function runRealRouteProbe(routeMode) {
   };
 }
 
+async function runRealFreshTicketIgnoresStaleRecovery() {
+  const oldSid = 'a'.repeat(32);
+  const newSid = 'b'.repeat(32);
+  const { sandbox, state, load } = newReal({
+    seedStorage: {
+      __kvm_recovery_v1: JSON.stringify({
+        sid: oldSid, closed: true, exhausted: true,
+        attempts: 3, total: 9, recovered: 2,
+      }),
+      ['__kvm_recovery_v2_' + oldSid]: JSON.stringify({
+        sid: oldSid, closed: true, exhausted: true,
+        attempts: 3, total: 9, recovered: 2,
+      }),
+    },
+    location: { pathname: '/s/' + newSid + '/' },
+  });
+  load();
+  await flush();
+  return {
+    total_rfbs: state.rfbs.length,
+    health_state: sandbox.__kvm_health.state,
+    status: state.status.textContent,
+    legacy_cleared: !state.storage.raw.__kvm_recovery_v1,
+    storage: JSON.parse(state.storage.raw['__kvm_recovery_v2_' + newSid] || '{}'),
+  };
+}
+
 async function main() {
   const mockClose = await runMockCloseGuard();
   process.stdout.write(JSON.stringify({
@@ -450,6 +487,7 @@ async function main() {
     real_close: await runRealCloseGuard(),
     real_signed_out: await runRealSignedOut(),
     real_at_limit: await runRealAtLimit(),
+    real_fresh_ticket: await runRealFreshTicketIgnoresStaleRecovery(),
     real_route_gone: await runRealRouteProbe('gone'),
     real_route_live: await runRealRouteProbe('live'),
   }) + '\n');

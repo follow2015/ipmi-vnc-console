@@ -1,4 +1,5 @@
 """Real TLS, certificate pinning, bounded inventory and logout against a local Redfish fixture."""
+import base64
 import hashlib
 import http.server
 import json
@@ -49,6 +50,11 @@ def device(tmp_path):
 
         def do_GET(self):
             self.record()
+            if state["mode"] == "basic_only":
+                expected = "Basic " + base64.b64encode(b"root:calvin").decode()
+                if self.headers.get("Authorization") != expected:
+                    self.reply(401, {"error": "unauthorized"})
+                    return
             if self.path == "/redfish/v1/":
                 if state["mode"] == "redirect":
                     self.reply(302, {"error": "SECRET_FROM_BMC"}, {"Location": "https://example.invalid/"})
@@ -69,6 +75,9 @@ def device(tmp_path):
 
         def do_POST(self):
             self.record()
+            if state["mode"] == "basic_only":
+                self.reply(405, {"error": "method_not_allowed"})
+                return
             if state["mode"] == "auth_failed":
                 self.reply(401, {"error": "SECRET_FROM_BMC"})
                 return
@@ -244,3 +253,28 @@ def test_redirect_is_reported_without_response_body(device, capsys):
     output = capsys.readouterr().out
     assert json.loads(output)["error"] == "redirect_denied_302"
     assert "SECRET_FROM_BMC" not in output
+
+
+def test_basic_auth_inventory_without_session_when_sessions_rejected(device, monkeypatch, capsys):
+    device["mode"] = "basic_only"
+    monkeypatch.setenv("BMC_USER", "root")
+    monkeypatch.setenv("BMC_PASSWORD", "calvin")
+    assert main(args(device)+["--basic-auth"]) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert report["authentication"] == "basic"
+    assert report["session_cleanup"] == "not_needed"
+    assert report["inventory"]["resources"]["Managers"][0]["FirmwareVersion"] == "1.0"
+    assert not any(r[0] in ("POST", "DELETE") for r in device["requests"])
+    assert "calvin" not in output
+    expected = "Basic " + base64.b64encode(b"root:calvin").decode()
+    assert all(r[2].get("Authorization") == expected for r in device["requests"])
+
+
+def test_basic_auth_requires_credentials_before_network(device, monkeypatch):
+    monkeypatch.delenv("BMC_USER", raising=False)
+    monkeypatch.delenv("BMC_PASSWORD", raising=False)
+    with pytest.raises(SystemExit) as error:
+        main(args(device)+["--basic-auth"])
+    assert error.value.code == 2
+    assert device["requests"] == []

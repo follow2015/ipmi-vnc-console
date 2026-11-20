@@ -10,8 +10,8 @@ from ..input_shaping import InputShapingConfig
 from ..passthrough import (
     BrowserHandshake,
     RfbPassthroughSession,
-    client_message_profile,
 )
+from ..rfb_protocol import build_protocol
 from ..rfb_upstream import RfbUpstream, UpstreamConfig
 
 ASSET_PATH = re.compile(
@@ -77,13 +77,17 @@ class PassthroughAdapter:
             )
         except ValueError as exc:
             raise Problem("invalid_target_policy", 502) from exc
+        try:
+            self.protocol = build_protocol(info.get("protocol"))
+        except ValueError:
+            raise Problem("invalid_target_policy", 502) from None
         self.upstream: RfbUpstream | None = None
         self.session: RfbPassthroughSession | None = None
         self.recovery = None
         self.cleanup_outcome: str | None = None
 
     async def login(self, username, password):
-        self.upstream = RfbUpstream(self.cfg)
+        self.upstream = RfbUpstream(self.cfg, protocol=self.protocol)
         await self.upstream.login(username, password)
         await self.upstream.open(request_frames=False)
 
@@ -96,7 +100,7 @@ class PassthroughAdapter:
             raise Problem("upstream_handshake_failed", 502)
         negotiated = getattr(self.upstream, "protocol_version", None) or RFB_VERSION.strip()
         version = client_protocol_version(negotiated)
-        allowed, sizes = client_message_profile(negotiated)
+        allowed, sizes = self.protocol.message_profile(negotiated)
         session = RfbPassthroughSession(
             self.upstream, BrowserHandshake(self.upstream.server_init_raw, version=version),
             allowed_client_messages=allowed,

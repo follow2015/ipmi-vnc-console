@@ -23,8 +23,8 @@ from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,  # no
                                 init_schema, make_engine, seed_roles,
                                 session_factory, transaction)
 from kvmhub.platform.models import (AccessGrant, Asset as PlatformAsset,  # noqa: E402
-                                    PROFILE_APPROVED, Capability, Credential, User,
-                                    VendorProfile)
+                                    PROFILE_APPROVED, ROLE_ADMIN, Capability,
+                                    Credential, Role, User, UserRole, VendorProfile)
 from kvmhub.platform.security import CredentialCipher  # noqa: E402
 from kvmhub.platform import (brand_onboarding, connection, governance,  # noqa: E402
                              services, vendor_registry)
@@ -491,7 +491,13 @@ def cmd_sync_data_plane(args):
                 select(AccessGrant.user_id).where(
                     AccessGrant.asset_id == asset.id, AccessGrant.expires > stamp)).all()]
             if asset.tenant_id:
-                grants = [TENANT_GRANT, *grants]
+                admins = [row[0] for row in db.execute(
+                    select(UserRole.user_id)
+                    .join(Role, Role.id == UserRole.role_id)
+                    .join(User, User.id == UserRole.user_id)
+                    .where(Role.code == ROLE_ADMIN, User.tenant_id == asset.tenant_id,
+                           User.is_active.is_(True))).all()]
+                grants = sorted(set(grants) | set(admins))
             if not grants and not args.user:
                 skipped.append({"asset": asset.id, "reason": "no_owner_no_grant"})
                 continue
@@ -544,6 +550,53 @@ def cmd_sync_data_plane(args):
         store.close()
     print(json.dumps(summary, ensure_ascii=False, indent=1))
     engine.dispose()
+
+
+def cmd_reconcile_data_plane(args):
+    _, engine, factory, _ = _context(args)
+    data_key = base64.b64decode(_required_env("KVMHUB_DATA_PLANE_KEY"), validate=True)
+    if len(data_key) != 32:
+        raise SystemExit("KVMHUB_DATA_PLANE_KEY must decode to 32 bytes")
+    stamp = time.time()
+    expected: dict[str, set[str]] = {}
+    with transaction(factory) as db:
+        for asset in db.scalars(select(PlatformAsset)).all():
+            users = {row[0] for row in db.execute(
+                select(AccessGrant.user_id).where(
+                    AccessGrant.asset_id == asset.id, AccessGrant.expires > stamp)).all()}
+            if asset.tenant_id:
+                users |= {row[0] for row in db.execute(
+                    select(UserRole.user_id)
+                    .join(Role, Role.id == UserRole.role_id)
+                    .join(User, User.id == UserRole.user_id)
+                    .where(Role.code == ROLE_ADMIN, User.tenant_id == asset.tenant_id,
+                           User.is_active.is_(True))).all()}
+            if users:
+                expected[asset.id] = users
+    store = Store(str(args.store), data_key)
+    try:
+        actual: dict[str, set[str]] = {}
+        wildcard_assets: list[str] = []
+        for row in store.db.execute("SELECT asset_id,user_id,expires FROM access_grant "
+                                    "WHERE expires>?", (stamp,)).fetchall():
+            aid, uid = row[0], row[1]
+            if uid == TENANT_GRANT:
+                wildcard_assets.append(aid)
+                continue
+            actual.setdefault(aid, set()).add(uid)
+    finally:
+        store.close()
+    drift = []
+    for aid in sorted(set(expected) | set(actual)):
+        missing = expected.get(aid, set()) - actual.get(aid, set())
+        extra = actual.get(aid, set()) - expected.get(aid, set())
+        if missing or extra:
+            drift.append({"asset": aid, "missing": sorted(missing), "extra": sorted(extra)})
+    result = {"clean": not drift, "assets": len(expected),
+              "wildcard_assets": sorted(set(wildcard_assets)), "drift": drift}
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+    engine.dispose()
+    return result
 
 
 def cmd_register_worker(args):
@@ -643,6 +696,11 @@ def parser():
     q.add_argument("--grant-days", type=int, default=30)
     q.add_argument("--dry-run", action="store_true")
     q.set_defaults(fn=cmd_sync_data_plane)
+    q = sub.add_parser("reconcile-data-plane",
+                       help="read-only per-user grant drift check before enabling strict grants")
+    q.add_argument("--store", required=True,
+                   help="data-plane store DSN: sqlite path or mysql://user:password@host:3306/db")
+    q.set_defaults(fn=cmd_reconcile_data_plane)
     q = sub.add_parser("register-worker", help="register/refresh a Worker in the shared roster")
     q.add_argument("--worker-id", required=True)
     q.add_argument("--instance-id", required=True)

@@ -13,6 +13,9 @@ dependencies = [
   # Independent fixed-Host route resolver process: uvloop is mandatory for the
   # Python fallback in design §6.3; the module still imports without it locally.
   "uvloop==0.23.0",
+  # Optional out-of-band BMC reset (platform maintenance action). Imported
+  # lazily in kvmhub/platform/bmc_reset.py so the app still imports without it.
+  "pyghmi==1.6.19", "python-dateutil==4.0.0",
 ]
 
 [project.optional-dependencies]
