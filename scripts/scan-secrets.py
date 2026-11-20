@@ -33,6 +33,10 @@ RULES: list[tuple[str, re.Pattern, str]] = [
         r"(?i)['\"]?\w*(passwd|password|pwd|secret|api[_-]?key|apikey)['\"]?\s*[=:]\s*"
         r"(?:['\"]([^'\"]{1,})['\"]|(\S{1,}))"
     ), "明文口令 / 密钥赋值"),
+    ("CREDENTIAL_PAIR", re.compile(
+        r"(?i)[\"'](?:basic\s+)?(root|admin|administrator|guest|operator|manager)"
+        r":([^\"'\s]{3,})[\"']"
+    ), "明文账户口令对"),
     ("CONN_STRING", re.compile(r"(?i)(mysql|redis|postgresql|mongodb)://\w+:[^@\s]+@"), "连接字符串含密码"),
     ("HOME_PATH", re.compile(
         r"(?<![\w.:/-])/(?:Users|home)/[A-Za-z0-9._-]+(?=/|[\s\"'<>,;)\]}]|$)"
@@ -57,6 +61,7 @@ SAFE_SYNTHETIC_VALUES = {
     "p", "u", "x", "wrong", "synthetic-password", "synthetic-user",
     "unit-test-password", "sim-password", "live-password", "local-admin",
 }
+KNOWN_DEFAULT_CREDENTIALS = {"calvin"}
 _PLACEHOLDER = re.compile(
     r"^(?:<.*|\$\{.*|\$\(.*|\{.*|os\..*|getenv.*|environ.*|%.*|None|null|\*+|x+|\.+)$",
     re.IGNORECASE,
@@ -135,6 +140,10 @@ def scan_file(path: Path, text: str | None = None) -> list[tuple[int, str, str, 
                         continue
                 if rule_id == "PASSWORD_ASSIGN" and _safe_password_value(match, line):
                     continue
+                if rule_id == "CREDENTIAL_PAIR":
+                    value = match.group(2).strip().lower()
+                    if value in SAFE_SYNTHETIC_VALUES or value in KNOWN_DEFAULT_CREDENTIALS:
+                        continue
                 if rule_id == "HOME_PATH" and matched.rsplit("/", 1)[-1].lower() in SAFE_HOME_USERS:
                     continue
                 if rule_id in {"MDNS_HOSTNAME", "LOCAL_HOSTNAME"}:
