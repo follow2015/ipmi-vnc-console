@@ -11,8 +11,9 @@ from contextlib import contextmanager
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
-from .common import (IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
-                     PASSTHROUGH_ADAPTER_ID, Problem,
+from .common import (HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+                     IDRAC8_ADAPTER_ID,
+                     IDRAC_VNC_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID, Problem,
                      bmc_allowed_networks_from_env, parse_controlled_networks)
 from .sql_backend import (INTEGRITY_ERRORS, mysql_capability_ddl, open_store,
                           parse_store_dsn)
@@ -601,11 +602,13 @@ class Store:
         if row["adapter"] == "mock-v1":
             return True
         if row["adapter"] not in (PASSTHROUGH_ADAPTER_ID, IDRAC8_ADAPTER_ID,
-                                  IDRAC_VNC_ADAPTER_ID):
+                                  IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+                                  HUAWEI_IBMC_KVM_GATEWAY_ID):
             return False
         if row["target"] not in self.passthrough_targets:
             return False
-        if row["adapter"] == IDRAC_VNC_ADAPTER_ID:
+        if row["adapter"] in (IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+                              HUAWEI_IBMC_KVM_GATEWAY_ID):
             import ipaddress
             from urllib.parse import urlsplit
             host = urlsplit(str(row["target"])).hostname

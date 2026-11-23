@@ -14,6 +14,7 @@ class ApiError(Contract):
     error: str
     message: str
     trace_id: str
+    retryable: bool = False
 
 
 class OkResult(Contract):
@@ -88,6 +89,7 @@ class Me(Contract):
     user_id: str
     username: str
     tenant_id: str | None = None
+    tenant_mode: str | None = None
     roles: list[str]
     permissions: list[str]
     csrf: str
@@ -110,7 +112,9 @@ class Asset(Contract):
     id: str
     tenant_id: str | None = None
     name: str
-    address: str
+    address: str | None = None
+    public_ip: str | None = None
+    public_ips: list[str] = []
     vendor: str
     model: str
     firmware: str
@@ -123,6 +127,17 @@ class Asset(Contract):
     grant_expires: float | None = None
     occupancy: AssetOccupancy | None = None
     occupancy_available: bool = False
+
+
+class PublicIpMapping(Contract):
+    id: str
+    tenant_id: str
+    asset_id: str
+    primary_ip: str
+    additional_ips: str
+    public_ips: list[str] = []
+    created: float
+    updated: float
 
 
 class PlatformAsset(Asset):
@@ -175,6 +190,38 @@ class VendorProfile(Contract):
     approver: str
     review_due: float
     priority: int
+
+
+class OnboardCapability(Contract):
+
+    id: str
+    model: str
+    firmware: str
+    adapter: str
+    status: str
+    expires: float
+
+
+class OnboardBrand(Contract):
+
+    profile_id: str
+    code: str
+    vendor: str
+    model_pattern: str
+    firmware_min: str
+    firmware_max: str
+    licence: str
+    console_impl: str
+    certificate_mode: str
+    certificate_note: str
+    default_capability_id: str | None = None
+    capabilities: list[OnboardCapability]
+
+
+class AssetOnboarding(Contract):
+
+    brands: list[OnboardBrand]
+    note: str
 
 
 class VendorProfileView(VendorProfile):
@@ -258,6 +305,21 @@ class DetectResult(Contract):
     connection_plan: dict[str, Any] | None = None
 
 
+class AssetProbeResult(Contract):
+
+    address: str
+    public_ips: list[str] = []
+    certificate_sha256: str
+    redfish_auth: str
+    detection: Detection
+    matched: bool
+    usable: bool
+    reason: str
+    profile_id: str | None = None
+    profile_code: str = ""
+    note: str = ""
+
+
 class ConnectionPlan(Contract):
     rfb_version: str
     message_profile: str
@@ -338,6 +400,7 @@ class SessionView(Contract):
     asset_id: str
     asset_name: str | None = None
     asset_address: str | None = None
+    asset_public_ip: str | None = None
     worker_id: str
     status: str
     cleanup: str
@@ -465,6 +528,10 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/users/{user_id}/active": {"post": "OkResult"},
     "/api/v2/users/{user_id}/password": {"post": "OkResult"},
     "/api/v2/assets": {"get": "list:Asset", "post": "Asset"},
+    "/api/v2/asset-onboarding": {"get": "AssetOnboarding"},
+    "/api/v2/assets/probe": {"post": "AssetProbeResult"},
+    "/api/v2/public-ips": {"get": "list:PublicIpMapping"},
+    "/api/v2/public-ips/{asset_id}": {"put": "PublicIpMapping"},
     "/api/v2/credentials": {"get": "list:CredentialCreated", "post": "CredentialCreated"},
     "/api/v2/grants": {"post": "OkResult"},
     "/api/v2/asset-groups": {"get": "list:AssetGroup", "post": "AssetGroup"},
@@ -496,7 +563,7 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/platform/workers/{worker_id}/drain": {"post": "WorkerInfo"},
     "/api/v2/platform/vendor-profiles": {"get": "list:VendorProfileView"},
     "/api/v2/platform/capabilities": {"get": "list:CapabilityView"},
-    "/api/v2/platform/assets": {"get": "list:PlatformAsset"},
+    "/api/v2/platform/assets": {"get": "list:PlatformAsset", "post": "Asset"},
     "/api/v2/platform/assets/assign": {"post": "AssetAssignment"},
     "/api/v2/platform/assets/grant": {"post": "PlatformGrantResult"},
     "/api/v2/platform/assets/{asset_id}/reset": {"post": "AssetResetResult"},

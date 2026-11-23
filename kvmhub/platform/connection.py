@@ -8,8 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import capability as poc_capability
-from ..common import (IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
-                      PASSTHROUGH_ADAPTER_ID)
+from ..common import (HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+                      IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID)
 from . import services, vendor_registry
 from .models import (CAPABILITY_VERIFIED, DEFAULT_TENANT_ID, PROFILE_APPROVED,
                      TENANT_ACTIVE, Asset, Capability, Tenant, VendorProfile,
@@ -35,7 +35,8 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
         raise ConnectionRefused("profile_not_approved",
                                 f"品牌档案 {profile.code} 未审批，不能生成连接配置")
     impl = str(profile.console_impl or "passthrough").strip()
-    if impl not in ("passthrough", IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID):
+    if impl not in ("passthrough", IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
+                    HUAWEI_IBMC_VNC_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID):
         raise ConnectionRefused("adapter_unavailable",
                                 f"档案声明的适配器 {profile.console_impl} 尚未接入数据面")
 
@@ -68,7 +69,9 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
         "firmware": firmware,
         "adapter": {"passthrough": PASSTHROUGH_ADAPTER_ID,
                     IDRAC8_ADAPTER_ID: IDRAC8_ADAPTER_ID,
-                    IDRAC_VNC_ADAPTER_ID: IDRAC_VNC_ADAPTER_ID}[impl],
+                    IDRAC_VNC_ADAPTER_ID: IDRAC_VNC_ADAPTER_ID,
+                    HUAWEI_IBMC_VNC_ADAPTER_ID: HUAWEI_IBMC_VNC_ADAPTER_ID,
+                    HUAWEI_IBMC_KVM_GATEWAY_ID: HUAWEI_IBMC_KVM_GATEWAY_ID}[impl],
         "models": [model],
         "firmware_min": str(profile.firmware_min or "").strip(),
         "firmware_max": str(profile.firmware_max or "").strip(),

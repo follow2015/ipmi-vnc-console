@@ -1,4 +1,4 @@
-"""I-4: the local/CI gate must fail loudly on security regressions."""
+"""scan-secrets: fixtures-allowed — 本文件刻意构造明文凭据样本验证闸门拦截逻辑，这些字面量是测试输入而非真实机密。"""
 from pathlib import Path
 
 from tools import gate
@@ -20,6 +20,7 @@ def test_repository_gate_is_clean():
     assert gate.check_lockfile(ROOT) == []
     assert gate.check_test_imports(ROOT) == []
     assert gate.check_collection(ROOT) == []
+    assert gate.check_document_plaintext_secrets(ROOT) == []
 
 
 def test_gate_allows_only_the_value_free_env_template(monkeypatch):
@@ -65,6 +66,28 @@ def test_gate_catches_a_test_importing_an_absent_local_module(tmp_path):
         "from tools.absent_check import Relay\n")
     problems = gate.check_test_imports(tmp_path)
     assert any("tools.absent_check" in problem for problem in problems)
+
+
+def test_gate_catches_plaintext_credential_in_doc_prose(tmp_path):
+    import subprocess
+    (tmp_path / "docs").mkdir()
+    note = tmp_path / "docs" / "note.md"
+    note.write_text('# 排障记录\n\nBMC 登录用 "root:calvin" 可成功。\n')
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=False)
+    subprocess.run(["git", "add", "docs/note.md"], cwd=tmp_path, check=False)
+    findings = gate.check_document_plaintext_secrets(tmp_path)
+    assert findings, "a plaintext credential in docs must fail the gate"
+    assert any("CREDENTIAL_PAIR" in f and "note.md" in f for f in findings)
+
+
+def test_gate_ignores_narrative_password_word_in_docs(tmp_path):
+    import subprocess
+    (tmp_path / "docs").mkdir()
+    note = tmp_path / "docs" / "note.md"
+    note.write_text('看到 Password: 提示符后输入，VNC 密码 write-only。\n')
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=False)
+    subprocess.run(["git", "add", "docs/note.md"], cwd=tmp_path, check=False)
+    assert gate.check_document_plaintext_secrets(tmp_path) == []
 
 
 def test_gate_detects_unpinned_or_drifted_lockfile(tmp_path):

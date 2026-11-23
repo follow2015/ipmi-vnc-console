@@ -174,3 +174,58 @@ def test_mode_changes_are_audited(rig):
         rows = db.scalars(select(AuditLog).where(AuditLog.action == "tenant_updated")).all()
     assert any("mode" in (row.detail or "") and "consumer" in (row.detail or "")
                for row in rows)
+
+
+def test_me_carries_tenant_mode_for_role_picker(rig):
+    client, _ = rig
+    assert client.get("/api/v2/me", headers=client.tenant("use")).json()["tenant_mode"] == "consumer"
+    assert client.get("/api/v2/me", headers=client.tenant("manage")).json()["tenant_mode"] == "manager"
+
+
+def test_consumer_tenant_has_no_operator_role(rig):
+    client, tenants = rig
+    h = client.tenant("use")
+    r = client.post("/api/v2/users", headers=h, json={
+        "username": "would-be-op", "password": PASSWORD, "role": "operator"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"] == "role_not_allowed"
+
+    created = client.post("/api/v2/users", headers=h, json={
+        "username": "plain-user", "password": PASSWORD, "role": "viewer"})
+    assert created.status_code == 200, created.text
+    uid = created.json()["id"]
+
+    r = client.post(f"/api/v2/platform/tenants/{tenants['use']}/users",
+                    headers=client.admin(), json={
+                        "username": "platform-op", "password": PASSWORD,
+                        "role": "operator"})
+    assert r.status_code == 400, r.text
+    r = client.patch(f"/api/v2/platform/users/{uid}/role", headers=client.admin(),
+                     json={"role": "operator"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"] == "role_not_allowed"
+
+    assert client.patch(f"/api/v2/platform/users/{uid}/role", headers=client.admin(),
+                        json={"role": "admin"}).status_code == 200
+
+
+def test_manager_tenant_can_still_assign_operator(rig):
+    client, tenants = rig
+    r = client.post(f"/api/v2/platform/tenants/{tenants['manage']}/users",
+                    headers=client.admin(), json={
+                        "username": "mgr-op", "password": PASSWORD, "role": "operator"})
+    assert r.status_code == 200, r.text
+    assert r.json()["roles"] == ["operator"]
+
+
+def test_manager_operator_has_no_account_management_or_grant(rig):
+    client, tenants = rig
+    client.post(f"/api/v2/platform/tenants/{tenants['manage']}/users",
+                headers=client.admin(), json={
+                    "username": "mgr-op", "password": PASSWORD, "role": "operator"})
+    h = client.login("mgr-op")
+    perms = set(client.get("/api/v2/me", headers=h).json()["permissions"])
+    assert "console.open" in perms and "asset.read" in perms
+    assert not ({"user.read", "user.write", "grant.write"} & perms)
+    assert client.get("/api/v2/users", headers=h).status_code == 403
+    assert client.post("/api/v2/grants", headers=h, json={}).status_code == 403

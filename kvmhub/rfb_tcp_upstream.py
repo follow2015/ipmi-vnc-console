@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import re
 import socket
+import ssl
 import struct
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from .common import Problem
@@ -69,6 +72,8 @@ class RfbTcpConfig:
     password: str
     port: int = 5901
     versions: tuple[str, ...] = RFB_VERSIONS
+    tls_enabled: bool = False
+    tls_cert_sha256: str = ""
     connect_timeout: float = 5.0
     handshake_timeout: float = 25.0
     max_frame_bytes: int = 8 * 1024 * 1024
@@ -82,6 +87,12 @@ class RfbTcpConfig:
                 or any(not isinstance(v, str) or not re.fullmatch(r"RFB \d{3}\.\d{3}", v)
                        for v in self.versions)):
             raise ValueError("invalid_protocol_versions")
+        if not isinstance(self.tls_enabled, bool):
+            raise ValueError("invalid_tls_enabled")
+        if (not isinstance(self.tls_cert_sha256, str)
+                or (self.tls_cert_sha256 != ""
+                    and not re.fullmatch(r"[0-9a-fA-F]{64}", self.tls_cert_sha256))):
+            raise ValueError("invalid_tls_cert_sha256")
         if not isinstance(self.password, str) or not self.password or len(self.password) > 128:
             raise ValueError("invalid_vnc_password")
         for value in (self.connect_timeout, self.handshake_timeout):
@@ -94,23 +105,69 @@ class RfbTcpConfig:
 
     def __repr__(self) -> str:
         return (f"RfbTcpConfig(host={self.host!r}, port={self.port}, "
-                f"versions={self.versions!r}, password=<redacted>)")
+                f"tls={self.tls_enabled}, versions={self.versions!r}, "
+                f"password=<redacted>)")
+
+
+HANDSHAKE_STAGES: tuple[str, ...] = (
+    "tcp_connect", "greeting", "security_types", "challenge",
+    "security_result", "server_init",
+)
+
+FAILURE_REASONS = frozenset({
+    "tcp_connect_timeout", "tcp_connect_error", "greeting_timeout",
+    "greeting_incomplete", "greeting_invalid", "security_types_timeout",
+    "security_types_invalid", "security_type_unsupported", "challenge_timeout",
+    "challenge_incomplete", "auth_failed", "auth_timeout",
+    "server_init_timeout", "server_init_incomplete", "server_init_invalid",
+    "budget_exceeded", "tls_cert_pin_mismatch", "closed",
+})
+
+
+@dataclass
+class HandshakeTrace:
+    stage: str = "tcp_connect"
+    elapsed_ms: dict[str, int] = field(default_factory=dict)
+    offered_security_types: tuple[int, ...] = ()
+    failure_reason: str = ""
+
+    def begin(self, stage: str) -> None:
+        self.stage = stage
+
+    def mark(self, stage: str, started: float) -> None:
+        if stage in HANDSHAKE_STAGES:
+            self.elapsed_ms[stage] = max(0, int((time.monotonic() - started) * 1000))
+        self.stage = stage
+
+    def fail(self, reason: str) -> None:
+        self.failure_reason = reason if reason in FAILURE_REASONS else "closed"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "elapsed_ms": dict(self.elapsed_ms),
+            "offered_security_types": list(self.offered_security_types),
+            "failure_reason": self.failure_reason,
+        }
 
 
 @dataclass
 class TcpRelayStats:
     frames: int = 0
+    chunks: int = 0
     bytes: int = 0
     protocol_version: str = ""
     security_type: int | None = None
     width: int = 0
     height: int = 0
+    trace: HandshakeTrace = field(default_factory=HandshakeTrace)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"frames": self.frames, "bytes": self.bytes,
+        return {"frames": self.frames, "chunks": self.chunks, "bytes": self.bytes,
                 "protocol_version": self.protocol_version,
                 "security_type": self.security_type,
-                "width": self.width, "height": self.height}
+                "width": self.width, "height": self.height,
+                "trace": self.trace.as_dict()}
 
 
 class RfbTcpUpstream:
@@ -125,22 +182,71 @@ class RfbTcpUpstream:
         self._send_lock = asyncio.Lock()
         self._closed = False
 
+    def _peer_cert_matches_pin(self) -> bool:
+        expected = self.cfg.tls_cert_sha256.lower().replace(":", "")
+        if not expected or self._writer is None:
+            return False
+        ssl_obj = self._writer.get_extra_info("ssl_object")
+        if ssl_obj is None:
+            return False
+        try:
+            der = ssl_obj.getpeercert(binary_form=True)
+        except (ValueError, OSError):
+            return False
+        if not der:
+            return False
+        return hashlib.sha256(der).hexdigest() == expected
+
     async def connect(self) -> None:
         if self._closed:
+            self.stats.trace.fail("closed")
             raise Problem("upstream_unavailable", 502)
+        trace = self.stats.trace
+        started = time.monotonic()
         try:
+            ssl_ctx = None
+            server_hostname = None
+            if self.cfg.tls_enabled:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                server_hostname = self.cfg.host
             async with asyncio.timeout(self.cfg.connect_timeout):
                 self._reader, self._writer = await asyncio.open_connection(
-                    self.cfg.host, self.cfg.port, limit=self.cfg.max_frame_bytes)
+                    self.cfg.host, self.cfg.port, limit=self.cfg.max_frame_bytes,
+                    ssl=ssl_ctx, server_hostname=server_hostname)
+            trace.mark("tcp_connect", started)
+            if self.cfg.tls_enabled:
+                if not self._peer_cert_matches_pin():
+                    trace.fail("tls_cert_pin_mismatch")
+                    await self.close()
+                    raise Problem("bmc_cert_pin_mismatch", 502)
             sock = self._writer.get_extra_info("socket")
-            if sock is not None:
+            if sock is not None and not self.cfg.tls_enabled:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             async with asyncio.timeout(self.cfg.handshake_timeout):
                 await self._handshake()
-        except Problem:
+        except Problem as exc:
+            if not trace.failure_reason:
+                trace.fail("auth_failed" if exc.code == "bmc_auth_failed" else "closed")
             await self.close()
             raise
-        except (OSError, TimeoutError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, TimeoutError) as exc:
+            phase = trace.stage
+            reason = {
+                "tcp_connect": "tcp_connect_timeout",
+                "greeting": "greeting_incomplete" if isinstance(exc, asyncio.IncompleteReadError) else "greeting_timeout",
+                "security_types": "security_types_timeout",
+                "challenge": "challenge_incomplete" if isinstance(exc, asyncio.IncompleteReadError) else "challenge_timeout",
+                "security_result": "auth_timeout",
+                "server_init": "server_init_incomplete" if isinstance(exc, asyncio.IncompleteReadError) else "server_init_timeout",
+            }.get(phase, "tcp_connect_timeout")
+            trace.fail(reason)
+            await self.close()
+            raise Problem("upstream_unavailable", 502) from None
+        except OSError:
+            reason = "tcp_connect_error" if trace.stage == "tcp_connect" else "closed"
+            trace.fail(reason)
             await self.close()
             raise Problem("upstream_unavailable", 502) from None
 
@@ -150,51 +256,84 @@ class RfbTcpUpstream:
             raise Problem("upstream_handshake_failed", 502)
         return await self._reader.readexactly(count)
 
+    def _handshake_fail(self, stage: str, reason: str) -> Problem:
+        self.stats.trace.fail(reason)
+        return Problem("bmc_auth_failed" if reason == "auth_failed"
+                       else "upstream_handshake_failed", 502)
+
     async def _handshake(self) -> None:
         assert self._writer is not None
+        trace = self.stats.trace
+
+        started = time.monotonic()
+        trace.begin("greeting")
         greeting = await self._read_exactly(RFB_VERSION_BYTES)
-        version = greeting[:-1].decode("ascii", "strict") if greeting.endswith(b"\n") else ""
-        if not greeting.endswith(b"\n") or version not in self.cfg.versions:
-            raise Problem("upstream_handshake_failed", 502)
+        version = ""
+        if greeting.endswith(b"\n"):
+            try:
+                version = greeting[:-1].decode("ascii", "strict")
+            except UnicodeDecodeError:
+                version = ""
+        if not version or version not in self.cfg.versions:
+            trace.mark("greeting", started)
+            raise self._handshake_fail("greeting", "greeting_invalid")
+        trace.mark("greeting", started)
         self.protocol_version = version
         self.stats.protocol_version = version
         self._write((version + "\n").encode("ascii"))
 
+        started = time.monotonic()
+        trace.begin("security_types")
         count = (await self._read_exactly(1))[0]
         if not 1 <= count <= MAX_SECURITY_TYPES:
-            raise Problem("upstream_handshake_failed", 502)
+            trace.mark("security_types", started)
+            raise self._handshake_fail("security_types", "security_types_invalid")
         types = await self._read_exactly(count)
+        trace.offered_security_types = tuple(int(t) for t in types)
+        trace.mark("security_types", started)
         if SECURITY_VNC_AUTH in types:
             selected = SECURITY_VNC_AUTH
         elif SECURITY_NONE in types and not self.cfg.password:  # pragma: no cover - password required
             selected = SECURITY_NONE
         else:
-            raise Problem("upstream_handshake_failed", 502)
+            raise self._handshake_fail("security_types", "security_type_unsupported")
         self.stats.security_type = selected
         self._write(bytes([selected]))
 
         if selected == SECURITY_VNC_AUTH:
+            started = time.monotonic()
+            trace.begin("challenge")
             challenge = await self._read_exactly(16)
             self._write(vnc_auth_response(challenge, self.cfg.password))
             del challenge
+            trace.mark("challenge", started)
+
+            started = time.monotonic()
+            trace.begin("security_result")
             result = struct.unpack(">I", await self._read_exactly(4))[0]
             if result != 0:
                 if version == "RFB 003.008":
                     length = struct.unpack(">I", await self._read_exactly(4))[0]
                     if length <= MAX_DESKTOP_NAME_BYTES:
                         await self._read_exactly(length)
-                raise Problem("bmc_auth_failed", 502)
+                trace.mark("security_result", started)
+                raise self._handshake_fail("security_result", "auth_failed")
+            trace.mark("security_result", started)
 
+        started = time.monotonic()
+        trace.begin("server_init")
         self._write(b"\x01")
         fixed = await self._read_exactly(SERVERINIT_FIXED_BYTES)
         name_len = struct.unpack(">I", await self._read_exactly(4))[0]
         if not 0 <= name_len <= MAX_DESKTOP_NAME_BYTES:
-            raise Problem("upstream_handshake_failed", 502)
+            trace.mark("server_init", started)
+            raise self._handshake_fail("server_init", "server_init_invalid")
         name = await self._read_exactly(name_len) if name_len else b""
         self.server_init_raw = fixed + struct.pack(">I", name_len) + name
         self.stats.width = struct.unpack(">H", fixed[0:2])[0]
         self.stats.height = struct.unpack(">H", fixed[2:4])[0]
         del name
+        trace.mark("server_init", started)
 
     def _write(self, data: bytes) -> None:
         assert self._writer is not None
@@ -208,9 +347,11 @@ class RfbTcpUpstream:
             data = await reader.read(MAX_CHUNK_BYTES)
             if not data:
                 return
-            self.stats.frames += 1
+            self.stats.chunks += 1
+            self.stats.frames = self.stats.chunks
             self.stats.bytes += len(data)
             if self.stats.bytes > self.cfg.max_total_bytes:
+                self.stats.trace.fail("budget_exceeded")
                 raise Problem("upstream_budget_exceeded", 502)
             await on_bytes(data)
 

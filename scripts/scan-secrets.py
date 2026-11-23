@@ -54,6 +54,11 @@ SAFE_IPS = {
     "1.2.3.4", "239.0.0.1", "255.255.255.0", "255.255.0.0", "255.0.0.0",
     "8.78.1.2",
     "10.0.0.1",
+    "100.100.100.200",
+    "169.254.169.254",
+    "169.254.170.2",
+    "169.254.1.2",
+    "224.0.0.1",
 }
 SAFE_NETWORKS = ("192.0.2.", "198.51.100.", "203.0.113.")
 
@@ -61,7 +66,7 @@ SAFE_SYNTHETIC_VALUES = {
     "p", "u", "x", "wrong", "synthetic-password", "synthetic-user",
     "unit-test-password", "sim-password", "live-password", "local-admin",
 }
-KNOWN_DEFAULT_CREDENTIALS = {"calvin"}
+KNOWN_DEFAULT_CREDENTIALS: set[str] = set()
 _PLACEHOLDER = re.compile(
     r"^(?:<.*|\$\{.*|\$\(.*|\{.*|os\..*|getenv.*|environ.*|%.*|None|null|\*+|x+|\.+)$",
     re.IGNORECASE,

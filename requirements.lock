@@ -25,6 +25,7 @@ markupsafe==3.0.4
 multidict==7.2.1
 opentelemetry-api==1.45.2
 packaging==26.3
+pillow==13.0.0
 pluggy==1.7.0
 propcache==0.5.4
 pyghmi==1.6.19

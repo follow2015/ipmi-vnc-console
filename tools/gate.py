@@ -33,6 +33,58 @@ def tracked_secrets(root: Path) -> list[str]:
             if name and name not in SAFE_ENV_TEMPLATES and SECRET_NAME.search(name)]
 
 
+CREDENTIAL_RULES = frozenset({
+    "PRIVATE_KEY", "GITHUB_TOKEN", "AWS_KEY", "SLACK_TOKEN", "SK_PREFIX",
+    "PASSWORD_ASSIGN", "CREDENTIAL_PAIR", "CONN_STRING",
+})
+DOC_ROOT = "docs/"
+SCANNED_DOC_SUFFIXES = (".md",)
+
+
+def check_document_plaintext_secrets(root: Path) -> list[str]:
+    result = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return []
+    scripts = ROOT / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_kvm_scan_secrets", scripts / "scan-secrets.py")
+        if spec is None or spec.loader is None:
+            return []
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        scan_file = module.scan_file
+    except Exception as exc:
+        return [f"secret scanner could not be loaded: {exc}"]
+
+    findings: list[str] = []
+    for name in result.stdout.split("\0"):
+        if not name or not name.startswith(DOC_ROOT) or not name.endswith(SCANNED_DOC_SUFFIXES):
+            continue
+        path = root / name
+        if not path.is_file():
+            continue
+        for lineno, rule_id, matched, desc in scan_file(path):
+            if rule_id not in CREDENTIAL_RULES:
+                continue
+            if rule_id == "PASSWORD_ASSIGN" and _is_cjk_narrative(matched):
+                continue
+            findings.append(f"{name}:{lineno} [{rule_id}] {desc}: {matched[:60]}")
+    return findings
+
+
+def _is_cjk_narrative(matched: str) -> bool:
+    _, sep, value = matched.partition(":")
+    if not sep:
+        _, sep, value = matched.partition("=")
+    value = value.strip().strip("'\"").lstrip()
+    return bool(value) and "\u4e00" <= value[0] <= "\u9fff"
+
+
 def check_error_codes() -> list[str]:
     from kvmhub.common import ERROR_STATUS, Problem
     return [code for code, status in ERROR_STATUS.items()
@@ -126,6 +178,7 @@ def main() -> int:
     problems = {
         "missing .gitignore rules": check_gitignore(ROOT),
         "tracked secret-like files": tracked_secrets(ROOT),
+        "plaintext credentials in docs": check_document_plaintext_secrets(ROOT),
         "unstable error codes": check_error_codes(),
         "lockfile pin drift": check_lockfile(ROOT),
         "tests importing absent modules": check_test_imports(ROOT),
@@ -137,8 +190,8 @@ def main() -> int:
             failed = True
             print(f"GATE FAIL: {label}: {items}", file=sys.stderr)
     if not failed:
-        print("GATE OK: ignore rules, tracked secrets, error codes, lockfile pins, "
-              "test imports and test collection are clean")
+        print("GATE OK: ignore rules, tracked secrets, doc plaintext credentials, "
+              "error codes, lockfile pins, test imports and test collection are clean")
     return 1 if failed else 0
 
 

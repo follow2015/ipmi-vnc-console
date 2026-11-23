@@ -1,6 +1,8 @@
 """Production control-plane HTTP API (FastAPI)."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,11 +20,13 @@ from .models import (Asset, Capability, Credential, ROLE_ADMIN, Tenant, User,
 from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
-from . import bmc_reset, connection, governance, services, text_input, vendor_registry
+from . import (bmc_probe, bmc_reset, connection, governance, public_ip,
+               services, text_input, vendor_registry)
 from .bus import AssemblyBus, BusError
 from .contracts import CONTRACT_RESPONSES, contract_components, response_schema
 
 MAX_BODY = 65536
+logger = logging.getLogger("kvmhub.platform.api")
 
 
 async def _drop_user_sessions(state: State, user_id: str) -> None:
@@ -121,6 +125,44 @@ async def _json(request: Request) -> dict:
     return value
 
 
+def _save_asset_from_body(db, body: dict, *, tenant_id: str, actor: str):
+    edit_id = str(body.get("id") or "") or None
+    existing = None
+    if edit_id:
+        candidate = db.get(Asset, edit_id)
+        if candidate is not None and candidate.tenant_id == tenant_id:
+            existing = candidate
+    if existing is None:
+        existing = db.scalar(select(Asset).where(
+            Asset.address == str(body.get("address", "")),
+            Asset.tenant_id == tenant_id))
+    optional = {key: body[key] if key in body else getattr(existing, key, None)
+                for key in ("vendor", "model", "firmware", "fingerprint",
+                            "credential_id", "profile_id", "capability_id", "licence", "notes")}
+    if existing is not None:
+        if any(optional[key] != getattr(existing, key)
+               for key in ("vendor", "model", "firmware", "profile_id")):
+            optional["capability_id"] = None
+    if optional["profile_id"]:
+        defaults = services.resolve_asset_defaults(
+            db, profile_id=optional["profile_id"], tenant_id=tenant_id)
+        if not optional["vendor"]:
+            optional["vendor"] = defaults["vendor"]
+        if not optional["licence"]:
+            optional["licence"] = defaults["licence"]
+        if existing is None and defaults["capability_id"]:
+            optional["capability_id"] = defaults["capability_id"]
+    public_ips = body["public_ips"] if "public_ips" in body else None
+    return services.upsert_asset(
+        db, name=str(body.get("name", "")), address=str(body.get("address", "")),
+        vendor=str(optional["vendor"] or ""), model=str(optional["model"] or ""),
+        firmware=str(optional["firmware"] or ""), fingerprint=str(optional["fingerprint"] or ""),
+        credential_id=optional["credential_id"], profile_id=optional["profile_id"],
+        capability_id=optional["capability_id"], licence=str(optional["licence"] or ""),
+        notes=str(optional["notes"] or ""), public_ips=public_ips,
+        asset_id=edit_id, actor=actor, tenant_id=tenant_id)
+
+
 def create_app(cfg: Settings | None = None, *, state: State | None = None,
                plane=None) -> FastAPI:
     platform = Platform(cfg or load_settings(), state=state, plane=plane)
@@ -132,11 +174,15 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
 
     app = FastAPI(title="KVM Hub 控制面", version="2.0.0", lifespan=lifespan)
     app.state.platform = platform
+    app.state.probe_semaphore = asyncio.Semaphore(4)
 
     @app.exception_handler(services.PlatformError)
     async def on_error(request: Request, exc: services.PlatformError):
-        return JSONResponse({"error": exc.code, "message": exc.message,
-                             "trace_id": request.state.trace}, status_code=exc.status)
+        body = {"error": exc.code, "message": exc.message,
+                "trace_id": request.state.trace}
+        if exc.retryable:
+            body["retryable"] = True
+        return JSONResponse(body, status_code=exc.status)
 
     @app.middleware("http")
     async def guards(request: Request, call_next):
@@ -194,6 +240,11 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                                  tenant_id=auth["tenant_id"])
         return auth
 
+    def show_ipmi_for(auth: dict) -> bool:
+        with transaction(platform.factory) as db:
+            return "asset.write" in services.effective_permissions(
+                db, auth["user_id"], auth["tenant_id"])
+
     async def current_platform(request: Request, *, mutate: bool = False,
                                permission: str | None = None) -> dict:
         auth = await current(request, mutate=mutate, tenant_required=False,
@@ -229,7 +280,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         with transaction(platform.factory) as db:
             assets = db.scalars(select(Asset).where(Asset.tenant_id == auth["tenant_id"])
                                 .order_by(Asset.address)).all()
-            return {"assets": [a.public() for a in assets]}
+            return {"assets": [public_ip.view(a, db, show_ipmi=True) for a in assets]}
 
     @app.post("/api/v2/integration/console/open")
     async def integration_console_open(request: Request):
@@ -241,9 +292,9 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         operator = str(body.get("operator", "") or "")[:128]
         with transaction(platform.factory) as db:
             if not asset_id and address:
-                row = db.scalar(select(Asset.id).where(Asset.address == address,
-                                                      Asset.tenant_id == auth["tenant_id"]))
-                asset_id = str(row or "")
+                resolved = public_ip.asset_by_public_ip(
+                    db, auth["tenant_id"], address)
+                asset_id = resolved.id if resolved is not None else ""
             try:
                 assembly = connection.assembly(
                     db, asset_id=asset_id, user_id=auth["user_id"],
@@ -390,9 +441,11 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         with transaction(platform.factory) as db:
             perms = sorted(services.effective_permissions(
                 db, auth["user_id"], auth["tenant_id"]))
+            tenant = db.get(Tenant, auth["tenant_id"])
+            tenant_mode = tenant.mode if tenant is not None else None
         return {"user_id": auth["user_id"], "username": auth["username"],
-                "tenant_id": auth["tenant_id"], "roles": auth["roles"],
-                "permissions": perms, "csrf": auth["csrf"]}
+                "tenant_id": auth["tenant_id"], "tenant_mode": tenant_mode,
+                "roles": auth["roles"], "permissions": perms, "csrf": auth["csrf"]}
 
     @app.get("/api/v2/platform/me")
     async def platform_me(request: Request):
@@ -450,10 +503,18 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                              permission="asset.write" if scope == "all" else "asset.read")
         is_admin = ROLE_ADMIN in (auth.get("roles") or [])
         narrow = scope == "granted" or (platform.cfg.strict_grants and not is_admin)
+        show_ipmi = show_ipmi_for(auth)
         with transaction(platform.factory) as db:
-            rows = (services.assets_for_user(db, auth["user_id"], tenant_id=auth["tenant_id"])
-                    if narrow else
-                    services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"]))
+            db_rows = (services.assets_for_user(db, auth["user_id"], tenant_id=auth["tenant_id"])
+                       if narrow else
+                       services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"]))
+            by_id = {row["id"]: row for row in db_rows}
+            assets = db.scalars(select(Asset).where(Asset.id.in_(by_id))).all() if by_id else []
+            rows = [public_ip.view(asset, db, show_ipmi=show_ipmi) for asset in assets]
+            for row in rows:
+                extra = by_id.get(row["id"])
+                if extra and "grant_expires" in extra:
+                    row["grant_expires"] = extra["grant_expires"]
         occupancy = platform.plane.asset_occupancy(
             [row["id"] for row in rows], auth["user_id"], manage=scope == "all") if platform.plane else {}
         with transaction(platform.factory) as db:
@@ -472,24 +533,100 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         auth = await current(request, mutate=True, permission="asset.write")
         body = await _json(request)
         with transaction(platform.factory) as db:
-            existing = db.scalar(select(Asset).where(Asset.address == str(body.get("address", "")),
-                                                      Asset.tenant_id == auth["tenant_id"]))
-            optional = {key: body[key] if key in body else getattr(existing, key, None)
-                        for key in ("vendor", "model", "firmware", "fingerprint",
-                                    "credential_id", "profile_id", "capability_id", "licence", "notes")}
-            if existing is not None and "capability_id" not in body:
-                if any(optional[key] != getattr(existing, key)
-                       for key in ("vendor", "model", "firmware", "profile_id")):
-                    optional["capability_id"] = None
-            asset = services.upsert_asset(
-                db, name=str(body.get("name", "")), address=str(body.get("address", "")),
-                vendor=str(optional["vendor"] or ""), model=str(optional["model"] or ""),
-                firmware=str(optional["firmware"] or ""), fingerprint=str(optional["fingerprint"] or ""),
-                credential_id=optional["credential_id"], profile_id=optional["profile_id"],
-                capability_id=optional["capability_id"], licence=str(optional["licence"] or ""),
-                notes=str(optional["notes"] or ""), actor=auth["username"],
-                tenant_id=auth["tenant_id"])
-            return asset.public()
+            asset = _save_asset_from_body(
+                db, body, tenant_id=auth["tenant_id"], actor=auth["username"])
+            return public_ip.view(asset, db, show_ipmi=True)
+
+    @app.get("/api/v2/public-ips")
+    async def list_public_ips(request: Request):
+        auth = await current(request, permission="asset.write")
+        with transaction(platform.factory) as db:
+            rows = db.scalars(select(public_ip.PublicIpMapping).where(
+                public_ip.PublicIpMapping.tenant_id == auth["tenant_id"]).order_by(
+                    public_ip.PublicIpMapping.primary_ip)).all()
+            return [public_ip.mapping_view(row) for row in rows]
+
+    @app.put("/api/v2/public-ips/{asset_id}")
+    async def put_public_ip(asset_id: str, request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        with transaction(platform.factory) as db:
+            mapping = public_ip.upsert_public_ip(
+                db, tenant_id=auth["tenant_id"], asset_id=asset_id,
+                raw=body.get("public_ips", ""), actor=auth["username"])
+            db.commit()
+            return public_ip.mapping_view(mapping) if mapping is not None else {
+                "id": "", "tenant_id": auth["tenant_id"], "asset_id": asset_id,
+                "primary_ip": "", "additional_ips": "", "public_ips": [],
+                "created": 0, "updated": 0}
+
+    @app.post("/api/v2/assets/probe")
+    async def probe_asset(request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        address = str(body.get("address", "")).strip()
+        credential_id = str(body.get("credential_id", "")).strip()
+        if not address or not credential_id:
+            raise services.PlatformError("invalid_request", "需要 BMC 地址和凭据")
+        try:
+            port = int(body.get("port", 443) or 443)
+        except (TypeError, ValueError):
+            raise services.PlatformError("invalid_request", "端口必须是整数") from None
+        with transaction(platform.factory) as db:
+            secret = services.read_credential(
+                db, platform.cipher, credential_id, tenant_id=auth["tenant_id"])
+        semaphore = request.app.state.probe_semaphore
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=2.0)
+        except TimeoutError:
+            raise services.PlatformError(
+                "probe_busy", "探测请求过多，请稍后重试", 429, retryable=True) from None
+        try:
+            measured = await asyncio.to_thread(
+                bmc_probe.probe, address, secret["username"], secret["password"], port=port)
+        except bmc_probe.ProbeError as exc:
+            safe_address = address.encode("unicode_escape").decode("ascii")[:256]
+            logger.warning("asset_probe_failed address=%s code=%s retryable=%s trace=%s",
+                           safe_address, exc.code, exc.retryable, request.state.trace)
+            with transaction(platform.factory) as db:
+                services.audit(
+                    db, auth["username"], "asset_probe_failed", tenant_id=auth["tenant_id"],
+                    detail={"address": address, "error": exc.code,
+                            "retryable": exc.retryable}, trace=request.state.trace)
+            raise services.PlatformError(
+                exc.code, "BMC 探测失败，请核对地址、凭据与网络", 502,
+                retryable=exc.retryable) from None
+        except Exception:
+            raise
+        finally:
+            semaphore.release()
+        detection = vendor_registry.detect_from_redfish(measured["inventory"])
+        with transaction(platform.factory) as db:
+            match = vendor_registry.identify(db, detection, tenant_id=auth["tenant_id"])
+            profile = match.profile if match.usable else None
+            services.audit(
+                db, auth["username"], "asset_probe", tenant_id=auth["tenant_id"],
+                detail={"address": address, "vendor": detection.get("vendor", ""),
+                        "model": detection.get("model", ""),
+                        "fingerprint_prefix": measured["fingerprint"][:12],
+                        "profile_id": profile.id if profile else None,
+                        "auth_mode": measured["redfish_auth"]},
+                trace=request.state.trace)
+        note = ("已匹配已批准品牌，可自动关联"
+                if profile else "未匹配到已批准品牌；未完成适配的型号请走新品牌适配流程")
+        return {"address": address, "public_ips": public_ip.normalize_public_ips(
+                    body.get("public_ips")),
+                "certificate_sha256": measured["fingerprint"],
+                "redfish_auth": measured["redfish_auth"], "detection": detection,
+                "matched": match.profile is not None, "usable": match.usable,
+                "reason": match.reason, "profile_id": profile.id if profile else None,
+                "profile_code": profile.code if profile else "", "note": note}
+
+    @app.get("/api/v2/asset-onboarding")
+    async def asset_onboarding(request: Request):
+        auth = await current(request, permission="asset.read")
+        with transaction(platform.factory) as db:
+            return services.asset_onboarding(db, tenant_id=auth["tenant_id"])
 
     @app.get("/api/v2/credentials")
     async def list_credentials(request: Request):
@@ -630,7 +767,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         return services.PlatformError(exc.code, exc.message,
                                       403 if exc.code == "tenant_suspended" else 409)
 
-    async def session_view(*, tenant_id: str | None = None) -> list[dict]:
+    async def session_view(*, tenant_id: str | None = None,
+                           show_ipmi: bool = True) -> list[dict]:
         plane = require_plane()
         rows = await plane.active_sessions()
         with transaction(platform.factory) as db:
@@ -641,6 +779,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             users = {user.id: user for user in
                      db.scalars(select(User).where(User.id.in_(user_ids)))} if user_ids else {}
             codes = {tenant.id: tenant.code for tenant in db.scalars(select(Tenant))}
+            public_ips = {asset.id: public_ip.public_ips_for_asset(db, asset.id)
+                          for asset in assets.values()}
         out = []
         for row in rows:
             asset = assets.get(row["asset_id"])
@@ -652,7 +792,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 "sid": row["id"], "tenant_id": tid, "tenant_code": codes.get(tid),
                 "user_id": row["user_id"], "username": owner.username if owner else None,
                 "asset_id": row["asset_id"], "asset_name": asset.name if asset else None,
-                "asset_address": asset.address if asset else None,
+                "asset_address": asset.address if asset and show_ipmi else None,
+                "asset_public_ip": (public_ips.get(row["asset_id"]) or [None])[0],
                 "worker_id": row["worker_id"], "status": row["status"],
                 "cleanup": row["cleanup"], "created": row["created"],
                 "duration_seconds": row["duration_seconds"],
@@ -740,7 +881,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     @app.get("/api/v2/sessions")
     async def sessions(request: Request):
         auth = await current(request, permission="session.read")
-        return await session_view(tenant_id=auth["tenant_id"])
+        return await session_view(tenant_id=auth["tenant_id"],
+                                  show_ipmi=show_ipmi_for(auth))
 
     @app.post("/api/v2/sessions/{sid}/revoke")
     async def revoke_session(sid: str, request: Request):
@@ -956,10 +1098,22 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             query = query.where(Asset.tenant_id == tenant_id)
         with transaction(platform.factory) as db:
             codes = {row.id: row.code for row in db.scalars(select(Tenant))}
-            return [{**{key: value for key, value in asset.public().items()
-                        if key != "credential_id"},
+            return [{**{key: value for key, value in public_ip.view(
+                            asset, db, show_ipmi=True).items() if key != "credential_id"},
                      "tenant_code": codes.get(asset.tenant_id)}
                     for asset in db.scalars(query).all()]
+
+    @app.post("/api/v2/platform/assets")
+    async def platform_create_asset(request: Request):
+        auth = await current_platform(request, mutate=True, permission="platform.asset.write")
+        body = await _json(request)
+        tenant_id = str(body.get("tenant_id", "") or "")
+        with transaction(platform.factory) as db:
+            if not tenant_id or db.get(Tenant, tenant_id) is None:
+                raise services.PlatformError("tenant_not_found", "租户不存在", 404)
+            asset = _save_asset_from_body(
+                db, body, tenant_id=tenant_id, actor=auth["username"])
+            return public_ip.view(asset, db, show_ipmi=True)
 
     @app.post("/api/v2/platform/assets/assign")
     async def platform_assign_asset(request: Request):
@@ -972,6 +1126,9 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 tenant_id=str(body.get("tenant_id", "") or ""),
                 name=str(body.get("name", "") or ""), actor=auth["username"],
                 reassign=bool(body.get("reassign", False)), plane=plane)
+            asset = db.get(Asset, result["asset"]["id"])
+            if asset is not None:
+                result["asset"] = public_ip.view(asset, db, show_ipmi=True)
         return result
 
     @app.post("/api/v2/platform/assets/grant")

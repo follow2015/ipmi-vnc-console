@@ -51,7 +51,7 @@ def device(tmp_path):
         def do_GET(self):
             self.record()
             if state["mode"] == "basic_only":
-                expected = "Basic " + base64.b64encode(b"root:calvin").decode()
+                expected = "Basic " + base64.b64encode(b"root:synthetic-password").decode()
                 if self.headers.get("Authorization") != expected:
                     self.reply(401, {"error": "unauthorized"})
                     return
@@ -150,6 +150,20 @@ def test_pin_mismatch_sends_no_http_or_credentials(device):
     with pytest.raises(RedfishError, match="tls_identity_mismatch"):
         c.login("user", "password")
     assert device["requests"] == [] and c.session_state == "not_created"
+
+
+def test_connect_ip_pins_tcp_but_keeps_sni(device):
+    c = Redfish("bmc.example.invalid", device["port"],
+                cert_sha256=device["fingerprint"], connect_ip="127.0.0.1")
+    result = c.json("/redfish/v1/")
+    assert "RedfishVersion" in result
+    assert device["requests"]
+    assert device["requests"][0][2].get("Host", "").startswith("bmc.example.invalid")
+
+
+def test_connect_ip_rejects_non_literal():
+    with pytest.raises(RedfishError, match="invalid_connect_ip"):
+        Redfish("bmc.example.invalid", 443, connect_ip="not-an-ip")
 
 
 def test_aborted_peer_is_not_dumped_and_the_server_keeps_serving(device):
@@ -258,7 +272,7 @@ def test_redirect_is_reported_without_response_body(device, capsys):
 def test_basic_auth_inventory_without_session_when_sessions_rejected(device, monkeypatch, capsys):
     device["mode"] = "basic_only"
     monkeypatch.setenv("BMC_USER", "root")
-    monkeypatch.setenv("BMC_PASSWORD", "calvin")
+    monkeypatch.setenv("BMC_PASSWORD", "synthetic-password")
     assert main(args(device)+["--basic-auth"]) == 0
     output = capsys.readouterr().out
     report = json.loads(output)
@@ -266,8 +280,8 @@ def test_basic_auth_inventory_without_session_when_sessions_rejected(device, mon
     assert report["session_cleanup"] == "not_needed"
     assert report["inventory"]["resources"]["Managers"][0]["FirmwareVersion"] == "1.0"
     assert not any(r[0] in ("POST", "DELETE") for r in device["requests"])
-    assert "calvin" not in output
-    expected = "Basic " + base64.b64encode(b"root:calvin").decode()
+    assert "synthetic-password" not in output
+    expected = "Basic " + base64.b64encode(b"root:synthetic-password").decode()
     assert all(r[2].get("Authorization") == expected for r in device["requests"])
 
 

@@ -20,7 +20,7 @@ from kvmhub.platform.config import Settings
 from kvmhub.platform.data_plane import verify_tenant
 from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,
                                 init_schema, seed_roles, session_factory, transaction)
-from kvmhub.platform.models import DEFAULT_TENANT_ID, Asset, User
+from kvmhub.platform.models import DEFAULT_TENANT_ID, Asset, Credential, User
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher, new_session_token, token_digest
 from sqlalchemy import select
@@ -128,6 +128,18 @@ def test_assets_do_not_cross_tenant_boundaries(env):
     signed_in(env, "globex")
     rows = env["client"].get("/api/v2/assets?scope=all").json()
     assert [row["address"] for row in rows] == ["192.0.2.12"]
+
+
+def test_asset_cannot_bind_another_tenants_credential(env):
+    with transaction(env["platform"].factory) as db:
+        foreign_cred = db.scalar(select(Credential).where(Credential.tenant_id == env["globex"]))
+    with pytest.raises(services.PlatformError) as exc:
+        with transaction(env["platform"].factory) as db:
+            services.upsert_asset(db, name="acme-stolen", address="192.0.2.99",
+                                  credential_id=foreign_cred.id, actor="test",
+                                  tenant_id=env["acme"])
+    assert exc.value.code == "cross_tenant_credential"
+    assert exc.value.status == 403
 
 
 def test_same_address_in_two_tenants_is_two_rows(env):
@@ -307,7 +319,7 @@ def test_platform_asset_view_is_read_only_and_hides_credential_ids(env):
     rows = env["client"].get("/api/v2/platform/assets").json()
     assert {row["address"] for row in rows} == {"192.0.2.11", "192.0.2.12"}
     assert all("credential_id" not in row for row in rows)
-    assert env["client"].post("/api/v2/platform/assets", json={}).status_code in (404, 405)
+    assert env["client"].post("/api/v2/platform/assets", json={}).status_code in (401, 403)
 
 
 
@@ -483,7 +495,7 @@ def test_migration_reports_its_head_and_downgrade_is_reversible(tmp_path):
     _legacy_db(db_path)
     assert _alembic(db_path, "upgrade", "head").returncode == 0
     head = _alembic(db_path, "current")
-    assert "0008_vendor_protocol (head)" in head.stdout + head.stderr
+    assert "0010_public_ip_float_precision (head)" in head.stdout + head.stderr
     down = _alembic(db_path, "downgrade", "0001_baseline")
     assert down.returncode == 0, down.stdout + down.stderr
     with sqlite3.connect(db_path) as conn:

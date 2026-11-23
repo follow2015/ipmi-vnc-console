@@ -46,11 +46,30 @@ def normalize_fingerprint(value: str | None) -> str | None:
     return result
 
 
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+
+    def __init__(self, host: str, port: int, connect_ip: str, **kwargs):
+        super().__init__(host, port, **kwargs)
+        self._pinned_ip = connect_ip
+        self._pinned_context = kwargs.get("context") or ssl.create_default_context()
+
+    def connect(self):
+        sock = socket.create_connection((self._pinned_ip, self.port),
+                                        self.timeout, self.source_address)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        else:
+            self.sock = self._pinned_context.wrap_socket(sock, server_hostname=self.host)
+
+
 class Redfish:
     def __init__(self, host: str, port: int = 443, ca_bundle: str | None = None,
                  timeout: float = 5, cert_sha256: str | None = None, *,
                  max_requests: int = 20, total_timeout: float = 60,
                  basic_auth: tuple[str, str] | None = None,
+                 connect_ip: str | None = None,
+                 deadline: float | None = None,
                  clock=time.monotonic):
         self.host = validate_host(host)
         if not 1 <= port <= 65535 or not math.isfinite(timeout) or not 0 < timeout <= 30:
@@ -60,6 +79,12 @@ class Redfish:
         if ca_bundle is not None and cert_sha256 is not None:
             raise RedfishError("conflicting_tls_modes")
         self.port, self.timeout = port, timeout
+        self.connect_ip: str | None = None
+        if connect_ip is not None:
+            try:
+                self.connect_ip = str(ipaddress.ip_address(connect_ip))
+            except ValueError:
+                raise RedfishError("invalid_connect_ip") from None
         self.cert_sha256 = normalize_fingerprint(cert_sha256)
         if basic_auth is not None:
             user, password = basic_auth
@@ -75,7 +100,7 @@ class Redfish:
             self.context.check_hostname = False
             self.context.verify_mode = ssl.CERT_NONE
         self.clock = clock
-        self.deadline = clock() + total_timeout
+        self.deadline = deadline if deadline is not None else clock() + total_timeout
         self.max_requests = max_requests
         self.requests_used = 0
         self.token: str | None = None
@@ -122,7 +147,11 @@ class Redfish:
             headers["X-Auth-Token"] = self.token
         if self.basic_header:
             headers["Authorization"] = self.basic_header
-        conn = http.client.HTTPSConnection(self.host, self.port, timeout=timeout, context=self.context)
+        if self.connect_ip:
+            conn = PinnedHTTPSConnection(self.host, self.port, self.connect_ip,
+                                         timeout=timeout, context=self.context)
+        else:
+            conn = http.client.HTTPSConnection(self.host, self.port, timeout=timeout, context=self.context)
         cleanup_deadline = self.clock()+timeout
 
         def read_timeout():

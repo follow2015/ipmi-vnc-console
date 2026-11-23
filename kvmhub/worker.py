@@ -17,6 +17,8 @@ from . import common
 from .adapter import MockAdapter
 from .adapters.idrac8 import Idrac8Adapter
 from .adapters.idrac_vnc import IdracVncAdapter
+from .adapters.huawei_ibmc_vnc import HuaweiIbmcVncAdapter
+from .adapters.huawei_ibmc_kvm_gateway import HuaweiIbmcKvmGatewayAdapter
 from .adapters.passthrough import ASSET_PATH as PASSTHROUGH_ASSET_PATH
 from .adapters.passthrough import PassthroughAdapter
 from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, PATH_SESSION,
@@ -63,6 +65,13 @@ class ManagerRejected(Problem):
 
 def cookie_max_age(hard_until: float, now: float) -> int:
     return max(1, min(14400, int(hard_until - now)))
+
+
+def input_protocol_for_adapter(adapter) -> str:
+    if isinstance(adapter, (IdracVncAdapter, HuaweiIbmcVncAdapter,
+                            HuaweiIbmcKvmGatewayAdapter)):
+        return "standard8"
+    return "insyde18"
 
 
 def localize_console(text: str, request) -> str:
@@ -394,6 +403,11 @@ REAL_CONSOLE_JS = """'use strict';
   var zoomModeBtn = document.getElementById('zoom-mode');
   var assetLabel = '真机 KVM';
   var desktopName = '';
+  // KeyEvent wire format for this session, from /_platform/meta. Standard VNC
+  // needs 8-byte frames with an X11 keysym; the measured vendor paths need the
+  // 18-byte HID frame. Default to the historical 18-byte format until meta
+  // answers, so nothing changes for adapters that do not declare a protocol.
+  var inputProtocol = 'insyde18';
   var noSignal = false;
   var inputOpened = false;
   // Open at native pixels. At 1:1 the text is crisp instead of interpolated,
@@ -420,7 +434,11 @@ REAL_CONSOLE_JS = """'use strict';
   fetch('/_platform/meta', { cache: 'no-store' }).then(function (response) {
     return response.ok ? response.json() : null;
   }).then(function (data) {
-    if (!data || !data.address) return;
+    if (!data) return;
+    if (data.input_protocol === 'standard8' || data.input_protocol === 'insyde18') {
+      inputProtocol = data.input_protocol;
+    }
+    if (!data.address) return;
     assetLabel = data.address;
     if (labelEl) labelEl.textContent = data.address;
     document.title = (desktopName ? desktopName + ' · ' : '') + assetLabel;
@@ -872,14 +890,15 @@ REAL_CONSOLE_JS = """'use strict';
   function pasteUsage(ch) {
     if (!pasteKeymap) return null;
     var upper = /^[A-Z]$/.test(ch);
+    var keysym = pasteKeymap.char_keysym ? pasteKeymap.char_keysym[ch] : undefined;
     if (upper && pasteKeymap.plain[ch.toLowerCase()] !== undefined) {
-      return { usage: pasteKeymap.plain[ch.toLowerCase()], shift: true };
+      return { usage: pasteKeymap.plain[ch.toLowerCase()], keysym: keysym, shift: true };
     }
     if (pasteKeymap.shifted[ch] !== undefined) {
-      return { usage: pasteKeymap.plain[pasteKeymap.shifted[ch]], shift: true };
+      return { usage: pasteKeymap.plain[pasteKeymap.shifted[ch]], keysym: keysym, shift: true };
     }
     if (pasteKeymap.plain[ch] !== undefined) {
-      return { usage: pasteKeymap.plain[ch], shift: false };
+      return { usage: pasteKeymap.plain[ch], keysym: keysym, shift: false };
     }
     return null;
   }
@@ -904,7 +923,7 @@ REAL_CONSOLE_JS = """'use strict';
       if (level === 'unsupported') continue;
       var mapped = pasteUsage(ch);
       if (!mapped) continue;
-      strokes.push({ char: ch, usage: mapped.usage, shift: mapped.shift, level: level, index: i });
+      strokes.push({ char: ch, usage: mapped.usage, keysym: mapped.keysym, shift: mapped.shift, level: level, index: i });
     }
     return { strokes: strokes, warnings: warnings, counts: counts, chars: text.length };
   }
@@ -966,7 +985,16 @@ REAL_CONSOLE_JS = """'use strict';
   function pasteEscapeSafe(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
-  function pasteFrame(usage, down) {
+  // One KeyEvent frame for the session's declared protocol. insyde18 carries
+  // a HID usage in a 18-byte vendor frame; standard8 carries an X11 keysym in
+  // a standard 8-byte frame. The two values are NOT interchangeable -- a HID
+  // usage of 0x04 means 'a' to the vendor client but Ctrl+D to standard RFB.
+  function pasteFrame(usage, down, keysym) {
+    if (inputProtocol === 'standard8') {
+      var ks = typeof keysym === 'number' ? keysym : usage;
+      return [4, down ? 1 : 0, 0, 0,
+        (ks >>> 24) & 255, (ks >>> 16) & 255, (ks >>> 8) & 255, ks & 255];
+    }
     // Same wire layout as insyde_messages.build_key_event: 18 bytes, type 4.
     return [4, 0, down ? 1 : 0, 0, 0,
       (usage >>> 24) & 255, (usage >>> 16) & 255, (usage >>> 8) & 255, usage & 255,
@@ -977,14 +1005,16 @@ REAL_CONSOLE_JS = """'use strict';
     var hold = Math.max(0, parseInt(document.getElementById('paste-hold').value, 10) || 20);
     var out = [];
     pastePlan.strokes.forEach(function (s) {
-      if (s.shift) {
+      if (s.shift && inputProtocol !== 'standard8') {
         out.push([pasteFrame(pasteKeymap.left_shift, true), 0]);
-        out.push([pasteFrame(s.usage, true), hold]);
-        out.push([pasteFrame(s.usage, false), gap]);
+        out.push([pasteFrame(s.usage, true, s.keysym), hold]);
+        out.push([pasteFrame(s.usage, false, s.keysym), gap]);
         out.push([pasteFrame(pasteKeymap.left_shift, false), 0]);
       } else {
-        out.push([pasteFrame(s.usage, true), hold]);
-        out.push([pasteFrame(s.usage, false), gap]);
+        // For standard8 the keysym already encodes case/shift, so no separate
+        // Shift down/up pair is emitted (same as noVNC keyEvent(keysym,down)).
+        out.push([pasteFrame(s.usage, true, s.keysym), hold]);
+        out.push([pasteFrame(s.usage, false, s.keysym), gap]);
       }
     });
     return out;
@@ -1193,19 +1223,21 @@ REAL_CONSOLE_JS = """'use strict';
     if (!pasteKeymap) return null;
     if (token.length === 1) {
       var lower = token.toLowerCase();
+      var ks = pasteKeymap.char_keysym ? pasteKeymap.char_keysym[token] : undefined;
       if (/^[A-Z]$/.test(token) && pasteKeymap.plain[lower] !== undefined) {
-        return { usage: pasteKeymap.plain[lower], shift: true };
+        return { usage: pasteKeymap.plain[lower], keysym: ks, shift: true };
       }
       if (pasteKeymap.shifted[token] !== undefined) {
-        return { usage: pasteKeymap.plain[pasteKeymap.shifted[token]], shift: true };
+        return { usage: pasteKeymap.plain[pasteKeymap.shifted[token]], keysym: ks, shift: true };
       }
       if (pasteKeymap.plain[token] !== undefined) {
-        return { usage: pasteKeymap.plain[token], shift: false };
+        return { usage: pasteKeymap.plain[token], keysym: ks, shift: false };
       }
       return null;
     }
     if (pasteKeymap.keys[token] !== undefined) {
-      return { usage: pasteKeymap.keys[token], shift: false };
+      var ksNamed = pasteKeymap.key_keysym ? pasteKeymap.key_keysym[token] : undefined;
+      return { usage: pasteKeymap.keys[token], keysym: ksNamed, shift: false };
     }
     return null;
   }
@@ -1224,14 +1256,24 @@ REAL_CONSOLE_JS = """'use strict';
     var hold = Math.max(0, parseInt(document.getElementById('paste-hold').value, 10) || 20);
     var gap = Math.max(10, parseInt(document.getElementById('paste-gap').value, 10) || 55);
     var out = [];
-    for (i = 0; i < mods.length; i += 1) out.push({ frame: pasteFrame(mods[i], true), delay: 0 });
+    // Modifiers arrive here as HID usages (pasteKeymap.keys[token]). For a
+    // standard session translate them to X11 keysyms; the vendor path keeps
+    // the HID usage.
+    var modKeysym = function (usage) {
+      if (inputProtocol !== 'standard8' || !pasteKeymap.key_keysym) return undefined;
+      for (var name in pasteKeymap.keys) {
+        if (pasteKeymap.keys[name] === usage) return pasteKeymap.key_keysym[name];
+      }
+      return undefined;
+    };
+    for (i = 0; i < mods.length; i += 1) out.push({ frame: pasteFrame(mods[i], true, modKeysym(mods[i])), delay: 0 });
     keys.forEach(function (key) {
-      if (key.shift) out.push({ frame: pasteFrame(pasteKeymap.left_shift, true), delay: 0 });
-      out.push({ frame: pasteFrame(key.usage, true), delay: hold });
-      out.push({ frame: pasteFrame(key.usage, false), delay: gap });
-      if (key.shift) out.push({ frame: pasteFrame(pasteKeymap.left_shift, false), delay: 0 });
+      if (key.shift && inputProtocol !== 'standard8') out.push({ frame: pasteFrame(pasteKeymap.left_shift, true), delay: 0 });
+      out.push({ frame: pasteFrame(key.usage, true, key.keysym), delay: hold });
+      out.push({ frame: pasteFrame(key.usage, false, key.keysym), delay: gap });
+      if (key.shift && inputProtocol !== 'standard8') out.push({ frame: pasteFrame(pasteKeymap.left_shift, false), delay: 0 });
     });
-    for (i = mods.length - 1; i >= 0; i -= 1) out.push({ frame: pasteFrame(mods[i], false), delay: 0 });
+    for (i = mods.length - 1; i >= 0; i -= 1) out.push({ frame: pasteFrame(mods[i], false, modKeysym(mods[i])), delay: 0 });
     return out;
   }
   function skPaintMods() {
@@ -1712,6 +1754,10 @@ def make_adapter(info):
         return Idrac8Adapter(info)
     if info["adapter"] == common.IDRAC_VNC_ADAPTER_ID:
         return IdracVncAdapter(info)
+    if info["adapter"] == common.HUAWEI_IBMC_VNC_ADAPTER_ID:
+        return HuaweiIbmcVncAdapter(info)
+    if info["adapter"] == common.HUAWEI_IBMC_KVM_GATEWAY_ID:
+        return HuaweiIbmcKvmGatewayAdapter(info)
     raise Problem("adapter_not_verified", 403)
 
 
@@ -1801,7 +1847,12 @@ class Gateway:
                     if isinstance(body, dict) and body.get("error") in SESSION_END_CODES:
                         code = body["error"]
                 raise ManagerRejected(code, response.status)
-            return await response.json()
+            try:
+                return await response.json()
+            except (ValueError, aiohttp.ContentTypeError) as exc:
+                log.warning("malformed Manager response for %s/%s: %s",
+                            sid, operation, type(exc).__name__)
+                raise Problem("manager_unavailable") from exc
 
     async def start(self, app):
         ctx = client_tls(self.cfg["ca"], self.cfg["client_cert"], self.cfg["client_key"])
@@ -1867,7 +1918,7 @@ class Gateway:
             else:
                 self._retry_later(sid)
             return
-        except (Problem, aiohttp.ClientError, TimeoutError):
+        except (Problem, aiohttp.ClientError, TimeoutError, ValueError):
             self._retry_later(sid)
             return
         self._forget_report(sid)
@@ -1963,11 +2014,16 @@ class Gateway:
                 "limit": int(getattr(getattr(recovery, "policy", None), "attempts", 0) or 0),
                 "max_total": int(getattr(getattr(recovery, "policy", None), "max_total", 0) or 0),
             }
+        adapter_session = getattr(sess.adapter, "session", None)
+        adapter_stats = (adapter_session.as_dict()
+                         if adapter_session is not None and hasattr(adapter_session, "as_dict")
+                         else None)
         return {"session": sess.telemetry.live(ws_open=len(sess.ws), opening=sess.opening,
                                                lease_remaining=sess.lease_end - time.monotonic(),
                                                closing=sess.closing),
                 "machine": sess.machine.as_dict(),
                 "recovery": rebuild,
+                "adapter": adapter_stats,
                 "recent_ended": self.evidence.recent(self.STATS_RECENT),
                 "evidence_keep": self.evidence.keep}
 
@@ -1979,11 +2035,23 @@ class Gateway:
 
     async def supervise(self):
         while True:
-            await asyncio.sleep(0.25)
-            now = time.monotonic()
-            await asyncio.gather(*(self.check_lease(s, now) for s in list(self.sessions.values())))
-            for sid, report in self.due_reports(now):
-                await self._submit(sid, report)
+            try:
+                await asyncio.sleep(0.25)
+                now = time.monotonic()
+                outcomes = await asyncio.gather(
+                    *(self.check_lease(s, now) for s in list(self.sessions.values())),
+                    return_exceptions=True,
+                )
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                        log.warning("supervise: lease check failed: %r", outcome)
+                for sid, report in self.due_reports(now):
+                    await self._submit(sid, report)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("supervise: unexpected error; continuing")
+                await asyncio.sleep(0.25)
 
     async def lease_watchdog(self, sess):
         while not sess.closing:
@@ -2006,13 +2074,23 @@ class Gateway:
         try:
             async with asyncio.timeout(min(2, sess.lease_end - sent)):
                 result = await self.call(sess.sid, "renew")
-            sess.lease_end = sent + result["lease_seconds"]
         except Problem as exc:
             await self.finish(sess, "capability_withdrawn" if exc.code == "capability_withdrawn"
                               else "revoked")
-        except (aiohttp.ClientError, TimeoutError):
+            return
+        except (aiohttp.ClientError, TimeoutError, ValueError):
             if time.monotonic() >= sess.lease_end:
                 await self.finish(sess, "lease_expired")
+            return
+        seconds = result.get("lease_seconds") if isinstance(result, dict) else None
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not 0 < seconds < float("inf")):
+            log.warning("malformed renew response for session %s: %r; keeping lease",
+                        sess.sid, result)
+            if time.monotonic() >= sess.lease_end:
+                await self.finish(sess, "lease_expired")
+            return
+        sess.lease_end = sent + seconds
 
     def authenticated(self, request):
         sid = request[SESSION_KEY]
@@ -2096,7 +2174,9 @@ class Gateway:
         offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
         browser_offered = bool(offered)
         if not offered and isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
-                                                      IdracVncAdapter)):
+                                                      IdracVncAdapter,
+                                                      HuaweiIbmcVncAdapter,
+                                                      HuaweiIbmcKvmGatewayAdapter)):
             offered = ["binary"]
         if "binary" not in offered:
             raise Problem("subprotocol_required", 400)
@@ -2143,7 +2223,13 @@ class Gateway:
             pumps = [to_upstream, from_upstream]
             done, _ = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                task.result()
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("pump ended with error for session %s: %s",
+                              sess.sid, type(exc).__name__)
             if from_upstream in done and not sess.closing:
                 if getattr(upstream, "reload_requested", False):
                     size = upstream.geometry_after or {}
@@ -2200,11 +2286,14 @@ class Gateway:
             host = (getattr(cfg, "host", "") if cfg is not None
                     else getattr(sess.adapter, "host", ""))
             return web.json_response({"address": host or "未接入",
-                                      "asset_id": getattr(sess, "asset_id", "")})
+                                      "asset_id": getattr(sess, "asset_id", ""),
+                                      "input_protocol": input_protocol_for_adapter(sess.adapter)})
         if request.method != "GET" or request.query_string:
             raise Problem("route_denied", 403)
         real = isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
-                                        IdracVncAdapter))
+                                        IdracVncAdapter,
+                                        HuaweiIbmcVncAdapter,
+                                        HuaweiIbmcKvmGatewayAdapter))
         asset_pattern = getattr(sess.adapter, "asset_pattern", PASSTHROUGH_ASSET_PATH)
         if real and asset_pattern.fullmatch(path):
             content_type, body = await sess.adapter.fetch_asset(path)

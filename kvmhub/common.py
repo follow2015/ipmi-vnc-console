@@ -60,6 +60,8 @@ def path_segment_is_safe(path: str) -> bool:
 PASSTHROUGH_ADAPTER_ID = "supermicro-x10-passthrough"
 IDRAC8_ADAPTER_ID = "dell-idrac8-html5"
 IDRAC_VNC_ADAPTER_ID = "dell-idrac-vnc-tcp"
+HUAWEI_IBMC_VNC_ADAPTER_ID = "huawei-ibmc-vnc-tls"
+HUAWEI_IBMC_KVM_GATEWAY_ID = "huawei-ibmc-kvm-gateway"
 
 BMC_ALLOWED_NETWORKS_ENV = "KVMHUB_BMC_ALLOWED_NETWORKS"
 

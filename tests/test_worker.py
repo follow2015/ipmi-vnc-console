@@ -683,6 +683,106 @@ async def test_a_successful_report_clears_the_retry_state(identities, monkeypatc
     assert gateway.pending_reports == {} and gateway._report_retry == {}
 
 
+@pytest.mark.parametrize("bad_body", [
+    {},
+    [],
+    None,
+    {"lease_seconds": "30"},
+    {"lease_seconds": 0},
+    {"lease_seconds": -5},
+    {"lease_seconds": True},
+    {"lease_seconds": float("nan")},
+])
+async def test_malformed_renew_body_keeps_lease_without_revoking(identities, caplog, bad_body):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+
+    class Adapter:
+        async def close(self):
+            return True
+
+    sess = Runtime("sid", "hash", Adapter(), time.monotonic() + 30)
+    gateway.sessions[sess.sid] = sess
+    original_end = sess.lease_end
+
+    async def bad_renew(sid, op, data=None):
+        return bad_body
+
+    gateway.call = bad_renew
+    with caplog.at_level("WARNING", logger="kvmhub.worker"):
+        await gateway.check_lease(sess, time.monotonic())
+
+    assert sess.lease_end == original_end, "malformed body must not extend the lease"
+    assert not sess.closing, "malformed body must not be treated as revocation"
+    assert "malformed renew" in caplog.text
+
+
+async def test_valid_renew_body_extends_lease(identities):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+
+    class Adapter:
+        async def close(self):
+            return True
+
+    sess = Runtime("sid", "hash", Adapter(), time.monotonic() + 30)
+    gateway.sessions[sess.sid] = sess
+    original_end = sess.lease_end
+
+    async def good_renew(sid, op, data=None):
+        return {"lease_seconds": 60}
+
+    gateway.call = good_renew
+    await gateway.check_lease(sess, time.monotonic())
+    assert sess.lease_end > original_end
+
+
+@pytest.mark.parametrize("poison", [
+    KeyError("lease_seconds"),
+    json.JSONDecodeError("bad", "not json", 0),
+    RuntimeError("unexpected"),
+])
+async def test_supervisor_survives_one_poisoned_session(identities, poison):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+    renewed = []
+
+    async def call(sid, op, data=None):
+        if op == "renew":
+            renewed.append(sid)
+            if sid == "poison":
+                raise poison
+            return {"lease_seconds": 60}
+        return {"ok": True}
+
+    gateway.call = call
+    for sid in ("poison", "healthy"):
+        gateway.sessions[sid] = Runtime(sid, "hash", object(), time.monotonic() + 60)
+
+    task = asyncio.create_task(gateway.supervise())
+    await asyncio.sleep(0.8)
+    assert not task.done(), "supervise loop died from a poisoned session"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "poison" in renewed and "healthy" in renewed
+
+
+async def test_submit_retries_on_malformed_json_body(identities, monkeypatch):
+    _, cfg = identities
+    gateway = Gateway(cfg)
+    clock = [1000.0]
+    monkeypatch.setattr(worker_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    async def broken(sid, op, data=None):
+        raise json.JSONDecodeError("bad", "not json", 0)
+
+    gateway.call = broken
+    await gateway.report("sid", "pending", "client_closed")
+    assert "sid" in gateway.pending_reports
+    assert "sid" in gateway._report_retry
+
+
 async def test_each_pending_report_is_scheduled_independently(identities, monkeypatch):
     _, cfg = identities
     gateway = Gateway(cfg)

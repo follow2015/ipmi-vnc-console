@@ -253,3 +253,51 @@ def test_the_bmc_secret_travels_with_the_device_but_a_shared_one_does_not(fleet)
         assert cred.tenant_id == fleet.tenants["bravo"]
         rows = db.scalars(select(AuditLog).where(AuditLog.action == "credential_rehomed")).all()
         assert len(rows) == 1
+
+
+
+def test_platform_can_record_a_full_device_into_a_tenant(fleet):
+    root = fleet.as_platform()
+    r = fleet.client.post("/api/v2/platform/assets", headers=root, json={
+        "tenant_id": fleet.tenants["alpha"],
+        "name": "rack-1", "address": "192.0.2.50",
+        "vendor": "huawei", "model": "2288H V5", "firmware": "6.27",
+        "public_ips": "203.0.113.10, 203.0.113.11",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["address"] == "192.0.2.50"
+    assert body["public_ips"] == ["203.0.113.10", "203.0.113.11"]
+    alpha = fleet.as_tenant("alpha")
+    assert fleet.addresses(alpha) == ["192.0.2.50"]
+    bravo = fleet.as_tenant("bravo")
+    assert fleet.addresses(bravo) == []
+
+
+def test_platform_intake_needs_a_real_tenant_and_write_permission(fleet):
+    root = fleet.as_platform()
+    assert fleet.client.post("/api/v2/platform/assets", headers=root,
+                             json={"tenant_id": "nope", "name": "x",
+                                   "address": "192.0.2.51"}).status_code == 404
+    assert fleet.client.post("/api/v2/platform/assets", headers=root,
+                             json={"name": "x", "address": "192.0.2.51"}).status_code == 404
+    alpha = fleet.as_tenant("alpha")
+    r = fleet.client.post("/api/v2/platform/assets", headers=alpha, json={
+        "tenant_id": fleet.tenants["alpha"], "name": "x", "address": "192.0.2.52"})
+    assert r.status_code in (401, 403)
+
+
+def test_platform_recorded_device_is_grantable_and_editable(fleet):
+    root = fleet.as_platform()
+    r = fleet.client.post("/api/v2/platform/assets", headers=root, json={
+        "tenant_id": fleet.tenants["alpha"], "name": "rack-2",
+        "address": "192.0.2.60"})
+    assert r.status_code == 200, r.text
+    asset_id = r.json()["id"]
+    edit = fleet.client.post("/api/v2/platform/assets", headers=root, json={
+        "tenant_id": fleet.tenants["alpha"], "id": asset_id,
+        "name": "rack-2", "address": "192.0.2.61",
+        "public_ips": "203.0.113.20"})
+    assert edit.status_code == 200, edit.text
+    assert edit.json()["id"] == asset_id
+    assert edit.json()["public_ips"] == ["203.0.113.20"]

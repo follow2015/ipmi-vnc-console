@@ -208,6 +208,111 @@ async def test_bad_vnc_password_maps_to_bmc_auth_failed():
 
 
 
+def test_handshake_trace_records_phases_without_sensitive_payload():
+    async def scenario():
+        server = await asyncio.start_server(fake_rfb_server(), "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        up = RfbTcpUpstream(RfbTcpConfig(host="127.0.0.1", port=port,
+                                        password="local-admin"))
+        try:
+            await up.connect()
+            trace = up.stats.trace.as_dict()
+            for phase in ("tcp_connect", "greeting", "security_types",
+                          "challenge", "security_result", "server_init"):
+                assert phase in trace["elapsed_ms"]
+                assert trace["elapsed_ms"][phase] >= 0
+            assert trace["stage"] == "server_init"
+            assert trace["failure_reason"] == ""
+            assert trace["offered_security_types"] == [2]
+            assert all(isinstance(t, int) for t in trace["offered_security_types"])
+            dumped = str(up.stats.as_dict())
+            assert "RFB 003.008" in dumped
+            assert "iDRAC" not in dumped
+            assert "local-admin" not in dumped
+        finally:
+            await up.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_failed_greeting_locates_stage_with_stable_reason():
+    async def handler(reader, writer):
+        writer.write(b"RFB 999.999\n")
+        await writer.drain()
+        await asyncio.sleep(0.1)
+        writer.close()
+
+    async def scenario():
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        up = RfbTcpUpstream(RfbTcpConfig(host="127.0.0.1", port=port,
+                                        password="local-admin"))
+        with pytest.raises(Problem):
+            await up.connect()
+        trace = up.stats.trace.as_dict()
+        assert trace["stage"] == "greeting"
+        assert trace["failure_reason"] == "greeting_invalid"
+        assert "NOT-RFB" not in str(trace)
+        await up.close()
+        server.close()
+        await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_bad_auth_reports_stable_auth_failed_reason():
+    async def scenario():
+        server = await asyncio.start_server(fake_rfb_server(password="synthetic-password"),
+                                            "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        up = RfbTcpUpstream(RfbTcpConfig(host="127.0.0.1", port=port, password="wrong"))
+        with pytest.raises(Problem) as exc:
+            await up.connect()
+        assert exc.value.code == "bmc_auth_failed"
+        trace = up.stats.trace.as_dict()
+        assert trace["stage"] == "security_result"
+        assert trace["failure_reason"] == "auth_failed"
+        assert "nope" not in str(trace)
+        await up.close()
+        server.close()
+        await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_relay_chunks_are_not_reported_as_framebuffer_updates():
+    async def scenario():
+        server = await asyncio.start_server(fake_rfb_server(), "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        up = RfbTcpUpstream(RfbTcpConfig(host="127.0.0.1", port=port,
+                                        password="local-admin"))
+        try:
+            await up.connect()
+            assert up.stats.frames == 0
+            assert up.stats.chunks == 0
+
+            async def collect(data):
+                return
+
+            relay = asyncio.create_task(up.relay(collect))
+            await asyncio.sleep(0.15)
+            relay.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await relay
+            d = up.stats.as_dict()
+            assert d["chunks"] > 0
+            assert d["frames"] == d["chunks"]
+        finally:
+            await up.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+
 def test_controlled_network_gate_requires_explicit_cidr():
     for networks in ("", "not-a-cidr"):
         with pytest.raises(Exception):

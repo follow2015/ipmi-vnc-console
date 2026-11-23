@@ -67,7 +67,10 @@ async def test_query_string_does_not_corrupt_resolved_path(identities, path_mode
             async with browser.get(server.make_url(url),
                                    headers=_cookie_header(sid)) as response:
                 assert response.status == 200
-                assert await response.json() == {"address": "未接入", "asset_id": ""}
+                body = await response.json()
+                assert body["address"] == "未接入"
+                assert body["asset_id"] == ""
+                assert body["input_protocol"] == "insyde18"
 
 
 

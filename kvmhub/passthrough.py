@@ -143,14 +143,21 @@ class ClientMessageFramer:
 
 class BrowserHandshake:
 
+    SECURITY_TYPE_NONE = 1
+
     def __init__(self, server_init: bytes, *, challenge: bytes | None = None,
-                 version: bytes = RFB_VERSION.encode("ascii")) -> None:
+                 version: bytes = RFB_VERSION.encode("ascii"),
+                 security_type: int | None = None) -> None:
         if not isinstance(server_init, (bytes, bytearray)) or not server_init:
             raise ValueError("server_init is required")
         if (not isinstance(version, (bytes, bytearray)) or len(version) != RFB_VERSION_BYTES
                 or version[:4] != b"RFB " or version[-1:] != b"\n"
                 or not all(byte in b"0123456789." for byte in version[4:-1])):
             raise ValueError("invalid_browser_version")
+        security_type = SECURITY_TYPE_INSYDE if security_type is None else security_type
+        if security_type not in (SECURITY_TYPE_INSYDE, self.SECURITY_TYPE_NONE):
+            raise ValueError("unsupported_security_type_config")
+        self._security_type = security_type
         self._version = bytes(version)
         self._server_init = bytes(server_init)
         self._challenge = bytes(challenge) if challenge is not None else secrets.token_bytes(CHALLENGE_BYTES)
@@ -181,8 +188,21 @@ class BrowserHandshake:
                 del self._buf[:RFB_VERSION_BYTES]
                 if raw != self._version:
                     raise BrowserHandshakeError("unexpected_client_version")
-                out += SECURITY_TYPES_FRAME
-                self.stage = "security"
+                if self._security_type == self.SECURITY_TYPE_NONE:
+                    out += bytes([1, self.SECURITY_TYPE_NONE])
+                    self.stage = "security_none"
+                else:
+                    out += SECURITY_TYPES_FRAME
+                    self.stage = "security"
+            elif self.stage == "security_none":
+                if not self._buf:
+                    break
+                scheme = self._buf[0]
+                del self._buf[:1]
+                if scheme != self.SECURITY_TYPE_NONE:
+                    raise BrowserHandshakeError("unsupported_security_type")
+                out += SECURITY_RESULT_OK
+                self.stage = "client_init"
             elif self.stage == "security":
                 if not self._buf:
                     break

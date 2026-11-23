@@ -62,6 +62,17 @@ TENANT_MODE_PERMISSIONS: dict[str, tuple[str, ...]] = {
     TENANT_MODE_MANAGER: PERMISSIONS,
 }
 
+TENANT_MODE_ROLES: dict[str, tuple[str, ...]] = {
+    TENANT_MODE_CONSUMER: (ROLE_ADMIN, ROLE_VIEWER),
+    TENANT_MODE_MANAGER: (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER),
+}
+
+
+def roles_for_tenant_mode(mode: str | None) -> frozenset[str]:
+    roles = TENANT_MODE_ROLES.get(mode or "")
+    return frozenset(roles if roles is not None
+                     else TENANT_MODE_ROLES[TENANT_MODE_CONSUMER])
+
 
 class Base(DeclarativeBase):
     pass
@@ -258,14 +269,33 @@ class Asset(Base):
     updated: Mapped[float] = mapped_column(Float, nullable=False)
     __table_args__ = (Index("ix_kvm_asset_tenant_address", "tenant_id", "address"),)
 
-    def public(self) -> dict:
-        return {"id": self.id, "tenant_id": self.tenant_id, "name": self.name,
-                "address": self.address,
-                "vendor": self.vendor, "model": self.model, "firmware": self.firmware,
-                "fingerprint_prefix": self.fingerprint[:12],
-                "profile_id": self.profile_id, "capability_id": self.capability_id,
-                "licence": self.licence, "status": self.status, "notes": self.notes,
-                "created": self.created, "updated": self.updated}
+    def public(self, *, public_ip: str | None = None,
+               public_ips: list[str] | None = None, show_ipmi: bool = True) -> dict:
+        result = {"id": self.id, "tenant_id": self.tenant_id, "name": self.name,
+                  "address": self.address,
+                  "vendor": self.vendor, "model": self.model, "firmware": self.firmware,
+                  "fingerprint_prefix": self.fingerprint[:12],
+                  "profile_id": self.profile_id, "capability_id": self.capability_id,
+                  "licence": self.licence, "status": self.status, "notes": self.notes,
+                  "created": self.created, "updated": self.updated,
+                  "public_ip": public_ip, "public_ips": list(public_ips or [])}
+        if not show_ipmi:
+            result.pop("address", None)
+        return result
+
+
+class PublicIpMapping(Base):
+
+    __tablename__ = "kvm_public_ip"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    asset_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("kvm_asset.id", ondelete="CASCADE"), nullable=False, unique=True)
+    primary_ip: Mapped[str] = mapped_column(String(256), nullable=False)
+    additional_ips: Mapped[str] = mapped_column(Text, default="")
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    updated: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    __table_args__ = (Index("ix_kvm_public_ip_tenant_primary", "tenant_id", "primary_ip"),)
 
 
 class AccessGrant(Base):

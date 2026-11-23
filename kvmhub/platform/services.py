@@ -19,11 +19,12 @@ from sqlalchemy.orm import Session
 
 from .models import (AccessGrant, Asset, AssetGroup, AssetGroupMember, AuditLog,
                      Capability, Credential, DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID,
-                     PERMISSIONS, Permission, GrantSource, Role, RolePermission,
+                     Permission, GrantSource, Role, RolePermission,
                      ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER, ROLE_PLATFORM_ADMIN,
                      TENANT_ACTIVE, TENANT_MODE_CONSUMER, TENANT_MODE_MANAGER,
                      TENANT_MODE_PERMISSIONS, TENANT_MODES, QuotaUsage, ServiceToken,
-                     Tenant, User, UserRole, VendorProfile, json_field, parse_json)
+                     Tenant, User, UserRole, VendorProfile, json_field, parse_json,
+                     roles_for_tenant_mode)
 from .security import (CredentialCipher, hash_password, verify_password)
 from ..sql_backend import open_store, parse_store_dsn
 
@@ -34,9 +35,11 @@ LOCK_SECONDS = 900
 
 
 class PlatformError(Exception):
-    def __init__(self, code: str, message: str, status: int = 400):
+    def __init__(self, code: str, message: str, status: int = 400,
+                 *, retryable: bool = False):
         super().__init__(f"{code}: {message}")
         self.code, self.message, self.status = code, message, status
+        self.retryable = retryable
 
 
 def default_tenant() -> str:
@@ -116,8 +119,19 @@ def permissions_of(session: Session, user_id: str) -> set[str]:
 
 def tenant_mode_permissions(session: Session, tenant_id: str | None) -> frozenset[str]:
     row = session.get(Tenant, tenant_id) if tenant_id else None
-    mode = row.mode if row else TENANT_MODE_MANAGER
-    return frozenset(TENANT_MODE_PERMISSIONS.get(mode, PERMISSIONS))
+    mode = row.mode if row else TENANT_MODE_CONSUMER
+    return frozenset(TENANT_MODE_PERMISSIONS.get(mode, TENANT_MODE_PERMISSIONS[TENANT_MODE_CONSUMER]))
+
+
+def allowed_roles_for_tenant(session: Session, tenant_id: str) -> frozenset[str]:
+    row = session.get(Tenant, tenant_id) if tenant_id else None
+    return roles_for_tenant_mode(row.mode if row else None)
+
+
+def assert_role_for_tenant(session: Session, tenant_id: str, role: str) -> None:
+    if tenant_id and role not in allowed_roles_for_tenant(session, tenant_id):
+        raise PlatformError("role_not_allowed",
+                            f"该租户类型不支持此角色：{role}", 400)
 
 
 def effective_permissions(session: Session, user_id: str,
@@ -161,6 +175,8 @@ def create_user(session: Session, username: str, password: str, role: str,
     role_row = session.scalar(select(Role).where(Role.code == role))
     if role_row is None:
         raise PlatformError("unknown_role", f"未知角色：{role}")
+    if tenant_id is not None:
+        assert_role_for_tenant(session, tenant_id, role)
     user = User(id=str(uuid.uuid4()), tenant_id=tenant_id, username=username.strip(),
                 display_name=display_name, password_hash=hash_password(password),
                 is_active=True, created=time.time() if now is None else now)
@@ -215,6 +231,7 @@ def set_user_role(session: Session, user_id: str, role: str, *, actor: str,
     role_row = session.scalar(select(Role).where(Role.code == role))
     if role_row is None:
         raise PlatformError("unknown_role", f"未知角色：{role}")
+    assert_role_for_tenant(session, user.tenant_id, role)
     before = roles_of(session, user_id)
     before_rank = max((_ROLE_RANK.get(code, -1) for code in before), default=-1)
     session.execute(delete(UserRole).where(UserRole.user_id == user_id))
@@ -275,26 +292,65 @@ def read_credential(session: Session, cipher: CredentialCipher, credential_id: s
             "password": cipher.decrypt(cred.password_cipher, aad=cred.id + ":password")}
 
 
+def _assert_owned_refs(session: Session, tenant_id: str, *,
+                       credential: str | None, profile: str | None,
+                       capability: str | None) -> None:
+    refs = (
+        (Credential, credential, "credential"),
+        (VendorProfile, profile, "profile"),
+        (Capability, capability, "capability"),
+    )
+    for model, ref_id, label in refs:
+        if not ref_id:
+            continue
+        row = session.get(model, ref_id)
+        if row is None:
+            raise PlatformError(label + "_not_found", f"{label} 不存在", 400)
+        owner = getattr(row, "tenant_id", None)
+        if owner is not None and owner != tenant_id:
+            raise PlatformError("cross_tenant_" + label,
+                                f"{label} 不属于当前租户", 403)
+
+
 def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
                  model: str = "", firmware: str = "", fingerprint: str = "",
                  credential_id: str | None = None, profile_id: str | None = None,
                  capability_id: str | None = None, licence: str = "", notes: str = "",
-                 actor: str, now: float | None = None,
+                 public_ips=None, actor: str, now: float | None = None,
+                 asset_id: str | None = None,
                  tenant_id: str = DEFAULT_TENANT_ID) -> Asset:
+    from . import public_ip as public_ip_module
     stamp = time.time() if now is None else now
     if not name or not address:
         raise PlatformError("invalid_asset", "资产名称与地址不能为空")
-    existing = session.scalar(select(Asset).where(Asset.tenant_id == tenant_id,
-                                                  Asset.address == address))
+    _assert_owned_refs(session, tenant_id, credential=credential_id,
+                       profile=profile_id, capability=capability_id)
+    existing = None
+    if asset_id:
+        candidate = session.get(Asset, asset_id)
+        if candidate is not None and candidate.tenant_id == tenant_id:
+            existing = candidate
+    if existing is None:
+        existing = session.scalar(select(Asset).where(Asset.tenant_id == tenant_id,
+                                                      Asset.address == address))
+    else:
+        clash = session.scalar(select(Asset).where(Asset.tenant_id == tenant_id,
+                                                   Asset.address == address,
+                                                   Asset.id != existing.id))
+        if clash is not None:
+            raise PlatformError("asset_address_conflict",
+                                "该 IPMI 地址已被本租户其它资产占用", 409)
     if existing is None:
         enforce_asset_quota(session, tenant_id)
         existing = Asset(id=str(uuid.uuid4()), tenant_id=tenant_id, name=name,
                          address=address, created=stamp, updated=stamp)
         session.add(existing)
+        session.flush()
         action = "asset_created"
     else:
         action = "asset_updated"
     existing.name = name
+    existing.address = address
     existing.vendor, existing.model, existing.firmware = vendor, model, firmware
     existing.fingerprint = fingerprint
     existing.credential_id = credential_id
@@ -302,6 +358,10 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
     existing.capability_id = capability_id
     existing.licence, existing.notes = licence, notes
     existing.updated = stamp
+    if public_ips is not None:
+        public_ip_module.upsert_public_ip(session, tenant_id=tenant_id,
+                                          asset_id=existing.id, raw=public_ips,
+                                          actor=actor, now=stamp)
     audit(session, actor, action, asset_id=existing.id, tenant_id=tenant_id,
           detail={"address": address, "vendor": vendor, "model": model,
                   "firmware": firmware, "profile_id": profile_id}, now=stamp)
@@ -309,13 +369,99 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
     return existing
 
 
+_ENV_PIN_ADAPTERS = frozenset({"huawei-ibmc-vnc-tls", "huawei-ibmc-kvm-gateway"})
+
+
+def asset_onboarding(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID,
+                     now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    rows = session.scalars(
+        select(VendorProfile)
+        .where((VendorProfile.tenant_id.is_(None)) | (VendorProfile.tenant_id == tenant_id))
+        .order_by(VendorProfile.priority, VendorProfile.code)
+    ).all()
+    brands = []
+    for row in rows:
+        if row.status != "approved":
+            continue
+        if row.review_due and row.review_due < stamp:
+            continue
+        caps = session.scalars(
+            select(Capability)
+            .where((Capability.profile_id == row.id)
+                   & (Capability.status == "verified")
+                   & (Capability.expires > stamp)
+                   & ((Capability.tenant_id.is_(None)) | (Capability.tenant_id == tenant_id)))
+            .order_by(Capability.expires.desc())
+        ).all()
+        cap_views = [{"id": c.id, "model": c.model, "firmware": c.firmware,
+                      "adapter": c.adapter, "status": c.status, "expires": c.expires}
+                     for c in caps]
+        env_pin = row.console_impl in _ENV_PIN_ADAPTERS
+        brands.append({
+            "profile_id": row.id,
+            "code": row.code,
+            "vendor": row.vendor,
+            "model_pattern": row.model_pattern,
+            "firmware_min": row.firmware_min,
+            "firmware_max": row.firmware_max,
+            "licence": row.licence,
+            "console_impl": row.console_impl,
+            "certificate_mode": "env_pin" if env_pin else "asset_fingerprint",
+            "certificate_note": (
+                "该品牌证书指纹由平台统一管理，资产无需填写；连接时按服务端 pin 校验。"
+                if env_pin else
+                "如该 BMC 使用自签证书，请填写证书 SHA-256 指纹；留空则不校验证书。"),
+            "default_capability_id": cap_views[0]["id"] if cap_views else None,
+            "capabilities": cap_views,
+        })
+    return {
+        "brands": brands,
+        "note": ("只能选择已完成适配并批准的品牌。未适配品牌请先在「品牌档案」页走"
+                 "新品牌适配流程；草稿档案不会产生连接方案。"),
+    }
+
+
+def resolve_asset_defaults(session: Session, *, profile_id: str,
+                            tenant_id: str = DEFAULT_TENANT_ID,
+                            now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    profile = session.get(VendorProfile, profile_id)
+    if profile is None or profile.tenant_id not in (None, tenant_id):
+        raise PlatformError("profile_not_found", "品牌档案不存在", 400)
+    if profile.status != "approved":
+        raise PlatformError("profile_not_approved",
+                            f"品牌档案 {profile.code} 尚未批准，请先走新品牌适配", 400)
+    if profile.review_due and profile.review_due < stamp:
+        raise PlatformError("profile_review_overdue", "品牌档案复核已到期，请带外重新审批", 400)
+    capability = session.scalar(
+        select(Capability)
+        .where((Capability.profile_id == profile.id)
+               & (Capability.status == "verified")
+               & (Capability.expires > stamp)
+               & ((Capability.tenant_id.is_(None)) | (Capability.tenant_id == tenant_id)))
+        .order_by(Capability.expires.desc())
+    )
+    return {
+        "vendor": profile.vendor,
+        "model_pattern": profile.model_pattern,
+        "licence": profile.licence,
+        "console_impl": profile.console_impl,
+        "capability_id": capability.id if capability else None,
+    }
+
+
 def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor: str,
                  name: str = "", reassign: bool = False,
                  now: float | None = None, plane: Any | None = None) -> dict:
+    from . import public_ip as public_ip_module
     stamp = time.time() if now is None else now
     addr = (address or "").strip()
     if not addr:
         raise PlatformError("invalid_asset", "请填写设备 IP 地址")
+    resolved = public_ip_module.asset_by_public_ip(session, None, addr)
+    if resolved is not None:
+        addr = resolved.address
     target = (tenant_id or "").strip() or None
     tenant = None
     if target is not None:
@@ -388,6 +534,8 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
             audit(session, actor, "credential_rehomed", asset_id=asset.id, tenant_id=target,
                   detail={"credential_id": credential.id,
                           "to": tenant.code if tenant is not None else None}, now=stamp)
+    public_ip_module.rehome_mapping(session, asset_id=asset.id, tenant_id=target,
+                                    actor=actor, now=stamp)
     action = "unassigned" if target is None else ("moved" if origin_code else "assigned")
     old_grantees = [row[0] for row in session.execute(
         select(AccessGrant.user_id).where(AccessGrant.asset_id == asset.id)).all()]

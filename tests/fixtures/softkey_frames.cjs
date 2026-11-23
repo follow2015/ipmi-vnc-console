@@ -12,6 +12,7 @@ const HTML = fs.readFileSync(opt('html'), 'utf8');
 const KEYMAP = fs.readFileSync(opt('keymap'), 'utf8');
 const CASES = JSON.parse(fs.readFileSync(opt('cases'), 'utf8'));
 const ORIGIN = 'https://softkey.example';
+const PROTOCOL = opt('protocol') || 'insyde18';
 
 async function main() {
   const browser = await chromium.launch({
@@ -32,7 +33,7 @@ async function main() {
     }
     if (path === '/_platform/meta') {
       return route.fulfill({ status: 200, contentType: 'application/json',
-        body: JSON.stringify({ address: '192.0.2.11' }) });
+        body: JSON.stringify({ address: '192.0.2.11', input_protocol: PROTOCOL }) });
     }
     if (path === '/_platform/limits') {
       return route.fulfill({

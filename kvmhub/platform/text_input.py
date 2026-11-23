@@ -40,6 +40,50 @@ _KEYS: dict[str, int] = {
 }
 _MODIFIERS = ("lctrl", "lshift", "lalt", "lwin", "rctrl", "rshift", "ralt")
 
+_X11_KEYSYM_BY_USAGE: dict[int, int] = {
+    0x28: 0xFF0D,
+    0x29: 0xFF1B,
+    0x2A: 0xFF08,
+    0x2B: 0xFF09,
+    0x2C: 0x20,
+    0x39: 0xFFE5,
+    0x49: 0xFF63,
+    0x4A: 0xFF50,
+    0x4B: 0xFF55,
+    0x4C: 0xFFFF,
+    0x4D: 0xFF57,
+    0x4E: 0xFF56,
+    0x4F: 0xFF53,
+    0x50: 0xFF51,
+    0x51: 0xFF54,
+    0x52: 0xFF52,
+    0xE0: 0xFFE3,
+    0xE1: 0xFFE1,
+    0xE2: 0xFFE9,
+    0xE3: 0xFFEB,
+    0xE4: 0xFFE4,
+    0xE5: 0xFFE2,
+    0xE6: 0xFFEA,
+}
+for _n in range(1, 13):
+    _X11_KEYSYM_BY_USAGE[0x39 + _n] = 0xFFBE + _n - 1
+
+
+def char_keysym(char: str) -> int:
+    special = {"\n": 0xFF0D, "\r": 0xFF0D, "\t": 0xFF09,
+               "\x08": 0xFF08, "\x1b": 0xFF1B}
+    if char in special:
+        return special[char]
+    return ord(char)
+
+
+def token_keysym(token: str) -> int | None:
+    if token in _KEYS:
+        return _X11_KEYSYM_BY_USAGE.get(_KEYS[token])
+    if len(token) == 1:
+        return char_keysym(token)
+    return None
+
 _MACROS: list[tuple[str, list[str]]] = [
     ("Ctrl+Alt+Del", ["lctrl", "lalt", "del"]),
     ("Ctrl+C", ["lctrl", "c"]),
@@ -99,6 +143,10 @@ class Keystroke:
     index: int
 
     def frames(self, *, style: str = "insyde18") -> list[bytes]:
+        if style == "standard8":
+            keysym = char_keysym(self.char)
+            return [_key_frame(keysym, True, style),
+                    _key_frame(keysym, False, style)]
         out: list[bytes] = []
         if self.shift:
             out.append(_key_frame(LEFT_SHIFT, True, style))
@@ -109,11 +157,11 @@ class Keystroke:
         return out
 
 
-def _key_frame(usage: int, down: bool, style: str) -> bytes:
+def _key_frame(value: int, down: bool, style: str) -> bytes:
     if style == "insyde18":
-        return struct.pack(">BBBHI", 4, 0, int(down), 0, usage) + b"\x00" * 9
+        return struct.pack(">BBBHI", 4, 0, int(down), 0, value) + b"\x00" * 9
     if style == "standard8":
-        return struct.pack(">BBHI", 4, int(down), 0, usage)
+        return struct.pack(">BBHI", 4, int(down), 0, value)
     raise ValueError(f"unknown key frame style: {style}")
 
 
@@ -186,14 +234,11 @@ def frame_stream(plan: TextPlan, *, style: str = "insyde18",
     out: list[tuple[bytes, int]] = []
     for stroke in plan.strokes:
         frames = stroke.frames(style=style)
-        if stroke.shift:
-            out.append((frames[0], 0))
-            out.append((frames[1], hold_ms))
-            out.append((frames[2], gap_ms))
-            out.append((frames[3], 0))
+        if len(frames) == 4:
+            delays = (0, hold_ms, gap_ms, 0)
         else:
-            out.append((frames[0], hold_ms))
-            out.append((frames[1], gap_ms))
+            delays = (hold_ms, gap_ms)
+        out.extend(zip(frames, delays))
     return out
 
 
@@ -216,30 +261,37 @@ def chord_frames(tokens: list[str], *, style: str = "insyde18",
                  hold_ms: int = 20, gap_ms: int = 55) -> list[tuple[bytes, int]]:
     if hold_ms < 0 or gap_ms < 0:
         raise ValueError("delays must be non-negative")
-    mods: list[int] = []
-    keys: list[tuple[int, bool]] = []
+    mods: list[tuple[str, int]] = []
+    keys: list[tuple[str, int, bool]] = []
     for token in tokens:
         if token in _MODIFIERS:
-            mods.append(_KEYS[token])
+            mods.append((token, _KEYS[token]))
             continue
         resolved = resolve_token(token)
         if resolved is None:
             raise ValueError(f"unknown key token: {token!r}")
-        keys.append(resolved)
+        keys.append((token, resolved[0], resolved[1]))
     if not keys:
         raise ValueError("a chord needs a key that is not a modifier")
+    standard = style == "standard8"
+    def value(token: str, usage: int) -> int:
+        if not standard:
+            return usage
+        ks = token_keysym(token)
+        return ks if ks is not None else usage
+
     out: list[tuple[bytes, int]] = []
-    for usage in mods:
-        out.append((_key_frame(usage, True, style), 0))
-    for usage, shift in keys:
-        if shift:
+    for token, usage in mods:
+        out.append((_key_frame(value(token, usage), True, style), 0))
+    for token, usage, shift in keys:
+        if shift and not standard:
             out.append((_key_frame(LEFT_SHIFT, True, style), 0))
-        out.append((_key_frame(usage, True, style), hold_ms))
-        out.append((_key_frame(usage, False, style), gap_ms))
-        if shift:
+        out.append((_key_frame(value(token, usage), True, style), hold_ms))
+        out.append((_key_frame(value(token, usage), False, style), gap_ms))
+        if shift and not standard:
             out.append((_key_frame(LEFT_SHIFT, False, style), 0))
-    for usage in reversed(mods):
-        out.append((_key_frame(usage, False, style), 0))
+    for token, usage in reversed(mods):
+        out.append((_key_frame(value(token, usage), False, style), 0))
     return out
 
 
@@ -257,6 +309,10 @@ def keymap_document() -> dict:
         "left_shift": LEFT_SHIFT,
         "max_chars": _MAX_CHARS,
         "frame_styles": ["insyde18", "standard8"],
+        "char_keysym": {ch: char_keysym(ch) for ch in sample},
+        "key_keysym": {name: token_keysym(name) for name in _KEYS
+                       if token_keysym(name) is not None},
+        "left_shift_keysym": _X11_KEYSYM_BY_USAGE[LEFT_SHIFT],
         "levels": {"verified": VERIFIED, "unverified": UNVERIFIED,
                    "known_broken": KNOWN_BROKEN, "unsupported": UNSUPPORTED},
         "note": ("verified 字符来自阶段 28 与 2026-11-16 的真机回读（后者是长命令输入框这条路）；"

@@ -40,18 +40,18 @@ def _chrome():
     return None
 
 
-def _cases_with_frames() -> list[dict]:
+def _cases_with_frames(style: str = "insyde18") -> list[dict]:
     doc = text_input.keymap_document()
     macros = {macro["label"]: macro["keys"] for macro in doc["macros"]}
     prepared = []
     for case in CASES:
         tokens = case.get("keys") or macros[case["macro"]]
-        frames = [list(frame) for frame, _ in text_input.chord_frames(tokens)]
+        frames = [list(frame) for frame, _ in text_input.chord_frames(tokens, style=style)]
         prepared.append(dict(case, tokens=tokens, frames=frames))
     return prepared
 
 
-def test_the_page_builds_the_same_frames_as_the_python_reference():
+def _run_browser_frames(style: str) -> tuple[dict, list[dict]]:
     playwright = os.environ.get("KVM_PLAYWRIGHT") or _find_playwright()
     chrome = _chrome()
     node = shutil.which("node")
@@ -68,7 +68,7 @@ def test_the_page_builds_the_same_frames_as_the_python_reference():
         (directory / "page.html").write_text(html, encoding="utf-8")
         (directory / "keymap.json").write_text(
             json.dumps(text_input.keymap_document(), ensure_ascii=False), encoding="utf-8")
-        cases = _cases_with_frames()
+        cases = _cases_with_frames(style)
         (directory / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
 
         env = dict(os.environ, KVM_PLAYWRIGHT=playwright, KVM_CHROMIUM=chrome)
@@ -77,17 +77,21 @@ def test_the_page_builds_the_same_frames_as_the_python_reference():
              "--html", str(directory / "page.html"),
              "--keymap", str(directory / "keymap.json"),
              "--cases", str(directory / "cases.json"),
+             "--protocol", style,
              "--shot", str(directory / "softkey.png")],
             capture_output=True, text=True, timeout=180, env=env,
         )
         assert result.returncode == 0, result.stderr[-2000:]
-        report = json.loads(result.stdout)
+        return json.loads(result.stdout), cases
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 
+
+def test_the_page_builds_the_same_frames_as_the_python_reference():
+    report, cases = _run_browser_frames("insyde18")
     assert report["errors"] == [], "the console page threw while clicking keys"
     by_label = {item["label"]: item for item in report["results"]}
-    for case in _cases_with_frames():
+    for case in cases:
         got = by_label[case["label"]]
         assert got["problem"] is None, f"{case['label']}: {got['problem']}"
         assert got["sent"] == case["frames"], f"{case['label']}: frame mismatch"
@@ -97,3 +101,15 @@ def test_the_page_builds_the_same_frames_as_the_python_reference():
     assert ui["macros"] == [macro["label"] for macro in text_input.keymap_document()["macros"]]
     assert ui["levels"].get("unverified"), "named keys must not claim verification"
     assert ui["panel_height"] > 150, "the keyboard drew nothing"
+
+
+def test_standard_vnc_session_builds_8_byte_keysym_frames():
+    report, cases = _run_browser_frames("standard8")
+    assert report["errors"] == [], "the console page threw while clicking keys"
+    by_label = {item["label"]: item for item in report["results"]}
+    for case in cases:
+        got = by_label[case["label"]]
+        assert got["problem"] is None, f"{case['label']}: {got['problem']}"
+        assert got["sent"] == case["frames"], f"{case['label']}: frame mismatch"
+        for frame in got["sent"]:
+            assert len(frame) == 8 and frame[0] == 4, (case["label"], frame)
