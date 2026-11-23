@@ -7,9 +7,10 @@ import time
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import Asset, PublicIpMapping
+from .models import Asset, PublicIpAlias, PublicIpMapping
 from .services import PlatformError, audit
 
 _SPLIT = re.compile(r"[,，;；\s]+")
@@ -58,6 +59,24 @@ def all_ips(row: PublicIpMapping) -> list[str]:
     return [row.primary_ip, *[p for p in _SPLIT.split(row.additional_ips or "") if p.strip()]]
 
 
+def _alias_rows(session: Session, mapping_id: str) -> list[PublicIpAlias]:
+    return list(session.scalars(select(PublicIpAlias).where(
+        PublicIpAlias.mapping_id == mapping_id)).all())
+
+
+def _replace_aliases(session: Session, mapping: PublicIpMapping,
+                     ips: list[str], stamp: float) -> None:
+    for row in _alias_rows(session, mapping.id):
+        session.delete(row)
+    session.flush()
+    for ip in ips:
+        session.add(PublicIpAlias(
+            id=str(uuid.uuid4()), tenant_id=mapping.tenant_id, ip=ip.lower(),
+            asset_id=mapping.asset_id, mapping_id=mapping.id,
+            created=stamp, updated=stamp))
+    session.flush()
+
+
 def view(asset: Asset, session: Session, *, show_ipmi: bool) -> dict:
     ips = public_ips_for_asset(session, asset.id)
     return asset.public(public_ip=ips[0] if ips else None, public_ips=ips,
@@ -74,6 +93,8 @@ def upsert_public_ip(session: Session, *, tenant_id: str, asset_id: str,
     existing = mapping_for_asset(session, asset_id)
     if not ips:
         if existing is not None:
+            for row in _alias_rows(session, existing.id):
+                session.delete(row)
             session.delete(existing)
             audit(session, actor, "public_ip_cleared", asset_id=asset_id,
                   tenant_id=tenant_id, detail={"asset_id": asset_id}, now=stamp)
@@ -91,6 +112,10 @@ def upsert_public_ip(session: Session, *, tenant_id: str, asset_id: str,
             continue
         for ip in all_ips(row):
             claimed[ip.lower()] = row.asset_id
+    for row in session.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.tenant_id == tenant_id)):
+        if row.asset_id != asset_id:
+            claimed[row.ip] = row.asset_id
     for ip in ips:
         owner = claimed.get(ip.lower())
         if owner:
@@ -109,7 +134,12 @@ def upsert_public_ip(session: Session, *, tenant_id: str, asset_id: str,
     existing.updated = stamp
     audit(session, actor, action, asset_id=asset_id, tenant_id=tenant_id,
           detail={"asset_id": asset_id, "public_ips": ips}, now=stamp)
-    session.flush()
+    try:
+        session.flush()
+        _replace_aliases(session, existing, ips, stamp)
+    except IntegrityError as exc:
+        raise PlatformError("public_ip_conflict",
+                            "公网 IP 已被本租户其它资产占用", 409) from exc
     return existing
 
 
@@ -150,6 +180,8 @@ def rehome_mapping(session: Session, *, asset_id: str, tenant_id: str | None,
         return
     if tenant_id is None:
         previous = row.tenant_id
+        for alias in _alias_rows(session, row.id):
+            session.delete(alias)
         session.delete(row)
         audit(session, actor, "public_ip_removed_on_unassign", asset_id=asset_id,
               tenant_id=previous, detail={"asset_id": asset_id}, now=stamp)
@@ -157,6 +189,9 @@ def rehome_mapping(session: Session, *, asset_id: str, tenant_id: str | None,
         previous = row.tenant_id
         row.tenant_id = tenant_id
         row.updated = stamp
+        for alias in _alias_rows(session, row.id):
+            alias.tenant_id = tenant_id
+            alias.updated = stamp
         audit(session, actor, "public_ip_rehomed", asset_id=asset_id,
               tenant_id=tenant_id, detail={"from": previous, "to": tenant_id},
               now=stamp)

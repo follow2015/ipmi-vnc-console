@@ -1,14 +1,18 @@
 """Tenant-facing public IPs are query labels, never connection targets."""
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from kvmhub.platform import public_ip, services
 from kvmhub.platform.api import create_app
 from kvmhub.platform.config import Settings
 from kvmhub.platform.db import init_schema, seed_roles, session_factory, transaction
-from kvmhub.platform.models import Asset
+from kvmhub.platform.models import Asset, PublicIpAlias
 from kvmhub.platform.redis_state import MemoryState
 
 KEY = b"0123456789abcdef0123456789abcdef"
@@ -212,3 +216,65 @@ def test_unassign_drops_public_ip_mapping(world):
         assert public_ip.mapping_for_asset(db, a["id"]) is None
         assert public_ip.asset_by_public_ip(db, services.DEFAULT_TENANT_ID,
                                            "203.0.113.10") is None
+
+
+def test_alias_rows_follow_mapping_lifecycle(world):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "web-01", "192.0.2.24",
+                      public_ips="203.0.113.10,203.0.113.11")
+    with transaction(platform.factory) as db:
+        rows = db.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.asset_id == a["id"])).all()
+        assert sorted(row.ip for row in rows) == ["203.0.113.10", "203.0.113.11"]
+        assert all(row.mapping_id == public_ip.mapping_for_asset(db, a["id"]).id
+                   for row in rows)
+
+    r = c.put(f"/api/v2/public-ips/{a['id']}", headers=_h(csrf),
+              json={"public_ips": "198.51.100.9"})
+    assert r.status_code == 200, r.text
+    with transaction(platform.factory) as db:
+        assert [row.ip for row in db.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.asset_id == a["id"])).all()] == ["198.51.100.9"]
+
+    r = c.put(f"/api/v2/public-ips/{a['id']}", headers=_h(csrf),
+              json={"public_ips": ""})
+    assert r.status_code == 200, r.text
+    with transaction(platform.factory) as db:
+        assert db.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.asset_id == a["id"])).all() == []
+
+
+def test_alias_table_rejects_race_duplicate_at_db_level(world):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "web-01", "192.0.2.24", public_ips="203.0.113.10")
+    b = _create_asset(c, csrf, "web-02", "192.0.2.25", public_ips="203.0.113.20")
+
+    with pytest.raises(IntegrityError):
+        with transaction(platform.factory) as db:
+            mapping = public_ip.mapping_for_asset(db, b["id"])
+            stamp = 1.0
+            db.add(PublicIpAlias(
+                id=str(uuid.uuid4()), tenant_id=services.DEFAULT_TENANT_ID,
+                ip="203.0.113.10", asset_id=b["id"], mapping_id=mapping.id,
+                created=stamp, updated=stamp))
+            db.flush()
+    with transaction(platform.factory) as db:
+        owners = db.scalars(select(PublicIpAlias.asset_id).where(
+            PublicIpAlias.ip == "203.0.113.10")).all()
+        assert owners == [a["id"]]
+
+
+def test_rehomed_aliases_follow_the_new_tenant(world):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "web-01", "192.0.2.24", public_ips="203.0.113.10")
+    with transaction(platform.factory) as db:
+        other = services.create_tenant(db, code="other", name="other", actor="test")
+        db.commit()
+        other_id = other.id
+    with transaction(platform.factory) as db:
+        services.assign_asset(db, address="192.0.2.24", tenant_id=other_id,
+                              actor="test", reassign=True)
+    with transaction(platform.factory) as db:
+        rows = db.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.asset_id == a["id"])).all()
+        assert len(rows) == 1 and rows[0].tenant_id == other_id

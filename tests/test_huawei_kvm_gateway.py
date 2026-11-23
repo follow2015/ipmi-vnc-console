@@ -5,12 +5,19 @@ import asyncio
 import hashlib
 import json
 import random
+import ssl
 import struct
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aiohttp
 import pytest
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.x509.oid import NameOID
 
 from kvmhub import huawei_kvm_protocol as P
 from kvmhub.huawei_kvm_input import BrowserInputTranslator, packet_command
@@ -27,6 +34,9 @@ from kvmhub.worker import make_adapter
 
 ROOT = Path(__file__).resolve().parents[1]
 CAPTURED_FRAMES = ROOT / "docs/implementation/evidence/huawei-ibmc-234-private-ws-frames-20261121.json"
+needs_capture = pytest.mark.skipif(
+    not CAPTURED_FRAMES.is_file(),
+    reason="private iBMC WS capture is intentionally unpublished")
 
 INFO = dict(
     adapter=HUAWEI_IBMC_KVM_GATEWAY_ID,
@@ -72,6 +82,101 @@ def test_gateway_fails_closed_when_pin_unconfigured(monkeypatch):
 def test_gateway_accepts_valid_pin_and_stores_it():
     adapter = HuaweiIbmcKvmGatewayAdapter(dict(INFO))
     assert adapter.tls_pin == TEST_PIN
+
+
+def _self_signed_cert(tmp_path):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption())
+    cert_path = tmp_path / "bmc.crt"
+    key_path = tmp_path / "bmc.key"
+    cert_path.write_bytes(cert_pem)
+    key_path.write_bytes(key_pem)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert_path, key_path)
+    der = cert.public_bytes(serialization.Encoding.DER)
+    return ctx, hashlib.sha256(der).hexdigest()
+
+
+def test_connect_pins_credentials_session_without_second_preflight(monkeypatch):
+    from kvmhub import huawei_kvm_upstream as U
+
+    seen = {}
+    real_connector = aiohttp.TCPConnector
+
+    def capture_connector(*args, **kwargs):
+        seen["ssl"] = kwargs.get("ssl")
+        return real_connector(*args, **kwargs)
+
+    async def forbidden_preflight(*args, **kwargs):
+        raise AssertionError("separate TLS preflight connection is forbidden")
+
+    monkeypatch.setattr(U.aiohttp, "TCPConnector", capture_connector)
+    monkeypatch.setattr(U.asyncio, "open_connection", forbidden_preflight)
+
+    up = U.HuaweiKvmUpstream("127.0.0.1", "admin", "synthetic-password",
+                             tls_pin=TEST_PIN)
+
+    async def stop_before_network():
+        seen["session"] = up._session
+        raise U.UpstreamError("stop_after_connector")
+
+    monkeypatch.setattr(up, "_obtain_ticket", stop_before_network)
+    with pytest.raises(U.UpstreamError):
+        asyncio.run(up.connect())
+
+    assert seen["session"] is not None
+    assert isinstance(seen["ssl"], aiohttp.Fingerprint)
+    assert seen["ssl"].fingerprint == bytes.fromhex(TEST_PIN)
+
+
+def test_pinned_connector_rejects_wrong_certificate_on_real_tls(tmp_path):
+    from kvmhub import huawei_kvm_upstream as U
+
+    ctx, pin = _self_signed_cert(tmp_path)
+
+    async def handle(reader, writer):
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                         b"Connection: close\r\n\r\nok")
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def run():
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+        port = server.sockets[0].getsockname()[1]
+        url = f"https://127.0.0.1:{port}/"
+        try:
+            good = U.HuaweiKvmUpstream("127.0.0.1", "admin", "synthetic-password",
+                                       port=port, tls_pin=pin)
+            async with aiohttp.ClientSession(connector=good._tls_connector()) as sess:
+                async with sess.get(url) as resp:
+                    assert resp.status == 200
+
+            bad = U.HuaweiKvmUpstream("127.0.0.1", "admin", "synthetic-password",
+                                      port=port, tls_pin="00" * 32)
+            async with aiohttp.ClientSession(connector=bad._tls_connector()) as sess:
+                with pytest.raises(aiohttp.ServerFingerprintMismatch):
+                    await sess.get(url)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
 
 
 
@@ -183,6 +288,7 @@ def test_jnlp_ticket_parsing():
 
 
 
+@needs_capture
 def test_decode_real_captured_frame_shows_nonblack_pixels():
     raw = json.loads(CAPTURED_FRAMES.read_text(encoding="utf-8"))
     buf = bytearray()
@@ -225,6 +331,7 @@ def _captured_complete_frames():
     return done
 
 
+@needs_capture
 def test_incremental_decode_keeps_canvas_across_frames():
     frames = _captured_complete_frames()
     assert len(frames) > 10
@@ -240,6 +347,7 @@ def test_incremental_decode_keeps_canvas_across_frames():
     assert dec.blocks, "persistent per-block cache must be populated"
 
 
+@needs_capture
 def test_persistent_decode_recovers_left_edge_text():
     frames = _captured_complete_frames()
     dec = P.HuaweiFrameDecoder()
@@ -256,6 +364,7 @@ def test_persistent_decode_recovers_left_edge_text():
     assert first_x is not None and first_x < 32, f"left edge missing, first_x={first_x}"
 
 
+@needs_capture
 def test_decode_failure_is_counted_not_silently_swallowed(monkeypatch):
     frames = _captured_complete_frames()
     dec2 = P.HuaweiFrameDecoder()
@@ -273,6 +382,7 @@ def test_decode_failure_is_counted_not_silently_swallowed(monkeypatch):
     assert dec.decoded_blocks == 0
 
 
+@needs_capture
 def test_vectorized_fbu_is_byte_identical_to_per_pixel_path():
     frames = _captured_complete_frames()
     dec = P.HuaweiFrameDecoder()

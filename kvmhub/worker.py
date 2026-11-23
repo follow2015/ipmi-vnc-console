@@ -68,6 +68,8 @@ def cookie_max_age(hard_until: float, now: float) -> int:
 
 
 def input_protocol_for_adapter(adapter) -> str:
+    if isinstance(adapter, Idrac8Adapter):
+        return "view_only"
     if isinstance(adapter, (IdracVncAdapter, HuaweiIbmcVncAdapter,
                             HuaweiIbmcKvmGatewayAdapter)):
         return "standard8"
@@ -435,7 +437,8 @@ REAL_CONSOLE_JS = """'use strict';
     return response.ok ? response.json() : null;
   }).then(function (data) {
     if (!data) return;
-    if (data.input_protocol === 'standard8' || data.input_protocol === 'insyde18') {
+    if (data.input_protocol === 'standard8' || data.input_protocol === 'insyde18'
+        || data.input_protocol === 'view_only') {
       inputProtocol = data.input_protocol;
     }
     if (!data.address) return;
@@ -928,8 +931,8 @@ REAL_CONSOLE_JS = """'use strict';
     return { strokes: strokes, warnings: warnings, counts: counts, chars: text.length };
   }
   function pasteReady() {
-    return health.state === 'normal' && !!window.__kvm &&
-      !!(window.__kvm._sock || window.__kvm._websocket);
+    return health.state === 'normal' && inputProtocol !== 'view_only' &&
+      !!window.__kvm && !!(window.__kvm._sock || window.__kvm._websocket);
   }
   function pasteSocket() {
     var client = window.__kvm;
@@ -990,8 +993,12 @@ REAL_CONSOLE_JS = """'use strict';
   // a standard 8-byte frame. The two values are NOT interchangeable -- a HID
   // usage of 0x04 means 'a' to the vendor client but Ctrl+D to standard RFB.
   function pasteFrame(usage, down, keysym) {
+    if (inputProtocol === 'view_only') return null;
     if (inputProtocol === 'standard8') {
-      var ks = typeof keysym === 'number' ? keysym : usage;
+      // A HID usage is not an X11 keysym (usage 4 == 'a' to the vendor client
+      // but Ctrl+D to standard RFB). Never guess: drop the stroke instead.
+      if (typeof keysym !== 'number') return null;
+      var ks = keysym;
       return [4, down ? 1 : 0, 0, 0,
         (ks >>> 24) & 255, (ks >>> 16) & 255, (ks >>> 8) & 255, ks & 255];
     }
@@ -1004,17 +1011,20 @@ REAL_CONSOLE_JS = """'use strict';
     var gap = Math.max(10, parseInt(document.getElementById('paste-gap').value, 10) || 55);
     var hold = Math.max(0, parseInt(document.getElementById('paste-hold').value, 10) || 20);
     var out = [];
+    var pushFrame = function (f, delay) {
+      if (f !== null) out.push([f, delay]);
+    };
     pastePlan.strokes.forEach(function (s) {
       if (s.shift && inputProtocol !== 'standard8') {
-        out.push([pasteFrame(pasteKeymap.left_shift, true), 0]);
-        out.push([pasteFrame(s.usage, true, s.keysym), hold]);
-        out.push([pasteFrame(s.usage, false, s.keysym), gap]);
-        out.push([pasteFrame(pasteKeymap.left_shift, false), 0]);
+        pushFrame(pasteFrame(pasteKeymap.left_shift, true), 0);
+        pushFrame(pasteFrame(s.usage, true, s.keysym), hold);
+        pushFrame(pasteFrame(s.usage, false, s.keysym), gap);
+        pushFrame(pasteFrame(pasteKeymap.left_shift, false), 0);
       } else {
         // For standard8 the keysym already encodes case/shift, so no separate
         // Shift down/up pair is emitted (same as noVNC keyEvent(keysym,down)).
-        out.push([pasteFrame(s.usage, true, s.keysym), hold]);
-        out.push([pasteFrame(s.usage, false, s.keysym), gap]);
+        pushFrame(pasteFrame(s.usage, true, s.keysym), hold);
+        pushFrame(pasteFrame(s.usage, false, s.keysym), gap);
       }
     });
     return out;
@@ -1091,6 +1101,10 @@ REAL_CONSOLE_JS = """'use strict';
     }
     pasteSendBtn.textContent = '发送到 KVM';
     var frames = pasteFrames();
+    if (!frames.length) {
+      pasteStatusText('该会话不支持按键注入或没有可用键位，已取消发送');
+      return;
+    }
     pasteAbort = false;
     pasteActive = true;
     pasteSent = 0;
@@ -1274,7 +1288,7 @@ REAL_CONSOLE_JS = """'use strict';
       if (key.shift && inputProtocol !== 'standard8') out.push({ frame: pasteFrame(pasteKeymap.left_shift, false), delay: 0 });
     });
     for (i = mods.length - 1; i >= 0; i -= 1) out.push({ frame: pasteFrame(mods[i], false, modKeysym(mods[i])), delay: 0 });
-    return out;
+    return out.filter(function (item) { return item.frame !== null; });
   }
   function skPaintMods() {
     skKeys.forEach(function (button) {

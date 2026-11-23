@@ -14,6 +14,7 @@ from kvmhub.platform.db import init_schema, make_engine, session_factory
 from kvmhub.platform.models import VendorProfile
 
 KEY = b"0123456789abcdef0123456789abcdef"
+TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "idrac8_vnc_setup.py"
 
 
 @pytest.fixture
@@ -78,8 +79,9 @@ def test_approved_vnc_profile_yields_plan_with_new_adapter(db_session):
 
 @pytest.fixture(scope="module")
 def tool():
-    path = Path(__file__).resolve().parents[1] / "tools" / "idrac8_vnc_setup.py"
-    spec = importlib.util.spec_from_file_location("idrac8_vnc_setup", path)
+    if not TOOL_PATH.is_file():
+        pytest.skip("internal RACADM tool is not published in the public repo")
+    spec = importlib.util.spec_from_file_location("idrac8_vnc_setup", TOOL_PATH)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["idrac8_vnc_setup"] = mod
     spec.loader.exec_module(mod)

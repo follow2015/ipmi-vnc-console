@@ -15,10 +15,14 @@ if str(_ROOT) not in sys.path:
 
 from demos.redfish_probe import Redfish, RedfishError, inventory as redfish_inventory, validate_host
 
+from ..common import parse_controlled_networks
+
 
 RETRYABLE_CODES = frozenset({"certificate_unavailable", "inventory_unavailable"})
 
 _INVENTORY_BUDGET = 30.0
+
+ALLOWED_PROBE_PORTS = frozenset({443, 8443})
 
 
 class ProbeError(ValueError):
@@ -44,7 +48,8 @@ def _reject_unsafe_address(address: ipaddress.IPv4Address | ipaddress.IPv6Addres
         raise ProbeError("probe_target_not_allowed")
 
 
-def validate_probe_target(host: str) -> tuple[str, str]:
+def validate_probe_target(host: str, *, allowed_networks=()) -> tuple[str, str]:
+    networks = parse_controlled_networks(allowed_networks)
     try:
         name = validate_host(host)
     except RedfishError:
@@ -53,6 +58,8 @@ def validate_probe_target(host: str) -> tuple[str, str]:
         literal = ipaddress.ip_address(name)
         addresses = [literal]
     except ValueError:
+        if networks:
+            raise ProbeError("probe_target_not_allowed") from None
         try:
             infos = socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP)
         except OSError:
@@ -67,11 +74,13 @@ def validate_probe_target(host: str) -> tuple[str, str]:
                 raise ProbeError("invalid_probe_target") from None
     for address in addresses:
         _reject_unsafe_address(address)
+        if networks and not any(address in network for network in networks):
+            raise ProbeError("probe_target_not_allowed")
     return str(addresses[0]), name
 
 
-def validate_probe_host(host: str) -> str:
-    connect_ip, _ = validate_probe_target(host)
+def validate_probe_host(host: str, *, allowed_networks=()) -> str:
+    connect_ip, _ = validate_probe_target(host, allowed_networks=allowed_networks)
     return connect_ip
 
 
@@ -129,9 +138,10 @@ def read_inventory(connect_ip: str, sni_name: str, port: int, timeout: float,
 
 
 def probe(host: str, username: str, password: str, *, port: int = 443,
-          timeout: float = 8) -> dict:
-    connect_ip, sni_name = validate_probe_target(host)
-    if not 1 <= port <= 65535:
+          timeout: float = 8, allowed_networks=()) -> dict:
+    connect_ip, sni_name = validate_probe_target(host,
+                                                 allowed_networks=allowed_networks)
+    if port not in ALLOWED_PROBE_PORTS:
         raise ProbeError("invalid_probe_port")
     if not 0 < timeout <= 30:
         raise ProbeError("invalid_probe_timeout")

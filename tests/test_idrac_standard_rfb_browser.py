@@ -102,7 +102,7 @@ def test_input_protocol_declared_per_adapter():
     vnc = object.__new__(IdracVncAdapter)
     assert worker.input_protocol_for_adapter(vnc) == "standard8"
     html5 = object.__new__(Idrac8Adapter)
-    assert worker.input_protocol_for_adapter(html5) == "insyde18"
+    assert worker.input_protocol_for_adapter(html5) == "view_only"
     passthrough = object.__new__(PassthroughAdapter)
     assert worker.input_protocol_for_adapter(passthrough) == "insyde18"
     assert worker.input_protocol_for_adapter(Stub()) == "insyde18"
@@ -124,8 +124,17 @@ def test_console_js_builds_both_frame_formats():
     js = worker.REAL_CONSOLE_JS
     assert "var inputProtocol = 'insyde18'" in js
     assert "data.input_protocol === 'standard8'" in js
+    assert "data.input_protocol === 'view_only'" in js
     assert "return [4, down ? 1 : 0, 0, 0," in js
-    assert "var ks = typeof keysym === 'number' ? keysym : usage;" in js
+    assert "var ks = typeof keysym === 'number' ? keysym : usage;" not in js
+    assert "if (typeof keysym !== 'number') return null;" in js
+    assert "if (f !== null)" in js
     assert "pasteKeymap.char_keysym" in js
     assert "pasteKeymap.key_keysym" in js
     assert "0, 0, 0, 0, 0, 0, 0, 0, 0]" in js
+
+
+def test_view_only_session_emits_no_key_frames():
+    js = worker.REAL_CONSOLE_JS
+    assert "if (inputProtocol === 'view_only') return null;" in js
+    assert "if (!frames.length) {" in js

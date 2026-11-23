@@ -49,8 +49,9 @@ def world(tmp_path, monkeypatch):
         foreign_id = foreign.id
     seen: list[tuple] = []
 
-    def fake_probe(host, username, password, *, port=443, timeout=5):
-        seen.append((host, username, password, port, timeout))
+    def fake_probe(host, username, password, *, port=443, timeout=5,
+                   allowed_networks=()):
+        seen.append((host, username, password, port, timeout, allowed_networks))
         return {
             "fingerprint": "ab" * 32, "redfish_auth": "basic",
             "inventory": {"resources": {"Managers": [
@@ -163,7 +164,7 @@ def test_transient_probe_error_is_marked_retryable_and_audited(world, monkeypatc
         response = _post(world)
     assert response.status_code == 502
     body = response.json()
-    assert body["error"] == "certificate_unavailable"
+    assert body["error"] == "asset_probe_failed"
     assert body["retryable"] is True
     assert "certificate_unavailable" in caplog.text
     assert "192.0.2.234" in caplog.text
@@ -185,7 +186,7 @@ def test_auth_failure_is_not_retryable(world, monkeypatch):
     response = _post(world)
     assert response.status_code == 502
     body = response.json()
-    assert body["error"] == "probe_auth_failed"
+    assert body["error"] == "asset_probe_failed"
     assert "retryable" not in body
 
 
@@ -237,3 +238,31 @@ def test_tls_identity_mismatch_is_not_retryable():
 def test_probe_rejects_malformed_target():
     with pytest.raises(bmc_probe.ProbeError):
         bmc_probe.validate_probe_host("not a host")
+
+
+def test_api_passes_controlled_networks_to_probe(world):
+    c, ids, platform, seen = world
+    object.__setattr__(platform.cfg, "bmc_allowed_networks",
+                       "192.0.2.0/24,192.0.2.0/24")
+    assert _post(world).status_code == 200
+    assert seen[-1][-1] == "192.0.2.0/24,192.0.2.0/24"
+
+
+def test_probe_refuses_target_outside_controlled_network():
+    with pytest.raises(bmc_probe.ProbeError) as exc:
+        bmc_probe.probe("8.8.8.8", "root", "synthetic-password",
+                        allowed_networks=("192.0.2.0/24",))
+    assert exc.value.code == "probe_target_not_allowed"
+
+
+def test_probe_refuses_hostname_when_controlled_network_configured():
+    with pytest.raises(bmc_probe.ProbeError) as exc:
+        bmc_probe.validate_probe_target(
+            "bmc.internal.example", allowed_networks=("192.0.2.0/24",))
+    assert exc.value.code == "probe_target_not_allowed"
+
+
+def test_probe_rejects_non_redfish_port():
+    with pytest.raises(bmc_probe.ProbeError) as exc:
+        bmc_probe.probe("192.0.2.234", "root", "synthetic-password", port=22)
+    assert exc.value.code == "invalid_probe_port"

@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from ..common import (HUAWEI_IBMC_VNC_ADAPTER_ID, Problem,
                       bmc_allowed_networks_from_env, require_controlled_host)
 from ..passthrough import RfbPassthroughSession
-from ..rfb_tcp_upstream import (RfbTcpConfig, RfbTcpUpstream,
+from ..rfb_tcp_upstream import (BROWSER_RFB_VERSION, RfbTcpConfig, RfbTcpUpstream,
                                 StandardRfbBrowserHandshake)
 from .idrac8 import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
 
@@ -63,9 +63,9 @@ class HuaweiIbmcVncAdapter:
             raise Problem("connection_limit")
         if self.upstream is None or not self.upstream.server_init_raw:
             raise Problem("upstream_handshake_failed", 502)
-        version = (self.upstream.protocol_version or "RFB 003.008") + "\n"
         handshake = StandardRfbBrowserHandshake(
-            self.upstream.server_init_raw, version=version.encode("ascii"))
+            self.upstream.server_init_raw,
+            version=(BROWSER_RFB_VERSION + "\n").encode("ascii"))
         session = RfbPassthroughSession(self.upstream, handshake)
         await session.start()
         self.session = session

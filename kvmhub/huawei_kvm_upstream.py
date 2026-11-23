@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import logging
 import os
 import re
-import ssl
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -94,10 +92,17 @@ class HuaweiKvmUpstream:
         self.framebuffer_width = 1024
         self.framebuffer_height = 768
 
+    def _tls_connector(self) -> aiohttp.TCPConnector:
+        if self.verify_ssl:
+            return aiohttp.TCPConnector(ssl=True)
+        if not valid_pin(self.tls_pin):
+            raise UpstreamError("bmc_cert_pin_unconfigured", 503)
+        return aiohttp.TCPConnector(
+            ssl=aiohttp.Fingerprint(bytes.fromhex(self.tls_pin)))
+
     async def connect(self) -> None:
-        await self._verify_tls_pin()
         timeout = aiohttp.ClientTimeout(total=LOGIN_TIMEOUT + HANDSHAKE_TIMEOUT)
-        connector = aiohttp.TCPConnector(ssl=None if self.verify_ssl else _insecure_ssl())
+        connector = self._tls_connector()
         self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         try:
             await self._obtain_ticket()
@@ -105,30 +110,6 @@ class HuaweiKvmUpstream:
         except Exception:
             await self.close()
             raise
-
-    async def _verify_tls_pin(self) -> None:
-        if self.verify_ssl:
-            return
-        if not valid_pin(self.tls_pin):
-            raise UpstreamError("bmc_cert_pin_unconfigured", 503)
-        ctx = _insecure_ssl()
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port, ssl=ctx,
-                                        server_hostname=self.host),
-                timeout=HANDSHAKE_TIMEOUT,
-            )
-        except (OSError, ssl.SSLError, TimeoutError) as exc:
-            raise UpstreamError("bmc_tls_pin_check_failed") from exc
-        try:
-            ssl_obj = writer.get_extra_info("ssl_object")
-            der = ssl_obj.getpeercert(binary_form=True) if ssl_obj is not None else None
-            if not tls_der_matches_pin(der, self.tls_pin):
-                raise UpstreamError("bmc_cert_pin_mismatch", 502)
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
 
     async def _obtain_ticket(self) -> None:
         base = f"https://{self.host}"
@@ -293,10 +274,3 @@ class HuaweiKvmUpstream:
             self._session = None
         self.connected = False
         return had
-
-
-def _insecure_ssl() -> ssl.SSLContext:
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx

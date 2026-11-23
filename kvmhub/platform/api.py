@@ -583,7 +583,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 "probe_busy", "探测请求过多，请稍后重试", 429, retryable=True) from None
         try:
             measured = await asyncio.to_thread(
-                bmc_probe.probe, address, secret["username"], secret["password"], port=port)
+                bmc_probe.probe, address, secret["username"], secret["password"],
+                port=port, allowed_networks=platform.cfg.bmc_allowed_networks)
         except bmc_probe.ProbeError as exc:
             safe_address = address.encode("unicode_escape").decode("ascii")[:256]
             logger.warning("asset_probe_failed address=%s code=%s retryable=%s trace=%s",
@@ -594,7 +595,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                     detail={"address": address, "error": exc.code,
                             "retryable": exc.retryable}, trace=request.state.trace)
             raise services.PlatformError(
-                exc.code, "BMC 探测失败，请核对地址、凭据与网络", 502,
+                "asset_probe_failed", "BMC 探测失败，请核对地址、凭据与网络", 502,
                 retryable=exc.retryable) from None
         except Exception:
             raise

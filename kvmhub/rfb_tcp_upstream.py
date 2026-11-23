@@ -16,7 +16,8 @@ from typing import Any, Awaitable, Callable
 from .common import Problem
 from .vnc_des import des_ecb_encrypt
 
-RFB_VERSIONS: tuple[str, ...] = ("RFB 003.008", "RFB 003.003")
+RFB_VERSIONS: tuple[str, ...] = ("RFB 003.008", "RFB 003.007", "RFB 003.003")
+BROWSER_RFB_VERSION = "RFB 003.008"
 RFB_VERSION_BYTES = 12
 SECURITY_NONE = 1
 SECURITY_VNC_AUTH = 2
@@ -93,6 +94,8 @@ class RfbTcpConfig:
                 or (self.tls_cert_sha256 != ""
                     and not re.fullmatch(r"[0-9a-fA-F]{64}", self.tls_cert_sha256))):
             raise ValueError("invalid_tls_cert_sha256")
+        if self.tls_enabled and not self.tls_cert_sha256:
+            raise ValueError("bmc_cert_pin_required")
         if not isinstance(self.password, str) or not self.password or len(self.password) > 128:
             raise ValueError("invalid_vnc_password")
         for value in (self.connect_timeout, self.handshake_timeout):
@@ -284,21 +287,30 @@ class RfbTcpUpstream:
 
         started = time.monotonic()
         trace.begin("security_types")
-        count = (await self._read_exactly(1))[0]
-        if not 1 <= count <= MAX_SECURITY_TYPES:
+        legacy_33 = version == "RFB 003.003"
+        if legacy_33:
+            (offered,) = struct.unpack(">I", await self._read_exactly(4))
+            trace.offered_security_types = (offered,)
             trace.mark("security_types", started)
-            raise self._handshake_fail("security_types", "security_types_invalid")
-        types = await self._read_exactly(count)
-        trace.offered_security_types = tuple(int(t) for t in types)
-        trace.mark("security_types", started)
-        if SECURITY_VNC_AUTH in types:
+            if offered != SECURITY_VNC_AUTH:
+                raise self._handshake_fail("security_types", "security_type_unsupported")
             selected = SECURITY_VNC_AUTH
-        elif SECURITY_NONE in types and not self.cfg.password:  # pragma: no cover - password required
-            selected = SECURITY_NONE
         else:
-            raise self._handshake_fail("security_types", "security_type_unsupported")
+            count = (await self._read_exactly(1))[0]
+            if not 1 <= count <= MAX_SECURITY_TYPES:
+                trace.mark("security_types", started)
+                raise self._handshake_fail("security_types", "security_types_invalid")
+            types = await self._read_exactly(count)
+            trace.offered_security_types = tuple(int(t) for t in types)
+            trace.mark("security_types", started)
+            if SECURITY_VNC_AUTH in types:
+                selected = SECURITY_VNC_AUTH
+            elif SECURITY_NONE in types and not self.cfg.password:  # pragma: no cover - password required
+                selected = SECURITY_NONE
+            else:
+                raise self._handshake_fail("security_types", "security_type_unsupported")
+            self._write(bytes([selected]))
         self.stats.security_type = selected
-        self._write(bytes([selected]))
 
         if selected == SECURITY_VNC_AUTH:
             started = time.monotonic()

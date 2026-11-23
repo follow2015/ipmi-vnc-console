@@ -52,6 +52,13 @@ def test_config_never_reprs_the_password():
         RfbTcpConfig(host="user@192.0.2.84", password="x")
 
 
+def test_config_rejects_tls_without_a_pin():
+    with pytest.raises(ValueError) as exc:
+        RfbTcpConfig(host="192.0.2.234", password="synthetic-password",
+                     tls_enabled=True)
+    assert "bmc_cert_pin_required" in str(exc.value)
+
+
 
 def test_standard_browser_handshake_is_credential_free():
     server_init = struct.pack(">HH", 1024, 768) + bytes(16) + struct.pack(">I", 0)
@@ -158,6 +165,93 @@ def fake_rfb_server(*, password: str = "local-admin", bad_auth: bool = False):
             writer.close()
 
     return handler
+
+
+def fake_legacy_rfb_server(version: str, *, password: str = "local-admin"):
+    greeting = (version + "\n").encode("ascii")
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            writer.write(greeting)
+            await writer.drain()
+            assert await reader.readexactly(12) == greeting
+            if version == "RFB 003.003":
+                writer.write(struct.pack(">I", 2))
+                await writer.drain()
+            else:
+                writer.write(b"\x01\x02")
+                await writer.drain()
+                assert await reader.readexactly(1) == b"\x02"
+            challenge = bytes(range(16))
+            writer.write(challenge)
+            await writer.drain()
+            expected = vnc_auth_response(challenge, password)
+            assert await reader.readexactly(16) == expected
+            writer.write(struct.pack(">I", 0))
+            await writer.drain()
+            assert await reader.readexactly(1) == b"\x01"
+            writer.write(SERVER_INIT)
+            await writer.drain()
+            await asyncio.sleep(0.05)
+        finally:
+            writer.close()
+
+    return handler
+
+
+@pytest.mark.parametrize("version", ["RFB 003.003", "RFB 003.007"])
+def test_upstream_completes_legacy_rfb_greetings(version):
+    async def scenario():
+        server = await asyncio.start_server(
+            fake_legacy_rfb_server(version), "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        up = RfbTcpUpstream(RfbTcpConfig(host="127.0.0.1", port=port,
+                                        password="local-admin"))
+        try:
+            await up.connect()
+            assert up.protocol_version == version
+            assert up.stats.security_type == 2
+            assert up.server_init_raw == SERVER_INIT
+            trace = up.stats.trace.as_dict()
+            assert trace["stage"] == "server_init"
+            assert trace["failure_reason"] == ""
+            assert trace["offered_security_types"] == [2]
+        finally:
+            await up.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("version", ["RFB 003.003", "RFB 003.007"])
+def test_browser_handshake_stays_rfb_3_8_for_legacy_upstream(monkeypatch, version):
+    monkeypatch.setenv("KVMHUB_BMC_ALLOWED_NETWORKS", "192.0.2.0/24")
+    from kvmhub.adapters.idrac_vnc import IdracVncAdapter
+
+    class _Upstream:
+        protocol_version = version
+        server_init_raw = SERVER_INIT
+
+        async def relay(self, on_bytes):
+            await asyncio.Event().wait()
+
+        async def send_raw(self, data):
+            return None
+
+        async def close(self):
+            return True
+
+    adapter = IdracVncAdapter(dict(INFO))
+    adapter.upstream = _Upstream()
+
+    async def scenario():
+        session = await adapter.connect(["binary"])
+        greeting = await asyncio.wait_for(anext(session), 2)
+        assert greeting.data == b"RFB 003.008\n"
+        await session.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.asyncio

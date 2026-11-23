@@ -298,6 +298,24 @@ class PublicIpMapping(Base):
     __table_args__ = (Index("ix_kvm_public_ip_tenant_primary", "tenant_id", "primary_ip"),)
 
 
+class PublicIpAlias(Base):
+
+    __tablename__ = "kvm_public_ip_alias"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    ip: Mapped[str] = mapped_column(String(256), nullable=False)
+    asset_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("kvm_asset.id", ondelete="CASCADE"), nullable=False)
+    mapping_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("kvm_public_ip.id", ondelete="CASCADE"), nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    updated: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "ip", name="uq_kvm_public_ip_alias_tenant_ip"),
+        Index("ix_kvm_public_ip_alias_asset", "asset_id"),
+    )
+
+
 class AccessGrant(Base):
     __tablename__ = "kvm_access_grant"
     tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
