@@ -1,0 +1,432 @@
+........................................................................ [  4%]
+........................................................................ [  8%]
+........................................................................ [ 12%]
+........................................................................ [ 16%]
+...s.......s...ssss.s....................................FFF............ [ 20%]
+ss..................................s................................... [ 24%]
+........................................................................ [ 28%]
+........................sssss........................................... [ 33%]
+..................................................................F...ss [ 37%]
+s....................................................................... [ 41%]
+........................................................................ [ 45%]
+...............................ssss..................................... [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 66%]
+........................................................................ [ 70%]
+..........................s.s........................................... [ 74%]
+........................................................................ [ 78%]
+.................................................F...................... [ 82%]
+........................................................................ [ 86%]
+........................................................................ [ 90%]
+........................................................................ [ 94%]
+........................................................................ [ 99%]
+................s                                                        [100%]
+=================================== FAILURES ===================================
+________ test_picture_stays_visible_above_sheet[desktop-1280-900-False] ________
+
+page_files = ('/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', PosixPath('/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0'))
+name = 'desktop', width = 1280, height = 900, touch = False
+
+    @pytest.mark.parametrize("name,width,height,touch", [
+        ("desktop", 1280, 900, False),
+        ("tablet", 1024, 768, True),
+        ("phone", 390, 844, True),
+    ])
+    def test_picture_stays_visible_above_sheet(page_files, name, width, height, touch):
+        node, d = page_files
+>       completed = subprocess.run(
+            [node, str(HARNESS),
+             "--html", str(d / "page.html"), "--keymap", str(d / "keymap.json"),
+             "--width", str(width), "--height", str(height),
+             "--touch", "1" if touch else "0"],
+            capture_output=True, text=True, timeout=90, check=True, env=_env())
+
+tests/test_console_sheet_layout.py:52: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = True, timeout = 90, check = True
+popenargs = (['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-c...s/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/keymap.json', ...],)
+kwargs = {'text': True, 'env': {'OSLogRateLimit': '64', 'MallocNanoZone': '0', 'USER': 'gguu', 'COMMAND_MODE': 'unix2003', ...}, 'stdout': -1, 'stderr': -1}
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout (seconds) is given and the process takes too long,
+         a TimeoutExpired exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/tests/fixtures/sheet_layout.cjs', '--html', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/page.html', '--keymap', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/keymap.json', '--width', '1280', '--height', '900', '--touch', '0']' returned non-zero exit status 1.
+
+/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:578: CalledProcessError
+_________ test_picture_stays_visible_above_sheet[tablet-1024-768-True] _________
+
+page_files = ('/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', PosixPath('/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0'))
+name = 'tablet', width = 1024, height = 768, touch = True
+
+    @pytest.mark.parametrize("name,width,height,touch", [
+        ("desktop", 1280, 900, False),
+        ("tablet", 1024, 768, True),
+        ("phone", 390, 844, True),
+    ])
+    def test_picture_stays_visible_above_sheet(page_files, name, width, height, touch):
+        node, d = page_files
+>       completed = subprocess.run(
+            [node, str(HARNESS),
+             "--html", str(d / "page.html"), "--keymap", str(d / "keymap.json"),
+             "--width", str(width), "--height", str(height),
+             "--touch", "1" if touch else "0"],
+            capture_output=True, text=True, timeout=90, check=True, env=_env())
+
+tests/test_console_sheet_layout.py:52: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = True, timeout = 90, check = True
+popenargs = (['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-c...s/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/keymap.json', ...],)
+kwargs = {'text': True, 'env': {'OSLogRateLimit': '64', 'MallocNanoZone': '0', 'USER': 'gguu', 'COMMAND_MODE': 'unix2003', ...}, 'stdout': -1, 'stderr': -1}
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout (seconds) is given and the process takes too long,
+         a TimeoutExpired exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/tests/fixtures/sheet_layout.cjs', '--html', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/page.html', '--keymap', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/keymap.json', '--width', '1024', '--height', '768', '--touch', '1']' returned non-zero exit status 1.
+
+/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:578: CalledProcessError
+__________ test_picture_stays_visible_above_sheet[phone-390-844-True] __________
+
+page_files = ('/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', PosixPath('/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0'))
+name = 'phone', width = 390, height = 844, touch = True
+
+    @pytest.mark.parametrize("name,width,height,touch", [
+        ("desktop", 1280, 900, False),
+        ("tablet", 1024, 768, True),
+        ("phone", 390, 844, True),
+    ])
+    def test_picture_stays_visible_above_sheet(page_files, name, width, height, touch):
+        node, d = page_files
+>       completed = subprocess.run(
+            [node, str(HARNESS),
+             "--html", str(d / "page.html"), "--keymap", str(d / "keymap.json"),
+             "--width", str(width), "--height", str(height),
+             "--touch", "1" if touch else "0"],
+            capture_output=True, text=True, timeout=90, check=True, env=_env())
+
+tests/test_console_sheet_layout.py:52: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = True, timeout = 90, check = True
+popenargs = (['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-c...s/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/keymap.json', ...],)
+kwargs = {'text': True, 'env': {'OSLogRateLimit': '64', 'MallocNanoZone': '0', 'USER': 'gguu', 'COMMAND_MODE': 'unix2003', ...}, 'stdout': -1, 'stderr': -1}
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout (seconds) is given and the process takes too long,
+         a TimeoutExpired exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/tests/fixtures/sheet_layout.cjs', '--html', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/page.html', '--keymap', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/sheet-layout0/keymap.json', '--width', '390', '--height', '844', '--touch', '1']' returned non-zero exit status 1.
+
+/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:578: CalledProcessError
+_________________ test_vnc_profile_is_builtin_and_well_formed __________________
+
+    def test_vnc_profile_is_builtin_and_well_formed():
+        p = _builtin("dell-idrac-vnc-tcp")
+        assert p["console_impl"] == IDRAC_VNC_ADAPTER_ID
+        assert p["message_profile"] == "standard"
+        assert p["rfb_version"] == "RFB 003.008"
+        assert p["vendor"] == "dell"
+        assert "iDRAC8" in p["model_pattern"]
+        assert p["priority"] < 90
+>       assert Path("docs/implementation/evidence/idrac8-vnc-tcp-20261120.json").is_file()
+E       AssertionError: assert False
+E        +  where False = is_file()
+E        +    where is_file = PosixPath('docs/implementation/evidence/idrac8-vnc-tcp-20261120.json').is_file
+E        +      where PosixPath('docs/implementation/evidence/idrac8-vnc-tcp-20261120.json') = Path('docs/implementation/evidence/idrac8-vnc-tcp-20261120.json')
+
+tests/test_idrac_vnc_onboarding.py:48: AssertionError
+________________ test_softkey_pages_switch_and_modifiers_latch _________________
+
+tmp_path = PosixPath('/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/test_softkey_pages_switch_and_0')
+
+    def test_softkey_pages_switch_and_modifiers_latch(tmp_path):
+>       result = _run(tmp_path)
+                 ^^^^^^^^^^^^^^
+
+tests/test_softkey_tabs.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_softkey_tabs.py:35: in _run
+    completed = subprocess.run(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = True, timeout = 90, check = True
+popenargs = (['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-c...p/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/test_softkey_pages_switch_and_0/keymap.json'],)
+kwargs = {'text': True, 'env': {'OSLogRateLimit': '64', 'MallocNanoZone': '0', 'USER': 'gguu', 'COMMAND_MODE': 'unix2003', ...}, 'stdout': -1, 'stderr': -1}
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout (seconds) is given and the process takes too long,
+         a TimeoutExpired exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['/Users/gguu/.workbuddy/binaries/node/versions/22.22.2-6/bin/node', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/tests/fixtures/softkey_tabs.cjs', '--html', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/test_softkey_pages_switch_and_0/page.html', '--keymap', '/Users/gguu/Desktop/ipmi-vnc-console/ipmi-vnc-console-deploy/.local-basetemp-public-final/test_softkey_pages_switch_and_0/keymap.json']' returned non-zero exit status 1.
+
+/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:578: CalledProcessError
+=============================== warnings summary ===============================
+../.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /Users/gguu/Desktop/ipmi-vnc-console/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_console_sheet_layout.py::test_picture_stays_visible_above_sheet[desktop-1280-900-False]
+FAILED tests/test_console_sheet_layout.py::test_picture_stays_visible_above_sheet[tablet-1024-768-True]
+FAILED tests/test_console_sheet_layout.py::test_picture_stays_visible_above_sheet[phone-390-844-True]
+FAILED tests/test_idrac_vnc_onboarding.py::test_vnc_profile_is_builtin_and_well_formed
+FAILED tests/test_softkey_tabs.py::test_softkey_pages_switch_and_modifiers_latch
+5 failed, 1715 passed, 25 skipped, 1 warning in 223.59s (0:03:43)

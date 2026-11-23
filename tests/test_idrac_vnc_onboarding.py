@@ -45,7 +45,16 @@ def test_vnc_profile_is_builtin_and_well_formed():
     assert p["vendor"] == "dell"
     assert "iDRAC8" in p["model_pattern"]
     assert p["priority"] < 90
-    assert Path("docs/implementation/evidence/idrac8-vnc-tcp-20261120.json").is_file()
+
+
+EVIDENCE = Path("docs/implementation/evidence/idrac8-vnc-tcp-20261120.json")
+needs_evidence = pytest.mark.skipif(
+    not EVIDENCE.is_file(), reason="private iDRAC real-device evidence is unpublished")
+
+
+@needs_evidence
+def test_vnc_profile_has_private_real_device_evidence():
+    assert EVIDENCE.is_file()
 
 
 def test_seed_installs_vnc_profile_as_draft(db_session):

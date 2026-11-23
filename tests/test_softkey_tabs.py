@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -9,29 +11,25 @@ import pytest
 
 from kvmhub import worker
 from kvmhub.platform import text_input
+from tools.browser_e2e import _find_chromium, _find_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "tests" / "fixtures" / "softkey_tabs.cjs"
 
 
 def _run(directory: Path) -> dict:
-    node = __import__("shutil").which("node")
-    if not node:
-        pytest.skip("node is not installed")
+    node = shutil.which("node")
+    playwright = os.environ.get("KVM_PLAYWRIGHT") or _find_playwright()
+    chrome = os.environ.get("KVM_CHROMIUM") or _find_chromium()
+    if not (node and playwright and chrome):
+        pytest.skip("browser harness (node/playwright-core/chromium) is unavailable")
     html = worker.REAL_CONSOLE_HTML.replace(
         '<script src="/_platform/console.js"></script>',
         "<script>" + worker.REAL_CONSOLE_JS + "</script>")
     (directory / "page.html").write_text(html, encoding="utf-8")
     (directory / "keymap.json").write_text(
         json.dumps(text_input.keymap_document(), ensure_ascii=False), encoding="utf-8")
-    import os
-    env = dict(os.environ)
-    pw = ROOT / ".local-playwright" / "node_modules" / "playwright-core"
-    if pw.exists():
-        env["KVM_PLAYWRIGHT"] = str(pw)
-    chromium = Path.home() / "AppData" / "Local" / "ms-playwright" / "chromium-1254" / "chrome-win64" / "chrome.exe"
-    if chromium.exists():
-        env["KVM_CHROMIUM"] = str(chromium)
+    env = dict(os.environ, KVM_PLAYWRIGHT=str(playwright), KVM_CHROMIUM=str(chrome))
     completed = subprocess.run(
         [node, str(HARNESS), "--html", str(directory / "page.html"),
          "--keymap", str(directory / "keymap.json")],

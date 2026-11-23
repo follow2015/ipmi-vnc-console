@@ -11,27 +11,20 @@ import pytest
 
 from kvmhub import worker
 from kvmhub.platform import text_input
+from tools.browser_e2e import _find_chromium, _find_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "tests" / "fixtures" / "sheet_layout.cjs"
 
 
-def _env() -> dict:
-    env = dict(os.environ)
-    pw = ROOT / ".local-playwright" / "node_modules" / "playwright-core"
-    if pw.exists():
-        env["KVM_PLAYWRIGHT"] = str(pw)
-    chrome = Path.home() / "AppData" / "Local" / "ms-playwright" / "chromium-1254" / "chrome-win64" / "chrome.exe"
-    if chrome.exists():
-        env["KVM_CHROMIUM"] = str(chrome)
-    return env
-
-
 @pytest.fixture(scope="module")
 def page_files(tmp_path_factory):
     node = shutil.which("node")
-    if not node:
-        pytest.skip("node is not installed")
+    playwright = os.environ.get("KVM_PLAYWRIGHT") or _find_playwright()
+    chrome = os.environ.get("KVM_CHROMIUM") or _find_chromium()
+    if not (node and playwright and chrome):
+        pytest.skip("browser harness (node/playwright-core/chromium) is unavailable")
+    env = dict(os.environ, KVM_PLAYWRIGHT=str(playwright), KVM_CHROMIUM=str(chrome))
     d = tmp_path_factory.mktemp("sheet-layout")
     html = worker.REAL_CONSOLE_HTML.replace(
         '<script src="/_platform/console.js"></script>',
@@ -39,7 +32,7 @@ def page_files(tmp_path_factory):
     (d / "page.html").write_text(html, encoding="utf-8")
     (d / "keymap.json").write_text(
         json.dumps(text_input.keymap_document(), ensure_ascii=False), encoding="utf-8")
-    return node, d
+    return node, d, env
 
 
 @pytest.mark.parametrize("name,width,height,touch", [
@@ -48,13 +41,13 @@ def page_files(tmp_path_factory):
     ("phone", 390, 844, True),
 ])
 def test_picture_stays_visible_above_sheet(page_files, name, width, height, touch):
-    node, d = page_files
+    node, d, env = page_files
     completed = subprocess.run(
         [node, str(HARNESS),
          "--html", str(d / "page.html"), "--keymap", str(d / "keymap.json"),
          "--width", str(width), "--height", str(height),
          "--touch", "1" if touch else "0"],
-        capture_output=True, text=True, timeout=90, check=True, env=_env())
+        capture_output=True, text=True, timeout=90, check=True, env=env)
     report = json.loads(completed.stdout)
     assert report["errors"] == []
     before, after = report["before"], report["after"]
