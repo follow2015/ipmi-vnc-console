@@ -46,6 +46,19 @@ def normalize_fingerprint(value: str | None) -> str | None:
     return result
 
 
+def legacy_tls_context(*, ca_bundle: str | None = None,
+                       relaxed_identity: bool) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=ca_bundle)
+    if relaxed_identity:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        try:
+            context.set_ciphers("DEFAULT:@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
+    return context
+
+
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def __init__(self, host: str, port: int, connect_ip: str, **kwargs):
@@ -93,12 +106,10 @@ class Redfish:
         else:
             self.basic_header = None
         try:
-            self.context = ssl.create_default_context(cafile=ca_bundle)
+            self.context = legacy_tls_context(
+                ca_bundle=ca_bundle, relaxed_identity=bool(self.cert_sha256))
         except (OSError, ssl.SSLError):
             raise RedfishError("invalid_ca_bundle") from None
-        if self.cert_sha256:
-            self.context.check_hostname = False
-            self.context.verify_mode = ssl.CERT_NONE
         self.clock = clock
         self.deadline = deadline if deadline is not None else clock() + total_timeout
         self.max_requests = max_requests

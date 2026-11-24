@@ -99,7 +99,32 @@ async function main() {
   await keybed.evaluate(el => { el.scrollLeft = 0; });
   after.endKeyReachable = endKeyReachable;
   if (SHOT) await page.screenshot({ path: SHOT, fullPage: false });
-  console.log(JSON.stringify({ W, H, TOUCH, before, after, errors }));
+  const widgetState = () => page.evaluate(() => {
+    const panel = document.getElementById('inputpanel').getBoundingClientRect();
+    const canvas = document.getElementById('screen').getBoundingClientRect();
+    return { x: panel.x, y: panel.y, w: panel.width, h: panel.height,
+      scale: parseFloat(document.getElementById('inputpanel').dataset.widgetScale),
+      canvas: { w: canvas.width, h: canvas.height },
+      inside: panel.left >= 0 && panel.top >= 0 && panel.right <= innerWidth + 1 && panel.bottom <= innerHeight + 1 };
+  });
+  const widgetBefore = await widgetState();
+  await page.selectOption('#widget-scale', '0.5');
+  await page.waitForTimeout(80);
+  const scaled = await widgetState();
+  const dragBox = await page.locator('#input-bar').boundingBox();
+  await page.mouse.move(dragBox.x + 8, dragBox.y + 8);
+  await page.mouse.down();
+  await page.mouse.move(40, 30, { steps: 8 });
+  await page.mouse.up();
+  const dragged = await widgetState();
+  await page.selectOption('#widget-scale', '1.2');
+  await page.setViewportSize({ width: 640, height: 420 });
+  await page.waitForTimeout(100);
+  const resized = await widgetState();
+  await page.locator('#widget-reset').click();
+  const reset = await widgetState();
+  console.log(JSON.stringify({ W, H, TOUCH, before, after, errors,
+    widget: { before: widgetBefore, scaled, dragged, resized, reset } }));
   await browser.close();
 }
 main().catch((e) => { console.error(String((e && e.stack) || e)); process.exit(1); });

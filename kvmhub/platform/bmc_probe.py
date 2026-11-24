@@ -13,7 +13,8 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from demos.redfish_probe import Redfish, RedfishError, inventory as redfish_inventory, validate_host
+from demos.redfish_probe import (Redfish, RedfishError, inventory as redfish_inventory,
+                                 legacy_tls_context, validate_host)
 
 from ..common import parse_controlled_networks
 
@@ -86,9 +87,7 @@ def validate_probe_host(host: str, *, allowed_networks=()) -> str:
 
 def read_certificate_sha256(connect_ip: str, sni_name: str, port: int,
                             timeout: float) -> str:
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
+    context = legacy_tls_context(relaxed_identity=True)
     try:
         with socket.create_connection((connect_ip, port), timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=sni_name) as tls:

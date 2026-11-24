@@ -46,11 +46,10 @@ def test_input_block_starts_as_one_button():
     assert "#inputpanel.show-keys #pastebar,#inputpanel.show-paste #softkey{display:none}" in html, \
         "the two panes are mutually exclusive so the text box stays visible"
     assert "#inputpanel.collapsed #input-body{display:none}" in html
-    assert "#inputpanel:not(.collapsed){height:var(--sheet-h)}" in html, \
-        "expansion is a bottom sheet driven by one variable"
+    assert "body.sheet-open #stage" not in html, "floating keyboard cannot shrink the picture"
     assert "inputPanel.classList.toggle('collapsed')" in js
     assert "classList.toggle('sheet-open'" in js, \
-        "opening the sheet makes the stage give up its height"
+        "tracks widget visibility without resizing the stage"
     block = js[js.index("inputToggle.onclick"):js.index("skRoot.addEventListener")]
     assert "loadKeymap();" in block, "the first expansion is what loads the table"
     assert "inputOpened" in block, "and it must happen once, not on every toggle"
@@ -205,10 +204,8 @@ def test_controls_behave_in_a_browser():
     assert opened["panelCollapsed"] is False
     assert opened["sheetOpen"] is True
     assert opened["panelWidth"] > 200, "the expanded sheet shows the keyboard"
-    assert opened["scale"] < 1.0, "the picture fits above the input deck"
-    assert opened["stageRight"] <= opened["panelLeft"] + 2 or \
-        opened["stageBottom"] <= opened["panelTop"] + 2, \
-        "the picture is not hidden behind the keyboard"
+    assert opened["scale"] == pytest.approx(oneone["scale"], abs=0.001)
+    assert opened["stageWidth"] == oneone["stageWidth"]
     assert opened["mouseScale"] == pytest.approx(opened["scale"], abs=0.001), \
         "pointer mapping tracks the sheet-time scale exactly"
 

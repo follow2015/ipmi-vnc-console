@@ -1,4 +1,4 @@
-"""One shared bottom-sheet layout must keep the picture fully visible at every"""
+"""Floating keyboard geometry, independent picture scale, drag and resize checks."""
 from __future__ import annotations
 
 import json
@@ -57,12 +57,10 @@ def test_picture_stays_visible_above_sheet(page_files, name, width, height, touc
     view_w = after["viewportW"]
     assert before["stage"]["w"] == view_w
     assert after["sheetOpen"] is True
-    assert after["panel"]["w"] == view_w
-    assert after["stage"]["w"] == view_w
-    assert after["stage"]["b"] <= after["panel"]["t"] + 2, \
-        f"stage overlaps the sheet at {name}"
-    assert after["canvas"]["b"] <= after["stage"]["b"] + 2, \
-        f"picture hidden behind the sheet at {name}: canvas {after['canvas']['b']} stage {after['stage']['b']}"
+    assert after["stage"] == before["stage"], "opening keyboard must not resize the stage"
+    assert after["canvas"] == before["canvas"], "opening keyboard must not change the picture scale"
+    assert after["panel"]["l"] >= 0 and after["panel"]["t"] >= 0
+    assert after["panel"]["r"] <= width + 1 and after["panel"]["b"] <= height + 1
     assert after["keyboardFirst"] is True
     assert after["visibleKeyCount"] >= 40
     assert not after["pageOverflows"], "keyboard scrolling must stay inside the keybed"
@@ -70,6 +68,12 @@ def test_picture_stays_visible_above_sheet(page_files, name, width, height, touc
     for row in after["keyRows"]:
         assert row["sameLine"], "physical keyboard rows must not wrap"
         assert row["labelsFit"], "key labels must not be clipped"
-        assert row["height"] >= (44 if touch else 34)
-    if width < 680:
-        assert after["keyboardScrolls"], "narrow screens retain readable keys with local scrolling"
+        assert row["height"] > 10, "uniform scaling preserves key proportions"
+    widget = report["widget"]
+    assert widget["scaled"]["canvas"] == widget["before"]["canvas"]
+    ratio = widget["scaled"]["scale"] / widget["before"]["scale"]
+    assert widget["scaled"]["w"] / widget["before"]["w"] == pytest.approx(ratio, abs=0.01)
+    assert widget["scaled"]["h"] / widget["before"]["h"] == pytest.approx(ratio, abs=0.01)
+    assert abs(widget["dragged"]["x"] - widget["scaled"]["x"]) > 2 or \
+        abs(widget["dragged"]["y"] - widget["scaled"]["y"]) > 2
+    assert all(widget[state]["inside"] for state in ("scaled", "dragged", "resized", "reset"))

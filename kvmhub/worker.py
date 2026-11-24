@@ -176,8 +176,8 @@ body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-seri
 /* iOS Chrome/Safari reports the browser chrome inside 100vh; 100dvh keeps the
    canvas inside the visible area when the address bar collapses. */
 @supports (height:100dvh){body{height:100dvh}}
-/* The stage owns all available space; the input deck reserves height only
-   while open. Closing it restores the operator's original zoom mode. */
+/* The stage owns all available space. Floating input never reserves space
+   or changes the operator's picture zoom. */
 #work{flex:1 1 auto;display:flex;flex-direction:column;min-width:0;min-height:0}
 header{display:flex;gap:12px;align-items:center;padding:10px 20px;background:#111b29;border-bottom:1px solid #28384e;flex-wrap:wrap;flex-shrink:0}
 header strong{font-weight:650;font-size:15px;letter-spacing:.2px;white-space:nowrap;max-width:32vw;overflow:hidden;text-overflow:ellipsis}
@@ -212,18 +212,19 @@ canvas:focus{box-shadow:0 0 0 1px #5a94d6,0 14px 38px rgba(0,0,0,.55)}
 #nosignal .card{max-width:min(560px,82%);padding:18px 22px;border:1px solid #c8a24a;border-radius:10px;background:#141d2b;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)}
 #nosignal .card strong{display:block;font-size:18px;color:#f0cf82;margin-bottom:8px}
 #nosignal .card span{font-size:13px;color:#b9c8dc;line-height:1.6}
-/* A horizontal input deck preserves the keyboard's spatial layout. The
-   stage reserves its height so controls never cover remote pixels. */
-:root{--sheet-h:min(46vh,354px)}
-#inputpanel{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:20;background:#111b29;border-top:1px solid #34465e;box-shadow:0 -12px 36px rgba(0,0,0,.3);display:flex;flex-direction:column;min-height:0;overflow:hidden}
-#inputpanel:not(.collapsed){height:var(--sheet-h)}
-#inputpanel.collapsed{left:auto;width:auto;right:20px;bottom:36px;height:auto;background:transparent;border:0;box-shadow:none}
+/* Floating input widget: it never participates in the picture layout.
+   One fixed keyboard geometry is scaled uniformly, independently of RFB. */
+#inputpanel{position:fixed;left:16px;top:100px;z-index:20;width:960px;max-height:none;background:#111b29;border:1px solid #435b79;border-radius:12px;box-shadow:0 16px 60px #0009;display:flex;flex-direction:column;overflow:hidden;transform-origin:top left}
+#inputpanel.collapsed{left:auto;top:auto;right:20px;bottom:36px;width:auto;height:auto;background:transparent;border:0;box-shadow:none;transform:none!important}
 #inputpanel.collapsed #input-body{display:none}
+#inputpanel.collapsed #widget-tools{display:none}
 #inputpanel.collapsed #input-bar{background:#1d2f4a;border:1px solid #4a6d9e;border-radius:12px;padding:4px}
 #inputpanel.collapsed #input-toggle{padding:10px 20px}
 #inputpanel.collapsed #input-hint{display:none}
-body.sheet-open #stage{margin-bottom:var(--sheet-h)}
-body.sheet-open footer{display:none}
+#widget-tools{display:flex;align-items:center;gap:7px;color:#a9bdd6;font-size:12px}
+#widget-scale{background:#192b42;color:#e6eef8;border:1px solid #435b79;border-radius:5px;padding:4px;font:inherit}
+#input-bar{cursor:move;touch-action:none;user-select:none}
+#input-bar button,#input-bar select{cursor:pointer;touch-action:manipulation}
 button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap;touch-action:manipulation}
 button:hover{background:#25405f}
 header #zoom-mode{background:#1b3454;border-color:#3b6a9e}
@@ -248,7 +249,7 @@ footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-t
 #input-tabs button.on{background:#2b5a86;border-color:#4d8fd0;color:#fff}
 #inputpanel.collapsed #input-tabs{display:none}
 #inputpanel.show-keys #pastebar,#inputpanel.show-paste #softkey{display:none}
-#input-body{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column;scrollbar-width:thin}
+#input-body{flex:1 1 auto;min-height:0;max-height:600px;overflow:auto;display:flex;flex-direction:column;scrollbar-width:thin}
 #softkey{order:1}
 #pastebar{order:2}
 /* Below this the header, the input block and the footer no longer fit at all.
@@ -321,7 +322,6 @@ footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-t
 .keyboard-footnote{display:flex;justify-content:space-between;gap:16px;color:#7f93af;font-size:11px;margin-top:6px}
 .keyboard-footnote span:last-child{white-space:nowrap}
 @media (max-width:700px){
-  :root{--sheet-h:min(56vh,440px)}
   .console-mark{display:none}
   header{gap:6px;padding:8px 12px}
   header strong{max-width:calc(100% - 100px);flex:1 1 calc(100% - 100px)}
@@ -331,15 +331,7 @@ footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-t
   .header-actions{order:6;margin-left:auto}
   .header-actions button{font-size:12px;padding:6px 10px}
   #spacer{display:none}
-  #input-bar{padding:8px 12px;gap:8px}
-  .deck-label{display:none}
-  #input-tabs button{padding:6px 12px}
-  #softkey{padding:10px 12px}
-  #softkey .head{flex-wrap:wrap}
-  #softkey .head strong,#softkey .head .sk-tag,#softkey .head .grow,#softkey .head #softkey-toggle{display:none}
-  .sk-note{order:5;width:100%;margin-left:0}
-  .keyboard-footnote span:last-child{display:none}
-  #pastebar{padding:10px 12px}
+
 }
 /* Touch targets stay large and the iOS address bar must not trigger input
    zoom (all inputs are >=16px). */
@@ -347,17 +339,12 @@ footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-t
   header{padding:8px 10px;gap:8px}
   #status{font-size:12px}
   button{min-height:44px;padding:8px 14px}
-  .sk{min-height:44px}
   input,textarea,select{font-size:16px}
   input[type=number]{width:72px}
 }
 /* Phones: bigger touch targets and keep the hint clear of the floating
    toggle. Layout itself is shared by every device (see #inputpanel above). */
-@media (pointer:coarse) and (max-width:700px){
-  .sk{min-height:44px;padding:10px 2px;font-size:15px}
-  .skrow.macros .sk{padding:10px;font-size:13px}
-  #phone-hint{bottom:74px}
-}
+
 </style>
 <div id="work">
 <header><span class="console-mark">KVM / LIVE</span><strong id="asset-label">真机 KVM 控制台</strong><span id="status">正在连接…</span><span id="frame-age" title="最近一次从主机侧收到数据距今多久。这台固件即使在画面静止时也会持续回送小包，所以这个数字持续上涨通常说明链路出了问题；反过来，数字正常但画面不动，说明是主机自己停住了（例如卡在 POST）。"></span><span id="zoom" title="画面按这个比例显示。自适应时窗口放不下 1:1 的帧缓冲，画面会等比缩小以完整显示；缩小时鼠标坐标仍按原比例换算。"></span><span id="spacer"></span><span class="header-actions"><button id="zoom-mode" title="在完整显示与 100% 原始像素之间切换。默认 100% 原始像素最清晰；窗口放不下时画面区可滚动，鼠标坐标仍随滚动换算。">画面自适应</button><button id="close">结束会话</button></span></header>
@@ -365,7 +352,7 @@ footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-t
 <footer title="画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。">远程控制台<span style="float:right">点击画面操作 · 输入面板辅助键入</span></footer>
 </div><!-- /work -->
 <aside id="inputpanel" class="collapsed show-keys">
-<div id="input-bar"><span class="deck-label">输入工作台</span><span id="input-tabs"><button type="button" id="tab-keys" class="on">软键盘</button><button type="button" id="tab-paste">长命令</button></span><button id="input-toggle" type="button" title="展开或收起输入面板" aria-expanded="false" aria-controls="input-body">⌨ 输入</button><span id="input-hint">点击展开</span></div>
+<div id="input-bar"><span class="deck-label">⠿ 拖动键盘</span><span id="input-tabs"><button type="button" id="tab-keys" class="on">软键盘</button><button type="button" id="tab-paste">长命令</button></span><span id="widget-tools"><label for="widget-scale">大小</label><select id="widget-scale" aria-label="浮动键盘缩放"><option value="0.5">50%</option><option value="0.65">65%</option><option value="0.8" selected>80%</option><option value="1">100%</option><option value="1.2">120%</option></select><button id="widget-reset" type="button" title="将键盘移回窗口内">归位</button></span><button id="input-toggle" type="button" title="展开或收起输入面板" aria-expanded="false" aria-controls="input-body">⌨ 输入</button><span id="input-hint">点击展开</span></div>
 <div id="input-body">
 <div id="pastebar">
 <div class="row"><strong>长命令输入</strong><span>粘贴后先预检；字符按实测可靠性着色</span><span class="grow"></span>
@@ -420,7 +407,7 @@ footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-t
 <button type="button" class="sk" data-send="ins">Ins</button><button type="button" class="sk" data-send="home">Home</button><button type="button" class="sk" data-send="pgup">PgUp</button><button type="button" class="sk" data-send="pgdn">PgDn</button><button type="button" class="sk" data-send="del">Del</button><button type="button" class="sk" data-send="end">End</button><button type="button" class="sk" data-send="left">&#8592;</button><button type="button" class="sk" data-send="down">&#8595;</button><button type="button" class="sk" data-send="up">&#8593;</button><button type="button" class="sk" data-send="right">&#8594;</button>
 </div>
 </div></div><div id="sk-status" role="status" aria-live="polite"></div>
-<div class="keyboard-footnote"><span>点亮 Ctrl / Alt / Shift，再选目标键</span><span>窄屏可左右滑动键盘</span></div>
+<div class="keyboard-footnote"><span>点亮 Ctrl / Alt / Shift，再选目标键</span><span>拖动标题栏移动 · 大小独立调整</span></div>
 </div>
 </div>
 </div>
@@ -1498,17 +1485,11 @@ REAL_CONSOLE_JS = """'use strict';
     var collapsed = inputPanel.classList.toggle('collapsed');
     inputToggle.textContent = collapsed ? '⌨ 输入' : '收起面板 ↓';
     inputToggle.setAttribute('aria-expanded', String(!collapsed));
-    // The sheet shares the window with the picture: when it opens the stage
-    // gives up the same height so the framebuffer scales into the top area and
-    // stays fully visible (never hidden behind the keyboard).
     document.body.classList.toggle('sheet-open', !collapsed);
-    // Restore the operator's normal stage alignment when the sheet closes;
-    // the sheet-open fit branch had forced centred/fixed for the short view.
-    if (collapsed) setZoomMode(zoomMode);
-    var hint = document.getElementById('input-hint');
-    if (hint) hint.textContent = collapsed
-      ? '点此展开键盘（首次点击才加载键位表）'
-      : '用「软键盘 / 长命令」切换；画面缩到上方';
+    if (collapsed) {
+      inputPanel.style.left = '';
+      inputPanel.style.top = '';
+    }
     if (!collapsed && !inputOpened) {
       inputOpened = true;
       loadKeymap();
@@ -1521,8 +1502,73 @@ REAL_CONSOLE_JS = """'use strict';
       }
     }
     fitPicture();
-    requestAnimationFrame(fitPicture);
+    placeWidget();
+    requestAnimationFrame(placeWidget);
   };
+  // Store logical scale separately from screen coordinates. Transforming the
+  // widget cannot affect the canvas bitmap or the vendor pointer arithmetic.
+  var widgetScale = document.getElementById('widget-scale');
+  var widgetBar = document.getElementById('input-bar');
+  var widgetPosition = null;
+  var widgetDrag = null;
+  try {
+    var savedScale = localStorage.getItem('kvmhub.widget.scale');
+    if ([].some.call(widgetScale.options, function (o) { return o.value === savedScale; })) widgetScale.value = savedScale;
+    var savedPosition = JSON.parse(localStorage.getItem('kvmhub.widget.position') || 'null');
+    if (savedPosition && Number.isFinite(savedPosition.x) && Number.isFinite(savedPosition.y)) widgetPosition = savedPosition;
+  } catch (error) {}
+  function placeWidget() {
+    if (!widgetScale || inputPanel.classList.contains('collapsed')) return;
+    var width = window.innerWidth, height = window.innerHeight;
+    var scale = Math.min(parseFloat(widgetScale.value) || 0.8,
+      Math.max(0.1, (width - 16) / inputPanel.offsetWidth),
+      Math.max(0.1, (height - 16) / inputPanel.offsetHeight));
+    inputPanel.style.transform = 'scale(' + scale + ')';
+    var boxW = inputPanel.offsetWidth * scale, boxH = inputPanel.offsetHeight * scale;
+    var pos = widgetPosition || { x: (width - boxW) / 2, y: height - boxH - 24 };
+    var x = Math.max(8, Math.min(pos.x, width - boxW - 8));
+    var y = Math.max(8, Math.min(pos.y, height - boxH - 8));
+    inputPanel.style.left = x + 'px';
+    inputPanel.style.top = y + 'px';
+    inputPanel.setAttribute('data-widget-scale', scale.toFixed(3));
+  }
+  function saveWidgetPosition() {
+    try { localStorage.setItem('kvmhub.widget.position', JSON.stringify(widgetPosition)); } catch (error) {}
+  }
+  widgetScale.onchange = function () {
+    try { localStorage.setItem('kvmhub.widget.scale', widgetScale.value); } catch (error) {}
+    placeWidget();
+  };
+  document.getElementById('widget-reset').onclick = function () {
+    widgetPosition = null; saveWidgetPosition(); placeWidget();
+  };
+  widgetBar.addEventListener('pointerdown', function (event) {
+    if (inputPanel.classList.contains('collapsed') || event.button !== 0 ||
+        event.target.closest('button,select,label,input')) return;
+    event.preventDefault();
+    var box = inputPanel.getBoundingClientRect();
+    widgetDrag = { x: event.clientX, y: event.clientY, left: box.left, top: box.top };
+    widgetBar.setPointerCapture(event.pointerId);
+  });
+  widgetBar.addEventListener('pointermove', function (event) {
+    if (!widgetDrag) return;
+    event.preventDefault();
+    widgetPosition = { x: widgetDrag.left + event.clientX - widgetDrag.x,
+      y: widgetDrag.top + event.clientY - widgetDrag.y };
+    placeWidget();
+  });
+  function endWidgetDrag() {
+    if (!widgetDrag) return;
+    widgetDrag = null;
+    var box = inputPanel.getBoundingClientRect();
+    widgetPosition = { x: box.left, y: box.top };
+    saveWidgetPosition();
+  }
+  widgetBar.addEventListener('pointerup', endWidgetDrag);
+  widgetBar.addEventListener('pointercancel', endWidgetDrag);
+  widgetBar.addEventListener('lostpointercapture', endWidgetDrag);
+  window.addEventListener('resize', placeWidget);
+  if (typeof ResizeObserver === 'function') new ResizeObserver(placeWidget).observe(inputPanel);
   skRoot.addEventListener('click', function (event) {
     var target = event.target;
     if (!target || !target.closest) return;
@@ -1623,9 +1669,7 @@ REAL_CONSOLE_JS = """'use strict';
   }
 
   // ---- fitting the picture ------------------------------------------------
-  // The input deck reserves its own space below the picture. While it is
-  // open the framebuffer fits above it; closing restores native pixels or
-  // the operator's chosen fit mode.
+  // The floating widget never changes stage dimensions or the RFB scale.
   //
   // "Fit" is the optional mode: Display.autoscale()
   // writes CSS width/height only (the bitmap stays 1:1 with the BMC, so drawing
@@ -1640,27 +1684,6 @@ REAL_CONSOLE_JS = """'use strict';
   var lastScale = 1;
   function fitPicture() {
     if (!rfb || !rfb._display || !rfb._display._fb_width) return;
-    // While the bottom sheet is open the stage has already shrunk (margin on
-    // the stage). Fit the framebuffer into whatever space is left so the WHOLE
-    // picture stays visible above the keyboard, on every device, regardless of
-    // the remembered zoom mode or the phone readable-zoom floor. Closing the
-    // sheet restores the operator's normal mode on the next fitPicture().
-    if (document.body.classList.contains('sheet-open')) {
-      var sW = stage.clientWidth - STAGE_PAD * 2;
-      var sH = stage.clientHeight - STAGE_PAD * 2;
-      if (sW < 32 || sH < 32) return;
-      var sRatio = 0;
-      try { sRatio = rfb._display.autoscale(sW, sH, true); }
-      catch (error) { return; }
-      if (rfb._mouse) rfb._mouse._scale = sRatio;
-      lastScale = sRatio || 1;
-      stage.setAttribute('data-scale', lastScale.toFixed(3));
-      stage.style.overflow = 'hidden';
-      stage.style.justifyContent = 'center';
-      stage.style.alignItems = 'center';
-      if (zoomEl) zoomEl.textContent = lastScale < 0.995 ? '画面 ' + Math.round(lastScale * 100) + '%' : '';
-      return;
-    }
     if (zoomMode === 'oneone') {
       // The vendor client's autoscale wrote CSS width/height only. Clearing
       // them restores 1:1 without touching the bitmap. The vendor pointer

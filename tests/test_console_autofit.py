@@ -39,25 +39,18 @@ def test_the_height_handle_is_gone():
     assert 'id="splitter"' not in html, "the handle is what squeezed one half or the other"
     assert "row-resize" not in html
     assert "kvmhub.input.height" not in js, "a remembered height has nothing to apply to"
-    assert "setPointerCapture" not in js
+    assert "widgetBar.setPointerCapture" in js
 
 
 def test_the_input_panel_is_one_shared_bottom_sheet():
     rule = _rule(worker.REAL_CONSOLE_HTML, "#inputpanel")
     html = worker.REAL_CONSOLE_HTML
-    assert "position:fixed" in rule and "bottom:0" in rule, \
-        "the panel is a fixed bottom sheet by default"
-    assert "left:0;right:0" in rule, "the expanded sheet spans the full width by default"
-    assert "--dock-w" not in html, "keyboard rows use the window width"
-    assert ":root{--sheet-h:min(46vh,354px)}" in html, \
-        "one variable drives the sheet height on every resolution"
-    assert "body.sheet-open #stage{margin-bottom:var(--sheet-h)}" in html, \
-        "the picture gives up exactly the sheet's height so nothing is covered"
-    assert "flex:0 0 44px" not in html and "flex-basis:300px" not in html, \
-        "no left-dock second layout remains"
-    body_rule = _rule(html, "#input-body")
-    assert "max-height" not in body_rule, f"a cap is what clipped the keyboard: {body_rule}"
-    assert "<aside id=\"inputpanel\"" in html, "the panel is a sibling of the picture column"
+    assert "position:fixed" in rule
+    assert "width:960px" in rule and "transform-origin:top left" in rule
+    assert "--sheet-h" not in html
+    assert "body.sheet-open #stage" not in html
+    assert "body.sheet-open #work" not in html
+    assert 'id="widget-scale"' in html and 'id="widget-reset"' in html
 
 
 def test_the_picture_area_does_not_scroll_either():
