@@ -120,6 +120,57 @@ def test_rotation_writes_a_secret_free_audit_row(credential_db):
 
 
 
+@pytest.mark.parametrize("mode", ["write", "dry_run", "corrupt", "incomplete", "encrypt_failure"])
+def test_rotation_covers_hidden_vnc_secrets_atomically(credential_db, monkeypatch, mode):
+    _, factory, old, ids = credential_db
+    new = CredentialCipher(NEW_KEY)
+    with transaction(factory) as db:
+        asset = services.upsert_asset(db, name="synthetic", address="192.0.2.90",
+                                      credential_id=ids[0], actor="test")
+        services.save_vnc_secret(db, old, asset_id=asset.id, username=BMC_USERNAME,
+                                 password=BMC_PASSWORD, actor="test")
+        aid = asset.id
+        if mode == "corrupt":
+            asset.vnc_password_cipher = b"corrupt"
+        elif mode == "incomplete":
+            asset.vnc_username_cipher = None
+    if mode in ("corrupt", "incomplete"):
+        with transaction(factory) as db:
+            report = key_rotate.verify_all(db, old)
+            assert not report["ok"] and report["undecryptable"] == ["vnc:" + aid]
+        with pytest.raises(ValueError):
+            with transaction(factory) as db:
+                key_rotate.rotate(db, old, new, write=True, actor="test", stamp=time.time())
+    else:
+        if mode == "encrypt_failure":
+            original = new.encrypt
+            def failing(plaintext, *, aad):
+                if aad.endswith(":vnc_password"):
+                    raise RuntimeError("kms unavailable")
+                return original(plaintext, aad=aad)
+            monkeypatch.setattr(new, "encrypt", failing)
+            with pytest.raises(RuntimeError, match="kms unavailable"):
+                with transaction(factory) as db:
+                    key_rotate.rotate(db, old, new, write=True, actor="test", stamp=time.time())
+        else:
+            with transaction(factory) as db:
+                report = key_rotate.rotate(db, old, new, write=mode == "write",
+                                           actor="test", stamp=time.time())
+                assert report["rows"] == 4 and report["vnc_rows"] == 1
+                assert report["credential_rows"] == 3
+        with transaction(factory) as db:
+            cipher = new if mode == "write" else old
+            report = key_rotate.verify_all(db, cipher)
+            assert report["ok"] and report["decryptable"] == 4
+            assert services.read_vnc_secret(db, cipher, aid)["password"] == BMC_PASSWORD
+            assert db.get(Asset, aid).vnc_key_version == (2 if mode == "write" else 1)
+            with pytest.raises(Exception):
+                cipher.decrypt(db.get(Asset, aid).vnc_password_cipher, aad=aid + ":password")
+    if mode != "write":
+        with transaction(factory) as db:
+            assert all(row.key_version == 1 for row in db.scalars(select(Credential)))
+            assert services.read_credential(db, old, ids[0])["password"] == BMC_PASSWORD
+
 def test_capacity_probe_never_oversubscribes_and_releases_slots():
     report = asyncio.run(worker_capacity.run_probe(workers=4, sessions=40, capacity=3))
     assert report["granted"] == 12 and report["refused"] == 28

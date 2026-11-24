@@ -15,7 +15,7 @@ from sqlalchemy import select  # noqa: E402
 
 from kvmhub.platform.config import settings  # noqa: E402
 from kvmhub.platform.db import make_engine, session_factory, transaction  # noqa: E402
-from kvmhub.platform.models import Credential  # noqa: E402
+from kvmhub.platform.models import Asset, Credential  # noqa: E402
 from kvmhub.platform.security import CredentialCipher  # noqa: E402
 from kvmhub.platform import services  # noqa: E402
 
@@ -33,40 +33,59 @@ def _key(name: str) -> bytes:
     return value
 
 
+def _encrypted_rows(db):
+    for row in db.scalars(select(Credential).order_by(Credential.created)):
+        yield row, "username_cipher", "password_cipher", "key_version", ":username", ":password", row.id
+    for row in db.scalars(select(Asset).where(
+            Asset.vnc_username_cipher.is_not(None) | Asset.vnc_password_cipher.is_not(None)
+    ).order_by(Asset.created)):
+        yield (row, "vnc_username_cipher", "vnc_password_cipher", "vnc_key_version",
+               ":vnc_username", ":vnc_password", "vnc:" + row.id)
+
+
 def rotate(db, old: CredentialCipher, new: CredentialCipher, *, write: bool,
            actor: str, stamp: float) -> dict:
-    rows = db.scalars(select(Credential).order_by(Credential.created)).all()
-    versions = sorted({int(row.key_version or 1) for row in rows})
+    rows = list(_encrypted_rows(db))
+    versions = sorted({int(getattr(row, version) or 1)
+                       for row, _, _, version, _, _, _ in rows})
     prepared = []
-    for row in rows:
-        username = old.decrypt(row.username_cipher, aad=row.id + ":username")
-        password = old.decrypt(row.password_cipher, aad=row.id + ":password")
-        prepared.append((row, username, password))
+    for row, ufield, pfield, version, uaad, paad, _ in rows:
+        username = old.decrypt(getattr(row, ufield), aad=row.id + uaad)
+        password = old.decrypt(getattr(row, pfield), aad=row.id + paad)
+        prepared.append((row, ufield, pfield, version, uaad, paad, username, password))
+    counts = {"credential_rows": sum(isinstance(item[0], Credential) for item in rows),
+              "vnc_rows": sum(isinstance(item[0], Asset) for item in rows)}
     if write:
-        for row, username, password in prepared:
-            row.username_cipher = new.encrypt(username, aad=row.id + ":username")
-            row.password_cipher = new.encrypt(password, aad=row.id + ":password")
-            row.key_version = int(row.key_version or 1) + 1
-            row.rotated_at = stamp
+        for row, ufield, pfield, version, uaad, paad, username, password in prepared:
+            setattr(row, ufield, new.encrypt(username, aad=row.id + uaad))
+            setattr(row, pfield, new.encrypt(password, aad=row.id + paad))
+            setattr(row, version, int(getattr(row, version) or 1) + 1)
+            if isinstance(row, Credential):
+                row.rotated_at = stamp
+            else:
+                row.updated = stamp
         services.audit(db, actor, "credential_key_rotated",
-                       detail={"rows": len(prepared), "from_versions": versions,
+                       detail={"rows": len(prepared), **counts, "from_versions": versions,
                                "to_version": (versions[-1] if versions else 1) + 1}, now=stamp)
-    return {"rows": len(prepared), "key_versions_before": versions,
+    return {"rows": len(prepared), **counts, "key_versions_before": versions,
             "key_version_after": (versions[-1] if versions else 1) + 1 if write else None,
             "written": bool(write)}
 
 
 def verify_all(db, cipher: CredentialCipher) -> dict:
-    rows = db.scalars(select(Credential)).all()
+    rows = list(_encrypted_rows(db))
     good, bad = 0, []
-    for row in rows:
+    for row, ufield, pfield, _, uaad, paad, identifier in rows:
         try:
-            cipher.decrypt(row.username_cipher, aad=row.id + ":username")
-            cipher.decrypt(row.password_cipher, aad=row.id + ":password")
+            cipher.decrypt(getattr(row, ufield), aad=row.id + uaad)
+            cipher.decrypt(getattr(row, pfield), aad=row.id + paad)
             good += 1
         except Exception:
-            bad.append(row.id)
-    return {"rows": len(rows), "decryptable": good, "undecryptable": bad,
+            bad.append(identifier)
+    return {"rows": len(rows),
+            "credential_rows": sum(isinstance(item[0], Credential) for item in rows),
+            "vnc_rows": sum(isinstance(item[0], Asset) for item in rows),
+            "decryptable": good, "undecryptable": bad,
             "ok": not bad}
 
 

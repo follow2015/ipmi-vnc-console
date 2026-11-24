@@ -171,27 +171,28 @@ REAL_CONSOLE_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>真机 KVM 控制台</title>
 <style>
-:root{color-scheme:dark}
+:root{color-scheme:dark;--ink:#e6eef8;--muted:#90a3bd;--accent:#79b8ff}
 body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:row;height:100vh;overflow:hidden;-webkit-text-size-adjust:100%}
 /* iOS Chrome/Safari reports the browser chrome inside 100vh; 100dvh keeps the
    canvas inside the visible area when the address bar collapses. */
 @supports (height:100dvh){body{height:100dvh}}
-/* The picture owns a column of its own. Docking the input controls on the
-   left keeps them out of the framebuffer's width and height entirely: even
-   collapsed they used to eat the bottom of the window, forcing the picture
-   to scale below 100% and making text fuzzy from interpolation. */
+/* The stage owns all available space; the input deck reserves height only
+   while open. Closing it restores the operator's original zoom mode. */
 #work{flex:1 1 auto;display:flex;flex-direction:column;min-width:0;min-height:0}
-header{display:flex;gap:12px;align-items:center;padding:9px 16px;background:linear-gradient(180deg,#15233b,#111c2e);border-bottom:1px solid #2a3d5c}
-header strong{font-weight:650;font-size:15px;letter-spacing:.2px;white-space:nowrap}
+header{display:flex;gap:12px;align-items:center;padding:10px 20px;background:#111b29;border-bottom:1px solid #28384e;flex-wrap:wrap;flex-shrink:0}
+header strong{font-weight:650;font-size:15px;letter-spacing:.2px;white-space:nowrap;max-width:32vw;overflow:hidden;text-overflow:ellipsis}
+.console-mark{display:flex;align-items:center;gap:9px;color:#99acc5;font:11px/1.2 ui-monospace,monospace;letter-spacing:1.5px}
+.console-mark::before{content:"";width:7px;height:7px;background:#7fb7f5;border-radius:2px;box-shadow:0 0 12px #4980b566}
+.header-actions{display:flex;align-items:center;gap:8px}
+button:focus-visible{outline:2px solid #88bfff;outline-offset:3px}
 #status{color:#a8c8ef;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#162941;border:1px solid #2c4266;border-radius:20px;padding:2px 10px}
 #frame-age{color:#8298b8;font-size:12px;white-space:nowrap}
 #frame-age.stale{color:#e8c26a}
 #zoom{color:#8298b8;font-size:12px;white-space:nowrap}
 #spacer{flex:1}
-/* A faint grid plus a soft centre glow makes the wide side margins read as a
-   console workspace instead of dead black. Purely decorative: it changes no
-   box, no overflow and no pointer coordinate. */
-#stage{flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:8px;min-height:0;position:relative;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;background-color:#0b1220;background-image:linear-gradient(rgba(94,142,202,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(94,142,202,.045) 1px,transparent 1px),radial-gradient(ellipse 70% 65% at 50% 45%,#14233c 0%,rgba(11,18,32,0) 78%);background-size:32px 32px,32px 32px,100% 100%}
+/* A quiet matte stage keeps attention on the remote screen. Canvas framing
+   uses shadows only, leaving dimensions and pointer offsets untouched. */
+#stage{flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:8px;min-height:0;position:relative;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;background:#080e17}
 /* Narrow phones cannot read a whole 1024px framebuffer (~31%); a short hint
    tells the operator how to zoom and pan the local view. It never eats input. */
 #phone-hint{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);background:rgba(9,18,34,.9);border:1px solid #3b5a86;border-radius:14px;padding:5px 12px;color:#cfe0f5;font-size:12px;white-space:nowrap;pointer-events:none;z-index:6;max-width:94vw;overflow:hidden;text-overflow:ellipsis}
@@ -211,43 +212,30 @@ canvas:focus{box-shadow:0 0 0 1px #5a94d6,0 14px 38px rgba(0,0,0,.55)}
 #nosignal .card{max-width:min(560px,82%);padding:18px 22px;border:1px solid #c8a24a;border-radius:10px;background:#141d2b;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)}
 #nosignal .card strong{display:block;font-size:18px;color:#f0cf82;margin-bottom:8px}
 #nosignal .card span{font-size:13px;color:#b9c8dc;line-height:1.6}
-/* The input panel is a bottom sheet on EVERY device: collapsed it floats as a
-   corner button, expanded it covers the lower part of the window while the
-   framebuffer keeps its FULL width (a side dock squeezed a phone to ~108px).
-   When open, the stage gives up the same height via margin-bottom, so the
-   picture is scaled into the visible top portion instead of hiding its lower
-   half. Desktop, tablet and phone now share one layout and one interaction. */
-:root{--sheet-h:min(48vh,430px)}
-#inputpanel{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:20;background:#0e192b;border-top:1px solid #3b5a86;box-shadow:0 -8px 26px rgba(0,0,0,.55);display:flex;flex-direction:column;min-height:0;overflow:hidden}
+/* A horizontal input deck preserves the keyboard's spatial layout. The
+   stage reserves its height so controls never cover remote pixels. */
+:root{--sheet-h:min(46vh,354px)}
+#inputpanel{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:20;background:#111b29;border-top:1px solid #34465e;box-shadow:0 -12px 36px rgba(0,0,0,.3);display:flex;flex-direction:column;min-height:0;overflow:hidden}
 #inputpanel:not(.collapsed){height:var(--sheet-h)}
-#inputpanel.collapsed{left:auto;width:auto;right:16px;bottom:20px;height:auto;background:transparent;border:0;box-shadow:none}
+#inputpanel.collapsed{left:auto;width:auto;right:20px;bottom:36px;height:auto;background:transparent;border:0;box-shadow:none}
 #inputpanel.collapsed #input-body{display:none}
-#inputpanel.collapsed #input-bar{background:#1d2f4a;border:1px solid #4a6d9e;border-radius:24px;padding:5px}
+#inputpanel.collapsed #input-bar{background:#1d2f4a;border:1px solid #4a6d9e;border-radius:12px;padding:4px}
 #inputpanel.collapsed #input-toggle{padding:10px 20px}
 #inputpanel.collapsed #input-hint{display:none}
 body.sheet-open #stage{margin-bottom:var(--sheet-h)}
-/* Wide desktop: dock the input panel on the right instead of the bottom. A
-   bottom sheet steals ~430px of height on a 850px window, which squeezed a
-   1024x768 framebuffer down to ~46% -- the terminal text was unreadable. On a
-   wide window there is spare width: the panel takes a fixed side column and
-   the picture keeps the whole window height (~100% at 1:1). Narrow and touch
-   devices keep the single bottom sheet above, so a phone never gets squeezed
-   into a ~108px strip. */
-@media (min-width:1100px){
-:root{--dock-w:340px}
-body.sheet-open #work{margin-right:var(--dock-w)}
-body.sheet-open #stage{margin-bottom:0}
-#inputpanel:not(.collapsed){left:auto;right:0;top:0;bottom:0;width:var(--dock-w);height:auto;border-top:0;border-left:1px solid #3b5a86;box-shadow:-8px 0 26px rgba(0,0,0,.55)}
-}
+body.sheet-open footer{display:none}
 button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap;touch-action:manipulation}
 button:hover{background:#25405f}
 header #zoom-mode{background:#1b3454;border-color:#3b6a9e}
 header #close{background:#3a2027;border-color:#78414c;color:#ffd6d6}
 header #close:hover{background:#512b34}
-footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-top:1px solid #24344d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+footer{padding:5px 20px;font-size:11px;color:#7f93af;background:#0d1622;border-top:1px solid #223148;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
 /* The input block starts as a single button. Nothing inside it is loaded
    until that button is pressed: the picture gets the whole window first. */
-#input-bar{display:flex;gap:12px;align-items:center;justify-content:flex-start;flex-wrap:wrap;padding:8px 12px;background:linear-gradient(180deg,#132039,#0e192b);border-bottom:1px solid #24344d;flex:0 0 auto}
+#input-bar{display:flex;gap:12px;align-items:center;justify-content:flex-start;padding:8px 20px;background:#142031;border-bottom:1px solid #2a3b52;flex:0 0 auto}
+.deck-label{font-size:12px;font-weight:600;color:#a9bdd6;letter-spacing:.5px}
+#input-bar #input-toggle{margin-left:auto;font-size:12px}
+#inputpanel.collapsed .deck-label{display:none}
 #input-bar #input-toggle{background:#24456d;border-color:#4a7db5}
 #input-hint{font-size:12px;color:#7288a6;line-height:1.5}
 /* Two sibling tabs switch the sheet between the soft keyboard and the long
@@ -260,7 +248,7 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 #input-tabs button.on{background:#2b5a86;border-color:#4d8fd0;color:#fff}
 #inputpanel.collapsed #input-tabs{display:none}
 #inputpanel.show-keys #pastebar,#inputpanel.show-paste #softkey{display:none}
-#input-body{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column}
+#input-body{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column;scrollbar-width:thin}
 #softkey{order:1}
 #pastebar{order:2}
 /* Below this the header, the input block and the footer no longer fit at all.
@@ -268,7 +256,7 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
    the bottom of the keyboard. Pointer mapping survives it: the client measures
    from pageX/pageY against the canvas' document offset. */
 @media (max-height:560px){body{overflow:auto}#stage{min-height:80px}footer{display:none}}
-#pastebar{background:#0e192b;padding:8px 16px;font-size:13px}
+#pastebar{background:#111b29;padding:12px 20px;font-size:13px;width:100%;max-width:1080px;box-sizing:border-box;margin:0 auto}
 #pastebar .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
 #pastebar .grow{flex:1}
 #pastebar label{white-space:nowrap;color:#9ab4d6}
@@ -281,15 +269,16 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 #paste-danger{margin-top:6px;padding:6px 8px;border:1px solid #a33;border-radius:6px;background:#2a0f12;color:#ff9d9d;font:12px/1.5 ui-monospace,Consolas,monospace}
 #paste-danger:empty{display:none}#paste-danger strong{color:#ffd0d0}
 #pastebar button{padding:4px 10px;font-size:13px}#pastebar button:disabled{opacity:.45;cursor:not-allowed}
-#softkey{border-top:1px solid #24344d;background:linear-gradient(180deg,#0d1a2e,#0a1424);padding:10px 12px 8px}
-#softkey .head{display:flex;gap:8px;align-items:center;font-size:12px;color:#7288a6;margin-bottom:8px}
+#softkey{background:#111b29;padding:10px 20px 12px;width:100%;max-width:1080px;box-sizing:border-box;margin:0 auto}
+#softkey .head{display:flex;gap:8px;align-items:center;font-size:12px;color:#90a3bd;margin-bottom:8px}
 #softkey .head strong{color:#e6eef8;font-size:14px;white-space:nowrap}
 #softkey .head .grow{flex:1}
 #softkey .head .hint{color:#8a94a6}
 .sk-tag{font:11px/1.4 ui-monospace,Consolas,monospace;color:#8fb6e8;background:#162941;border:1px solid #2c4266;border-radius:10px;padding:1px 7px;white-space:nowrap}
 /* The caveat used to share the title row and wrapped into two cramped lines.
    It gets its own callout; JS only swaps the inner span's hint/on classes. */
-.sk-note{margin-bottom:9px;padding:6px 9px;border:1px solid #2c4266;border-left:3px solid #4d8fd0;border-radius:6px;background:#101f35;font-size:12px;line-height:1.5}
+.sk-note{font-size:11px;line-height:1.5;min-width:0;margin-left:10px}
+#softkey .head #softkey-toggle{font-size:11px;padding:3px 8px}
 .sk-note .hint{color:#9ab4d6}
 .sk-note .hint.on{color:#7fe0a6;font-weight:600}
 #sk-modstate.on{color:#7fe0a6;font-weight:600}
@@ -298,7 +287,7 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 #sk-body.hidden{display:none}
 /* Page tabs. The keyboard used to stack every group into one tiny grid;
    splitting into pages keeps each key large and the panel short. */
-.sktabs{display:flex;gap:4px;margin-bottom:9px}
+.sktabs{display:flex;gap:4px;margin-bottom:8px;max-width:460px}
 .sktab{flex:1 1 0;min-width:0;padding:6px 2px;font:600 12px/1.2 system-ui,sans-serif;border:1px solid #2b4266;background:#12223a;color:#9ab4d6;border-radius:6px;min-height:32px}
 .sktab:hover{background:#1a2f4d}
 .sktab.on{background:#21528a;border-color:#3f7cc0;color:#fff;box-shadow:inset 0 -2px 0 #6fb0ff}
@@ -308,14 +297,15 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 #sk-body[data-page="func"] .skrow[data-skpage="func"],
 #sk-body[data-page="nav"] .skrow[data-skpage="nav"],
 #sk-body[data-page="macros"] .skrow[data-skpage="macros"]{display:flex}
-.skrow{flex-wrap:wrap;gap:4px;margin-bottom:5px}
+.skrow{flex-wrap:nowrap;gap:5px;margin-bottom:5px}
+#sk-keybed{overflow-x:auto;scrollbar-width:thin;padding:2px 1px}
+#sk-body{min-width:680px}
 .skrow.macros{gap:6px;margin-bottom:2px}
 /* Keys share leftover width evenly; --u still widens space/shift. No
    ellipsis: a truncated label reads as a broken key. */
-/* A zero flex-basis plus nowrap buttons let the last keys of a row run past
-   the dock edge in Safari. Give every key a real minimum and wrap instead:
-   two shorter rows read better than one clipped row. */
-.sk{flex:var(--u,1) 1 30px;min-width:30px;box-sizing:border-box;min-height:34px;padding:6px 2px;border:1px solid #36507a;background:#1b2f4d;color:#eaf1fb;border-radius:6px;cursor:pointer;text-align:center;transition:background .08s,transform .05s}
+/* The keybed has a readable minimum width and scrolls on small screens;
+   individual rows never wrap or scramble the physical keyboard order. */
+.sk{flex:var(--u,1) 1 0;min-width:0;box-sizing:border-box;min-height:34px;padding:6px 4px;border:1px solid #3c4e68;border-bottom:3px solid #29394e;background:#233248;color:#eaf1fb;border-radius:6px;cursor:pointer;text-align:center;transition:background .08s,transform .05s}
 .sk:hover:enabled{background:#2a4a75}
 .sk:active:enabled{background:#37699f;transform:translateY(1px)}
 .sk:disabled{opacity:.4;cursor:not-allowed}
@@ -326,19 +316,38 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 .skrow.macros .sk{flex:0 0 auto;padding:6px 12px;background:#3a2a52;border-color:#6a4f9a;color:#f0e7ff;font-size:12px}
 .sk[data-level=unverified]{border-bottom:2px dotted #c8a24a}
 .sk[data-level=known_broken]{border-color:#b05148;color:#ffc9c4}
-#sk-status{font-size:12px;color:#8fb6e8;min-height:26px;margin-top:8px;padding:5px 9px;background:#0d1a2d;border:1px solid #24344d;border-radius:6px;box-sizing:border-box}
-/* The dock is full height on a wide desktop; without this the keyboard
-   occupies the top third and the rest reads as an unfinished empty column. */
-.sk-help{margin-top:14px;padding-top:12px;border-top:1px solid #24344d;font-size:12px;line-height:1.65;color:#8298b8}
-.sk-help strong{display:block;color:#a8c8ef;font-size:12px;margin-bottom:5px}
-.sk-help p{margin:0 0 4px;padding-left:12px;position:relative}
-.sk-help p::before{content:'›';position:absolute;left:0;color:#4d8fd0}
+#sk-status{font-size:12px;color:#8fb6e8;margin-top:6px;padding:3px 8px;min-height:22px;border:0;background:#172439;border-radius:6px;box-sizing:border-box}
+#sk-status:empty{display:none}
+.keyboard-footnote{display:flex;justify-content:space-between;gap:16px;color:#7f93af;font-size:11px;margin-top:6px}
+.keyboard-footnote span:last-child{white-space:nowrap}
+@media (max-width:700px){
+  :root{--sheet-h:min(56vh,440px)}
+  .console-mark{display:none}
+  header{gap:6px;padding:8px 12px}
+  header strong{max-width:calc(100% - 100px);flex:1 1 calc(100% - 100px)}
+  #status{max-width:32vw}
+  #frame-age{order:4}
+  #zoom{order:5}
+  .header-actions{order:6;margin-left:auto}
+  .header-actions button{font-size:12px;padding:6px 10px}
+  #spacer{display:none}
+  #input-bar{padding:8px 12px;gap:8px}
+  .deck-label{display:none}
+  #input-tabs button{padding:6px 12px}
+  #softkey{padding:10px 12px}
+  #softkey .head{flex-wrap:wrap}
+  #softkey .head strong,#softkey .head .sk-tag,#softkey .head .grow,#softkey .head #softkey-toggle{display:none}
+  .sk-note{order:5;width:100%;margin-left:0}
+  .keyboard-footnote span:last-child{display:none}
+  #pastebar{padding:10px 12px}
+}
 /* Touch targets stay large and the iOS address bar must not trigger input
    zoom (all inputs are >=16px). */
 @media (pointer:coarse){
   header{padding:8px 10px;gap:8px}
   #status{font-size:12px}
   button{min-height:44px;padding:8px 14px}
+  .sk{min-height:44px}
   input,textarea,select{font-size:16px}
   input[type=number]{width:72px}
 }
@@ -351,12 +360,12 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 }
 </style>
 <div id="work">
-<header><strong id="asset-label">真机 KVM 控制台</strong><span id="status">正在连接…</span><span id="frame-age" title="最近一次从主机侧收到数据距今多久。这台固件即使在画面静止时也会持续回送小包，所以这个数字持续上涨通常说明链路出了问题；反过来，数字正常但画面不动，说明是主机自己停住了（例如卡在 POST）。"></span><span id="zoom" title="画面按这个比例显示。自适应时窗口放不下 1:1 的帧缓冲，画面会等比缩小以完整显示；缩小时鼠标坐标仍按原比例换算。"></span><span id="spacer"></span><button id="zoom-mode" title="在完整显示与 100% 原始像素之间切换。默认 100% 原始像素最清晰；窗口放不下时画面区可滚动，鼠标坐标仍随滚动换算。">画面自适应</button><button id="close">结束会话</button></header>
+<header><span class="console-mark">KVM / LIVE</span><strong id="asset-label">真机 KVM 控制台</strong><span id="status">正在连接…</span><span id="frame-age" title="最近一次从主机侧收到数据距今多久。这台固件即使在画面静止时也会持续回送小包，所以这个数字持续上涨通常说明链路出了问题；反过来，数字正常但画面不动，说明是主机自己停住了（例如卡在 POST）。"></span><span id="zoom" title="画面按这个比例显示。自适应时窗口放不下 1:1 的帧缓冲，画面会等比缩小以完整显示；缩小时鼠标坐标仍按原比例换算。"></span><span id="spacer"></span><span class="header-actions"><button id="zoom-mode" title="在完整显示与 100% 原始像素之间切换。默认 100% 原始像素最清晰；窗口放不下时画面区可滚动，鼠标坐标仍随滚动换算。">画面自适应</button><button id="close">结束会话</button></span></header>
 <div id="stage"><canvas id="screen" width="1024" height="768" tabindex="0"></canvas><div id="phone-hint" hidden>双指捏合缩放 · 双指拖动画面 · 单指操作远端</div><div id="nosignal" hidden><div class="card"><strong>无视频信号 · 系统可能未开机</strong><span>主机没有输出画面。这不是 VNC 链路故障；本页未接入电源状态，请到 BMC 电源管理页确认设备是否已上电。</span></div></div></div>
-<footer title="画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。">画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。</footer>
+<footer title="画面与键鼠经平台网关原样转发；BMC 票据、Cookie 与凭据不下发浏览器。本页不提供电源、重置或用户管理入口；长命令输入与软键盘只发按键帧，不放开剪贴板消息。">远程控制台<span style="float:right">点击画面操作 · 输入面板辅助键入</span></footer>
 </div><!-- /work -->
 <aside id="inputpanel" class="collapsed show-keys">
-<div id="input-bar"><button id="input-toggle" type="button" title="展开输入面板（首次点击才加载键位表）">⌨ 输入</button><span id="input-tabs"><button type="button" id="tab-keys" class="on">软键盘</button><button type="button" id="tab-paste">长命令</button></span><span id="input-hint">点击展开</span></div>
+<div id="input-bar"><span class="deck-label">输入工作台</span><span id="input-tabs"><button type="button" id="tab-keys" class="on">软键盘</button><button type="button" id="tab-paste">长命令</button></span><button id="input-toggle" type="button" title="展开或收起输入面板" aria-expanded="false" aria-controls="input-body">⌨ 输入</button><span id="input-hint">点击展开</span></div>
 <div id="input-body">
 <div id="pastebar">
 <div class="row"><strong>长命令输入</strong><span>粘贴后先预检；字符按实测可靠性着色</span><span class="grow"></span>
@@ -367,10 +376,9 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 <div id="paste-preview-box"></div><div id="paste-status"></div><div id="paste-danger"></div>
 </div>
 <div id="softkey">
-<div class="head"><strong>软键盘</strong><span class="sk-tag">US QWERTY</span><span class="grow"></span><button id="softkey-toggle">收起键盘</button></div>
-<div class="sk-note"><span class="hint" id="sk-modstate">画面上直接键入会丢 Shift · 请用下方按键输入</span></div>
+<div class="head"><strong>软键盘</strong><span class="sk-tag">US QWERTY</span><div class="sk-note"><span class="hint" id="sk-modstate">画面上直接键入会丢 Shift · 请用下方按键输入</span></div><span class="grow"></span><button id="softkey-toggle" aria-expanded="true" aria-controls="sk-body">收起键盘</button></div>
 <div class="sktabs" id="sk-tabs"><button type="button" class="sktab on" data-skpage="chars">字符</button><button type="button" class="sktab" data-skpage="symbols">符号</button><button type="button" class="sktab" data-skpage="func">功能</button><button type="button" class="sktab" data-skpage="nav">导航</button><button type="button" class="sktab" data-skpage="macros">宏</button></div>
-<div id="sk-body">
+<div id="sk-keybed" tabindex="0" aria-label="软键盘按键区，窄屏可横向滚动"><div id="sk-body">
 <div class="skrow macros" id="sk-macros" data-skpage="macros"></div>
 <div class="skrow" data-skpage="func">
 <button type="button" class="sk" data-send="esc" style="--u:1.3">Esc</button>
@@ -411,14 +419,8 @@ footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-t
 <div class="skrow" data-skpage="nav">
 <button type="button" class="sk" data-send="ins">Ins</button><button type="button" class="sk" data-send="home">Home</button><button type="button" class="sk" data-send="pgup">PgUp</button><button type="button" class="sk" data-send="pgdn">PgDn</button><button type="button" class="sk" data-send="del">Del</button><button type="button" class="sk" data-send="end">End</button><button type="button" class="sk" data-send="left">&#8592;</button><button type="button" class="sk" data-send="down">&#8595;</button><button type="button" class="sk" data-send="up">&#8593;</button><button type="button" class="sk" data-send="right">&#8594;</button>
 </div>
-<div id="sk-status"></div>
-<div class="sk-help">
-<strong>操作提示</strong>
-<p>修饰键点亮后再点目标键，再点一次修饰键取消。</p>
-<p>「长命令」页可粘贴文本：先预检，再发送，随时可停止。</p>
-<p>画面只转发键鼠；电源与重置不在本页提供。</p>
-</div>
-</div>
+</div></div><div id="sk-status" role="status" aria-live="polite"></div>
+<div class="keyboard-footnote"><span>点亮 Ctrl / Alt / Shift，再选目标键</span><span>窄屏可左右滑动键盘</span></div>
 </div>
 </div>
 </div>
@@ -1446,6 +1448,7 @@ REAL_CONSOLE_JS = """'use strict';
     if (open) skBody.classList.remove('hidden');
     else skBody.classList.add('hidden');
     skToggle.textContent = open ? '收起键盘' : '展开键盘';
+    skToggle.setAttribute('aria-expanded', String(open));
   }
   // First visit: open the keyboard only where it leaves room for the picture.
   // A remembered choice always wins, so an operator who collapsed it stays
@@ -1493,7 +1496,8 @@ REAL_CONSOLE_JS = """'use strict';
   // the buttons cannot be pressed before the table that defines them exists.
   inputToggle.onclick = function () {
     var collapsed = inputPanel.classList.toggle('collapsed');
-    inputToggle.textContent = collapsed ? '⌨ 输入' : '⌨ 收起面板';
+    inputToggle.textContent = collapsed ? '⌨ 输入' : '收起面板 ↓';
+    inputToggle.setAttribute('aria-expanded', String(!collapsed));
     // The sheet shares the window with the picture: when it opens the stage
     // gives up the same height so the framebuffer scales into the top area and
     // stays fully visible (never hidden behind the keyboard).
@@ -1619,11 +1623,9 @@ REAL_CONSOLE_JS = """'use strict';
   }
 
   // ---- fitting the picture ------------------------------------------------
-  // The input block used to sit below the picture and eat window height. A
-  // drag handle tried to trade that height by hand; it only cropped the
-  // framebuffer or scrolled the bottom row of keys out of view. The block now
-  // docks on the left, so it takes width and never height, and the picture
-  // opens at native 1:1 pixels -- crisp text instead of a blurred interpolation.
+  // The input deck reserves its own space below the picture. While it is
+  // open the framebuffer fits above it; closing restores native pixels or
+  // the operator's chosen fit mode.
   //
   // "Fit" is the optional mode: Display.autoscale()
   // writes CSS width/height only (the bitmap stays 1:1 with the BMC, so drawing
@@ -2352,11 +2354,8 @@ class Gateway:
         if path == "/_platform/keymap" and request.method == "GET":
             return web.json_response(keymap_document())
         if path == "/_platform/meta" and request.method == "GET":
-            cfg = getattr(sess.adapter, "cfg", None)
-            host = (getattr(cfg, "host", "") if cfg is not None
-                    else getattr(sess.adapter, "host", ""))
-            label = getattr(sess, "display_address", "") or host
-            return web.json_response({"address": label or "未接入",
+            label = getattr(sess, "display_address", "") or "控制台"
+            return web.json_response({"address": label,
                                       "asset_id": getattr(sess, "asset_id", ""),
                                       "input_protocol": input_protocol_for_adapter(sess.adapter)})
         if request.method != "GET" or request.query_string:

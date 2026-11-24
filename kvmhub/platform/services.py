@@ -416,6 +416,8 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
         if clash is not None:
             raise PlatformError("asset_address_conflict",
                                 "该 IPMI 地址已被本租户其它资产占用", 409)
+    public_ip_module.assert_ipmi_available(session, tenant_id, address,
+                                           existing.id if existing else None)
     if existing is None:
         enforce_asset_quota(session, tenant_id)
         existing = Asset(id=str(uuid.uuid4()), tenant_id=tenant_id, name=name,
@@ -538,6 +540,8 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
     resolved = public_ip_module.asset_by_public_ip(session, None, addr)
     if resolved is not None:
         addr = resolved.address
+    elif public_ip_module.address_asset_ids(session, None, addr):
+        raise PlatformError("asset_ambiguous", "该地址匹配多个设备或归属异常，请先修复地址登记", 409)
     target = (tenant_id or "").strip() or None
     tenant = None
     if target is not None:
@@ -552,6 +556,7 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
     if not candidates:
         if target is None:
             raise PlatformError("asset_not_found", "没有这个地址的设备", 404)
+        public_ip_module.assert_ipmi_available(session, target, addr)
         enforce_asset_quota(session, target)
         asset = Asset(id=str(uuid.uuid4()), tenant_id=target, name=(name or addr).strip() or addr,
                       address=addr, created=stamp, updated=stamp)

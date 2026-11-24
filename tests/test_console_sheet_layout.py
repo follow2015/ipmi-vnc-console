@@ -39,6 +39,8 @@ def page_files(tmp_path_factory):
     ("desktop", 1280, 900, False),
     ("tablet", 1024, 768, True),
     ("phone", 390, 844, True),
+    ("landscape", 844, 390, True),
+    ("wide", 1920, 1080, False),
 ])
 def test_picture_stays_visible_above_sheet(page_files, name, width, height, touch):
     node, d, env = page_files
@@ -55,20 +57,19 @@ def test_picture_stays_visible_above_sheet(page_files, name, width, height, touc
     view_w = after["viewportW"]
     assert before["stage"]["w"] == view_w
     assert after["sheetOpen"] is True
-    if width >= 1100:
-        assert after["panel"]["t"] <= 2 and after["panel"]["b"] >= height - 2, \
-            f"wide panel is not a full-height side dock at {name}"
-        assert after["panel"]["r"] >= view_w - 2
-        assert after["stage"]["r"] <= after["panel"]["l"] + 2, \
-            f"side dock overlaps the picture at {name}"
-        assert after["stage"]["b"] >= height - 60, \
-            f"picture lost window height at {name}: stage {after['stage']['b']}"
-    else:
-        assert after["panel"]["w"] == view_w
-        assert after["stage"]["w"] == view_w
-        assert after["stage"]["b"] <= after["panel"]["t"] + 2, \
-            f"stage overlaps the sheet at {name}"
+    assert after["panel"]["w"] == view_w
+    assert after["stage"]["w"] == view_w
+    assert after["stage"]["b"] <= after["panel"]["t"] + 2, \
+        f"stage overlaps the sheet at {name}"
     assert after["canvas"]["b"] <= after["stage"]["b"] + 2, \
         f"picture hidden behind the sheet at {name}: canvas {after['canvas']['b']} stage {after['stage']['b']}"
     assert after["keyboardFirst"] is True
     assert after["visibleKeyCount"] >= 40
+    assert not after["pageOverflows"], "keyboard scrolling must stay inside the keybed"
+    assert after["endKeyReachable"], "Backspace remains reachable by scrolling the keyboard"
+    for row in after["keyRows"]:
+        assert row["sameLine"], "physical keyboard rows must not wrap"
+        assert row["labelsFit"], "key labels must not be clipped"
+        assert row["height"] >= (44 if touch else 34)
+    if width < 680:
+        assert after["keyboardScrolls"], "narrow screens retain readable keys with local scrolling"

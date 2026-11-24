@@ -76,8 +76,28 @@ async function main() {
       visibleKeyCount: [].slice.call(document.querySelectorAll('#softkey [data-send]'))
         .filter(k => getComputedStyle(k.closest('.skrow')).display !== 'none').length,
       viewportW: Math.round(document.documentElement.clientWidth),
+      keyRows: [...document.querySelectorAll('#sk-body .skrow[data-skpage="chars"]')].map(row => {
+        const keys = [...row.querySelectorAll('button')];
+        const rects = keys.map(key => key.getBoundingClientRect());
+        return {
+          sameLine: rects.every(rect => Math.abs(rect.top - rects[0].top) < 1),
+          labelsFit: keys.every(key => key.scrollWidth <= key.clientWidth + 1),
+          height: Math.min(...rects.map(rect => rect.height)),
+        };
+      }),
+      keyboardScrolls: document.getElementById('sk-keybed').scrollWidth > document.getElementById('sk-keybed').clientWidth,
+      pageOverflows: document.documentElement.scrollWidth > window.innerWidth,
     };
   });
+  const keybed = page.locator('#sk-keybed');
+  await keybed.evaluate(el => { el.scrollLeft = el.scrollWidth; });
+  const endKeyReachable = await page.evaluate(() => {
+    const key = document.querySelector('[data-send="bksp"]').getBoundingClientRect();
+    const bed = document.getElementById('sk-keybed').getBoundingClientRect();
+    return key.left >= bed.left - 1 && key.right <= bed.right + 1;
+  });
+  await keybed.evaluate(el => { el.scrollLeft = 0; });
+  after.endKeyReachable = endKeyReachable;
   if (SHOT) await page.screenshot({ path: SHOT, fullPage: false });
   console.log(JSON.stringify({ W, H, TOUCH, before, after, errors }));
   await browser.close();

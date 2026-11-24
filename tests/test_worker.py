@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import aiohttp
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestServer
+from aiohttp.test_utils import TestServer, make_mocked_request
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -22,6 +22,24 @@ from kvmhub.recovery import RecoveryPolicy
 from kvmhub.worker import (GATEWAY_KEY, MAX_TRACES, SESSION_KEY, Gateway, ManagerRejected,
                            Runtime, create_worker, wire_recovery)
 from tools.bootstrap import generate
+
+
+@pytest.mark.parametrize("alias", ["", "203.0.113.40"])
+async def test_authenticated_console_meta_never_reveals_ipmi(alias):
+    adapter = SimpleNamespace(host="192.0.2.99", cfg=SimpleNamespace(host="192.0.2.99"))
+    sess = Runtime("synthetic-session", digest("synthetic-cookie"), adapter,
+                   time.monotonic() + 30, asset_id="synthetic-asset", display_address=alias)
+    gateway = SimpleNamespace(sessions={sess.sid: sess})
+    gateway.authenticated = lambda req: Gateway.authenticated(gateway, req)
+    request = make_mocked_request("GET", "/_platform/meta", headers={
+        "Host": "console.example.test",
+        "Cookie": worker_module.cookie_name_for(sess.sid) + "=synthetic-cookie"})
+    request[SESSION_KEY] = sess.sid
+    response = await Gateway.handle(gateway, request)
+    body = json.loads(response.body)
+    assert response.status == 200
+    assert body["address"] == (alias or "控制台")
+    assert "192.0.2.99" not in response.text
 
 
 @pytest.fixture

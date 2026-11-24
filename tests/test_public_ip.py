@@ -185,6 +185,56 @@ def test_assign_accepts_public_ip(world):
     assert result["asset"]["address"] == "192.0.2.24"
 
 
+@pytest.mark.parametrize("edit", [False, True])
+def test_ipmi_cannot_shadow_another_assets_public_alias(world, edit):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "a", "192.0.2.10", public_ips="203.0.113.10")
+    bid = _create_asset(c, csrf, "b", "192.0.2.11")["id"] if edit else None
+    address = "203.0.113.10"
+    with pytest.raises(services.PlatformError) as exc:
+        with transaction(platform.factory) as db:
+            services.upsert_asset(db, name="b", address=address, asset_id=bid, actor="test")
+    assert exc.value.code == "public_ip_conflict" and exc.value.status == 409
+    with transaction(platform.factory) as db:
+        assert public_ip.asset_by_public_ip(db, services.DEFAULT_TENANT_ID, address).id == a["id"]
+
+
+def test_legacy_ipmi_alias_collision_refuses_lookup_and_assignment(world):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "a", "192.0.2.10", public_ips="203.0.113.10")
+    b = _create_asset(c, csrf, "b", "192.0.2.11")
+    with transaction(platform.factory) as db:
+        db.get(Asset, b["id"]).address = "203.0.113.10"
+    with transaction(platform.factory) as db:
+        assert public_ip.asset_by_public_ip(db, services.DEFAULT_TENANT_ID, "203.0.113.10") is None
+        assert public_ip.asset_by_public_ip(db, None, "203.0.113.10") is None
+    with pytest.raises(services.PlatformError) as exc:
+        with transaction(platform.factory) as db:
+            services.assign_asset(db, address="203.0.113.10",
+                                  tenant_id=services.DEFAULT_TENANT_ID, actor="test")
+    assert exc.value.code == "asset_ambiguous"
+
+
+@pytest.mark.parametrize("incoming_alias", [False, True])
+def test_rehome_refuses_ipmi_alias_collision_in_either_direction(world, incoming_alias):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "a", "192.0.2.10",
+                      **({"public_ips": "203.0.113.10"} if incoming_alias else {}))
+    with transaction(platform.factory) as db:
+        other = services.create_tenant(db, code="other", name="other", actor="test")
+        other_id = other.id
+        services.upsert_asset(db, name="b", tenant_id=other_id, actor="test",
+                              address="203.0.113.10" if incoming_alias else "192.0.2.11",
+                              public_ips=None if incoming_alias else "192.0.2.10")
+    with pytest.raises(services.PlatformError) as exc:
+        with transaction(platform.factory) as db:
+            services.assign_asset(db, address="192.0.2.10", tenant_id=other_id,
+                                  actor="test", reassign=True)
+    assert exc.value.code == ("public_ip_conflict" if incoming_alias else "asset_ambiguous")
+    with transaction(platform.factory) as db:
+        assert db.get(Asset, a["id"]).tenant_id == services.DEFAULT_TENANT_ID
+
+
 def test_reassign_moves_public_ip_mapping_to_new_tenant(world):
     c, csrf, _, _, platform = world
     a = _create_asset(c, csrf, "web-01", "192.0.2.24", public_ips="203.0.113.10")

@@ -112,8 +112,8 @@ def test_only_the_address_is_published():
     marker = next((m for m in markers if m in source), None)
     assert marker is not None, markers
     block = source[source.index(marker):source.index('if request.method != "GET"', source.index(marker))]
-    assert '"address": label or "未接入"' in block
-    assert 'getattr(sess, "display_address", "") or host' in block
+    assert '"address": label' in block
+    assert 'getattr(sess, "display_address", "") or "控制台"' in block
     assert '"asset_id": getattr(sess, "asset_id", "")' in block
     code = "\n".join(line for line in block.splitlines()
                        if not line.lstrip().startswith("#")).lower()
@@ -205,7 +205,7 @@ def test_controls_behave_in_a_browser():
     assert opened["panelCollapsed"] is False
     assert opened["sheetOpen"] is True
     assert opened["panelWidth"] > 200, "the expanded sheet shows the keyboard"
-    assert opened["scale"] < 1.0, "the picture fits beside the docked panel"
+    assert opened["scale"] < 1.0, "the picture fits above the input deck"
     assert opened["stageRight"] <= opened["panelLeft"] + 2 or \
         opened["stageBottom"] <= opened["panelTop"] + 2, \
         "the picture is not hidden behind the keyboard"

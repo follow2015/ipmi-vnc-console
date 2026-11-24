@@ -143,25 +143,48 @@ def upsert_public_ip(session: Session, *, tenant_id: str, asset_id: str,
     return existing
 
 
+def assert_ipmi_available(session: Session, tenant_id: str | None, address: str,
+                          asset_id: str | None = None) -> None:
+    value = address.strip().lower()
+    for row in session.scalars(select(PublicIpMapping).where(
+            PublicIpMapping.tenant_id == tenant_id)):
+        if row.asset_id != asset_id and any(ip.lower() == value for ip in all_ips(row)):
+            raise PlatformError("public_ip_conflict", "该 IPMI 地址已被其它资产用作公网 IP", 409)
+    for row in session.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.tenant_id == tenant_id)):
+        if row.asset_id != asset_id and row.ip.lower() == value:
+            raise PlatformError("public_ip_conflict", "该 IPMI 地址已被其它资产用作公网 IP", 409)
+
+
+def address_asset_ids(session: Session, tenant_id: str | None, address: str) -> set[str]:
+    value = (address or "").strip().lower()
+    if not value:
+        return set()
+    assets = select(Asset)
+    if tenant_id is not None:
+        assets = assets.where(Asset.tenant_id == tenant_id)
+    matched = {a.id for a in session.scalars(assets)
+               if a.address.strip().lower() == value}
+    mappings = select(PublicIpMapping)
+    aliases = select(PublicIpAlias)
+    if tenant_id is not None:
+        mappings = mappings.where(PublicIpMapping.tenant_id == tenant_id)
+        aliases = aliases.where(PublicIpAlias.tenant_id == tenant_id)
+    for row in session.scalars(mappings):
+        if any(ip.lower() == value for ip in all_ips(row)):
+            matched.add(row.asset_id)
+    for row in session.scalars(aliases):
+        if row.ip.lower() == value:
+            mapping = session.get(PublicIpMapping, row.mapping_id)
+            valid = (mapping is not None and mapping.tenant_id == row.tenant_id
+                     and mapping.asset_id == row.asset_id)
+            matched.add(row.asset_id if valid else "invalid:" + row.id)
+    return matched
+
+
 def asset_by_public_ip(session: Session, tenant_id: str | None,
                        address: str) -> Asset | None:
-    value = (address or "").strip()
-    if not value:
-        return None
-    by_ipmi = session.scalars(select(Asset).where(Asset.address == value)).all()
-    if tenant_id is not None:
-        by_ipmi = [a for a in by_ipmi if a.tenant_id == tenant_id]
-    if len(by_ipmi) == 1:
-        return by_ipmi[0]
-    if len(by_ipmi) > 1:
-        return None
-    query = select(PublicIpMapping)
-    if tenant_id is not None:
-        query = query.where(PublicIpMapping.tenant_id == tenant_id)
-    matched_asset_ids = set()
-    for row in session.scalars(query):
-        if any(ip.lower() == value.lower() for ip in all_ips(row)):
-            matched_asset_ids.add(row.asset_id)
+    matched_asset_ids = address_asset_ids(session, tenant_id, address)
     if len(matched_asset_ids) != 1:
         return None
     asset = session.get(Asset, next(iter(matched_asset_ids)))
@@ -175,6 +198,9 @@ def asset_by_public_ip(session: Session, tenant_id: str | None,
 def rehome_mapping(session: Session, *, asset_id: str, tenant_id: str | None,
                    actor: str, now: float | None = None) -> None:
     stamp = time.time() if now is None else now
+    asset = session.get(Asset, asset_id)
+    if tenant_id is not None and asset is not None:
+        assert_ipmi_available(session, tenant_id, asset.address, asset_id)
     row = mapping_for_asset(session, asset_id)
     if row is None:
         return
@@ -191,7 +217,12 @@ def rehome_mapping(session: Session, *, asset_id: str, tenant_id: str | None,
         claimed = set(session.scalars(select(PublicIpAlias.ip).where(
             PublicIpAlias.tenant_id == tenant_id,
             PublicIpAlias.mapping_id != row.id)))
-        conflict = any(alias.ip in claimed for alias in aliases)
+        claimed.update(a.address.strip().lower() for a in session.scalars(
+            select(Asset).where(Asset.tenant_id == tenant_id, Asset.id != asset_id)))
+        for other in session.scalars(select(PublicIpMapping).where(
+                PublicIpMapping.tenant_id == tenant_id, PublicIpMapping.asset_id != asset_id)):
+            claimed.update(ip.lower() for ip in all_ips(other))
+        conflict = any(ip.lower() in claimed for ip in all_ips(row))
         if conflict:
             raise PlatformError("public_ip_conflict",
                                 "公网 IP 已被本租户其它资产占用", 409)
