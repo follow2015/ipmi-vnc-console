@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -144,6 +145,15 @@ def test_text_plan_preflight_flags_the_pipe(client):
     assert "|" in matrix["levels"]["known_broken"]
     assert "A" in matrix["levels"]["verified"] and "!" in matrix["levels"]["verified"]
     assert "|" not in matrix["levels"]["verified"]
+
+
+def test_text_input_matrix_does_not_expose_internal_provenance(client):
+    login(client)
+    matrix = client.get("/api/v2/text-input/matrix").json()
+    assert "note" not in matrix
+    encoded = json.dumps(matrix, ensure_ascii=False)
+    for marker in ("阶段 28", "2026-11-16", "真机回读"):
+        assert marker not in encoded
 
 
 def test_audit_records_the_sensitive_operations(client):

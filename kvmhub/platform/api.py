@@ -914,9 +914,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         for ch in sample:
             rows[text_input.reliability(ch)].append(ch if ch.isprintable() else repr(ch))
         return {"levels": rows, "known_broken_notes": text_input._KNOWN_BROKEN,
-                "max_chars": text_input._MAX_CHARS,
-                "note": "verified 来自真机回读（阶段 28 与 2026-11-16 的长命令输入框）；"
-                        "unverified 是未核对，不是可用。"}
+                "max_chars": text_input._MAX_CHARS}
 
     @app.post("/api/v2/text-plan")
     async def text_plan(request: Request):
