@@ -10,6 +10,7 @@ __pycache__/
 # Local synthetic run directories (private keys, tokens, database)
 .local/
 .local*/
+.local*
 
 # macOS
 .DS_Store

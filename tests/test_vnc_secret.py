@@ -7,6 +7,7 @@ import pytest
 
 from kvmhub.platform import services
 from kvmhub.platform.db import init_schema, make_engine, session_factory, transaction
+from kvmhub.platform.models import Asset
 from kvmhub.platform.security import CredentialCipher
 
 from test_platform import BMC_PASSWORD, KEY, make_cfg
@@ -66,6 +67,39 @@ def test_vnc_secret_read_back_and_aad_bound_to_asset(ctx):
             services.read_vnc_secret(db, cipher, a2.id)
         with pytest.raises(Exception):
             cipher.decrypt(bytes(a1.vnc_password_cipher), aad=a2.id + ":vnc_password")
+
+
+def test_save_vnc_secret_joins_caller_transaction(ctx):
+    _, factory, cipher = ctx
+    asset_id = None
+    with pytest.raises(RuntimeError, match="abort"):
+        with transaction(factory) as db:
+            _, asset = _asset_with_bmc_credential(db, cipher)
+            asset_id = asset.id
+            services.save_vnc_secret(db, cipher, asset_id=asset_id,
+                                     username="vnc", password="unit-test-password",
+                                     actor="cli")
+            raise RuntimeError("abort")
+    with transaction(factory) as db:
+        assert services.has_vnc_secret(db.get(Asset, asset_id)) is False
+
+
+def test_clear_vnc_secret_joins_caller_transaction(ctx):
+    _, factory, cipher = ctx
+    with transaction(factory) as db:
+        _, asset = _asset_with_bmc_credential(db, cipher)
+        asset_id = asset.id
+        services.save_vnc_secret(db, cipher, asset_id=asset_id,
+                                 username="vnc", password="unit-test-password",
+                                 actor="cli")
+    with pytest.raises(RuntimeError, match="abort"):
+        with transaction(factory) as db:
+            services.clear_vnc_secret(db, asset_id=asset_id, actor="cli")
+            raise RuntimeError("abort")
+    with transaction(factory) as db:
+        reloaded = db.get(Asset, asset_id)
+        assert services.has_vnc_secret(reloaded) is True
+        assert services.read_vnc_secret(db, cipher, asset_id)["password"] == "unit-test-password"
 
 
 def test_select_sync_secret_prefers_vnc_then_falls_back_to_bmc(ctx):

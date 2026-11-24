@@ -56,6 +56,12 @@ def test_prod_refuses_sqlite_and_missing_redis(monkeypatch):
         settings()
 
 
+def test_prod_requires_bmc_allowed_networks():
+    cfg = make_cfg(env="prod", bmc_allowed_networks="")
+    with pytest.raises(ValueError, match="KVMHUB_BMC_ALLOWED_NETWORKS"):
+        cfg.validate()
+
+
 def test_dev_can_run_on_sqlite_without_redis(monkeypatch, tmp_path):
     monkeypatch.setenv("KVMHUB_ENV", "dev")
     monkeypatch.setenv("KVMHUB_DB_URL", f"sqlite:///{tmp_path}/p.db")

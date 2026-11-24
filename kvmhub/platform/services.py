@@ -315,7 +315,7 @@ def save_vnc_secret(session: Session, cipher: CredentialCipher, *, asset_id: str
     audit(session, actor, "vnc_secret_saved", asset_id=asset.id,
           tenant_id=asset.tenant_id,
           detail={"key_version": 1, "credential_id_unchanged": True}, now=stamp)
-    session.commit()
+    session.flush()
     return asset
 
 
@@ -334,7 +334,7 @@ def clear_vnc_secret(session: Session, *, asset_id: str, actor: str,
     asset.updated = stamp
     audit(session, actor, "vnc_secret_cleared", asset_id=asset.id,
           tenant_id=asset.tenant_id, now=stamp)
-    session.commit()
+    session.flush()
     return asset
 
 

@@ -206,6 +206,34 @@ def test_reassign_moves_public_ip_mapping_to_new_tenant(world):
                                            "203.0.113.10") is None
 
 
+def test_rehome_with_duplicate_public_ip_returns_409(world):
+    c, csrf, _, _, platform = world
+    a = _create_asset(c, csrf, "web-01", "192.0.2.24",
+                      public_ips="203.0.113.10")
+    with transaction(platform.factory) as db:
+        other = services.create_tenant(db, code="other", name="other", actor="test")
+        db.commit()
+        other_id = other.id
+        services.upsert_asset(db, name="web-02", address="192.0.2.25",
+                              public_ips="203.0.113.10", actor="test",
+                              tenant_id=other_id)
+
+    with pytest.raises(services.PlatformError) as exc:
+        with transaction(platform.factory) as db:
+            services.assign_asset(db, address="192.0.2.24", tenant_id=other_id,
+                                  actor="test", reassign=True)
+    assert exc.value.code == "public_ip_conflict"
+    assert exc.value.status == 409
+
+    with transaction(platform.factory) as db:
+        asset = db.get(Asset, a["id"])
+        assert asset.tenant_id == services.DEFAULT_TENANT_ID
+        mapping = public_ip.mapping_for_asset(db, a["id"])
+        assert mapping is not None and mapping.tenant_id == services.DEFAULT_TENANT_ID
+        assert [row.ip for row in db.scalars(select(PublicIpAlias).where(
+            PublicIpAlias.mapping_id == mapping.id))] == ["203.0.113.10"]
+
+
 def test_unassign_drops_public_ip_mapping(world):
     c, csrf, _, _, platform = world
     a = _create_asset(c, csrf, "web-01", "192.0.2.24", public_ips="203.0.113.10")

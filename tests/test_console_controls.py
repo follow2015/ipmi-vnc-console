@@ -28,6 +28,12 @@ def _chrome():
     return candidate if Path(candidate).exists() else None
 
 
+def test_softkey_panel_has_no_provenance_tooltip():
+    js = worker.REAL_CONSOLE_JS
+    assert "data.note" not in js, "the keymap provenance note must not be shown as a tooltip"
+    assert "getElementById('softkey').title" not in js
+
+
 def test_input_block_starts_as_one_button():
     html = worker.REAL_CONSOLE_HTML
     js = worker.REAL_CONSOLE_JS

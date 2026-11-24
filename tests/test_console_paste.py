@@ -18,6 +18,14 @@ def test_keymap_document_is_json_serialisable_and_matches_the_planner():
     assert doc["max_chars"] == text_input._MAX_CHARS
 
 
+def test_keymap_document_does_not_ship_internal_provenance_note():
+    doc = text_input.keymap_document()
+    assert "note" not in doc
+    encoded = json.dumps(doc, ensure_ascii=False)
+    for marker in ("阶段 28", "2026-11-16", "真机回读", "两次观察"):
+        assert marker not in encoded
+
+
 def test_every_mappable_character_has_a_hid_usage():
     doc = text_input.keymap_document()
     for char, level in doc["reliability"].items():

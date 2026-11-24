@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import sqlite3
@@ -23,6 +24,7 @@ from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,
 from kvmhub.platform.models import DEFAULT_TENANT_ID, Asset, Credential, User
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher, new_session_token, token_digest
+import sqlalchemy as sa
 from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -447,6 +449,45 @@ def _alembic(db_path: Path, *args: str) -> subprocess.CompletedProcess:
     env.pop("MYSQL_HOST", None)
     return subprocess.run([sys.executable, "-m", "alembic", "-c", "alembic.ini", *args],
                           cwd=str(ROOT), env=env, capture_output=True, text=True)
+
+
+def _public_ip_migration():
+    path = ROOT / "migrations" / "versions" / "0011_public_ip_alias_unique.py"
+    spec = importlib.util.spec_from_file_location("m0011_public_ip_alias", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_migration_0011_reports_legacy_duplicate_claims(capsys):
+    migration = _public_ip_migration()
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE kvm_public_ip (id TEXT PRIMARY KEY, tenant_id TEXT, "
+            "asset_id TEXT, primary_ip TEXT, additional_ips TEXT, "
+            "created REAL, updated REAL)")
+        conn.exec_driver_sql(
+            "CREATE TABLE kvm_public_ip_alias (id TEXT PRIMARY KEY, "
+            "tenant_id TEXT NOT NULL, ip TEXT NOT NULL, asset_id TEXT NOT NULL, "
+            "mapping_id TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL)")
+        conn.execute(migration._PUBLIC_IP.insert(), [
+            {"id": "m1", "tenant_id": "t1", "asset_id": "a1",
+             "primary_ip": "203.0.113.10", "additional_ips": "",
+             "created": 1.0, "updated": 1.0},
+            {"id": "m2", "tenant_id": "t1", "asset_id": "a2",
+             "primary_ip": "203.0.113.10", "additional_ips": "",
+             "created": 2.0, "updated": 2.0},
+        ])
+        migration.backfill_aliases(conn)
+
+    out = capsys.readouterr().out
+    assert "duplicate public IP claim" in out
+    assert "m2" in out
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(migration._ALIAS)).mappings().all()
+    assert len(rows) == 1 and rows[0]["mapping_id"] == "m1"
+    engine.dispose()
 
 
 def test_legacy_database_upgrades_in_place(tmp_path):

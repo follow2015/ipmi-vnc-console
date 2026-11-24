@@ -315,13 +315,6 @@ def keymap_document() -> dict:
         "left_shift_keysym": _X11_KEYSYM_BY_USAGE[LEFT_SHIFT],
         "levels": {"verified": VERIFIED, "unverified": UNVERIFIED,
                    "known_broken": KNOWN_BROKEN, "unsupported": UNSUPPORTED},
-        "note": ("verified 字符来自阶段 28 与 2026-11-16 的真机回读（后者是长命令输入框这条路）；"
-                 "unverified 是尚未核对，不是可用；known_broken 的竖线在两次观察里结果不一致"
-                 "（一次到达为 ↔、一次为正常竖线），未澄清前按不可用处理。"
-                 "Esc/F1-F12/方向键/Home/End/Del/Tab/Caps/Win/Alt 的 HID 编号是标准值，"
-                 "但主机侧效果尚未在真机核对，软键盘上按未核对显示；Shift/Ctrl/Enter/"
-                 "Backspace/Space 已在 2026-11-16 的软键盘路径上核对。"),
-
     }
 
 

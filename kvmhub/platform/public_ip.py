@@ -187,11 +187,24 @@ def rehome_mapping(session: Session, *, asset_id: str, tenant_id: str | None,
               tenant_id=previous, detail={"asset_id": asset_id}, now=stamp)
     elif row.tenant_id != tenant_id:
         previous = row.tenant_id
+        aliases = _alias_rows(session, row.id)
+        claimed = set(session.scalars(select(PublicIpAlias.ip).where(
+            PublicIpAlias.tenant_id == tenant_id,
+            PublicIpAlias.mapping_id != row.id)))
+        conflict = any(alias.ip in claimed for alias in aliases)
+        if conflict:
+            raise PlatformError("public_ip_conflict",
+                                "公网 IP 已被本租户其它资产占用", 409)
         row.tenant_id = tenant_id
         row.updated = stamp
-        for alias in _alias_rows(session, row.id):
+        for alias in aliases:
             alias.tenant_id = tenant_id
             alias.updated = stamp
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise PlatformError("public_ip_conflict",
+                                "公网 IP 已被本租户其它资产占用", 409) from exc
         audit(session, actor, "public_ip_rehomed", asset_id=asset_id,
               tenant_id=tenant_id, detail={"from": previous, "to": tenant_id},
               now=stamp)

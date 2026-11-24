@@ -132,6 +132,8 @@ class HuaweiKvmUpstream:
                     session_id = m.group(1)
                 if not token:
                     raise UpstreamError("bmc_token_missing", 401)
+        except aiohttp.ServerFingerprintMismatch as exc:
+            raise UpstreamError("bmc_cert_pin_mismatch") from exc
         except aiohttp.ClientError as exc:
             raise UpstreamError("bmc_unreachable") from exc
 
@@ -156,6 +158,8 @@ class HuaweiKvmUpstream:
                 if resp.status != 200:
                     raise UpstreamError("kvm_jnlp_download_failed", resp.status)
                 xml_text = await resp.text()
+        except aiohttp.ServerFingerprintMismatch as exc:
+            raise UpstreamError("bmc_cert_pin_mismatch") from exc
         except aiohttp.ClientError as exc:
             raise UpstreamError("kvm_jnlp_download_failed") from exc
         self.ticket = parse_jnlp(xml_text, self.host)
@@ -167,6 +171,8 @@ class HuaweiKvmUpstream:
             async with sess.post(url, json=body, headers=headers) as resp:
                 if resp.status != 200 and not optional:
                     raise UpstreamError("kvm_session_action_failed", resp.status)
+        except aiohttp.ServerFingerprintMismatch as exc:
+            raise UpstreamError("bmc_cert_pin_mismatch") from exc
         except aiohttp.ClientError as exc:
             if optional:
                 return
@@ -185,6 +191,8 @@ class HuaweiKvmUpstream:
             self._ws = await sess.ws_connect(
                 url, heartbeat=None, max_msg_size=MAX_FRAME_BYTES,
                 protocols=(), receive_timeout=HANDSHAKE_TIMEOUT)
+        except aiohttp.ServerFingerprintMismatch as exc:
+            raise UpstreamError("bmc_cert_pin_mismatch") from exc
         except aiohttp.ClientError as exc:
             raise UpstreamError("kvm_ws_connect_failed") from exc
 
@@ -260,6 +268,8 @@ class HuaweiKvmUpstream:
                         blocks, w, h, q = done
                         self.frame_count += 1
                         yield blocks, w, h, q
+        except aiohttp.ServerFingerprintMismatch as exc:
+            raise UpstreamError("bmc_cert_pin_mismatch") from exc
         except aiohttp.ClientError as exc:
             raise UpstreamError("kvm_stream_error") from exc
 

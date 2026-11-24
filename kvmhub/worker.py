@@ -181,21 +181,28 @@ body{margin:0;background:#0b1220;color:#e6eef8;font:15px/1.5 system-ui,sans-seri
    collapsed they used to eat the bottom of the window, forcing the picture
    to scale below 100% and making text fuzzy from interpolation. */
 #work{flex:1 1 auto;display:flex;flex-direction:column;min-width:0;min-height:0}
-header{display:flex;gap:14px;align-items:center;padding:10px 16px;background:#111c2e;border-bottom:1px solid #24344d}
-header strong{font-weight:600;white-space:nowrap}
-#status{color:#8fb6e8;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#frame-age{color:#7288a6;font-size:12px;white-space:nowrap}
+header{display:flex;gap:12px;align-items:center;padding:9px 16px;background:linear-gradient(180deg,#15233b,#111c2e);border-bottom:1px solid #2a3d5c}
+header strong{font-weight:650;font-size:15px;letter-spacing:.2px;white-space:nowrap}
+#status{color:#a8c8ef;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#162941;border:1px solid #2c4266;border-radius:20px;padding:2px 10px}
+#frame-age{color:#8298b8;font-size:12px;white-space:nowrap}
 #frame-age.stale{color:#e8c26a}
-#zoom{color:#7288a6;font-size:12px;white-space:nowrap}
+#zoom{color:#8298b8;font-size:12px;white-space:nowrap}
 #spacer{flex:1}
-#stage{flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:8px;min-height:0;position:relative;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+/* A faint grid plus a soft centre glow makes the wide side margins read as a
+   console workspace instead of dead black. Purely decorative: it changes no
+   box, no overflow and no pointer coordinate. */
+#stage{flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:8px;min-height:0;position:relative;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;background-color:#0b1220;background-image:linear-gradient(rgba(94,142,202,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(94,142,202,.045) 1px,transparent 1px),radial-gradient(ellipse 70% 65% at 50% 45%,#14233c 0%,rgba(11,18,32,0) 78%);background-size:32px 32px,32px 32px,100% 100%}
 /* Narrow phones cannot read a whole 1024px framebuffer (~31%); a short hint
    tells the operator how to zoom and pan the local view. It never eats input. */
 #phone-hint{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);background:rgba(9,18,34,.9);border:1px solid #3b5a86;border-radius:14px;padding:5px 12px;color:#cfe0f5;font-size:12px;white-space:nowrap;pointer-events:none;z-index:6;max-width:94vw;overflow:hidden;text-overflow:ellipsis}
 #phone-hint[hidden]{display:none}
 /* noVNC owns mouse/touch gestures on the framebuffer. Without touch-action:none
    the tablet scrolls or pinch-zooms the page instead of sending a mouse move. */
-canvas{background:#000;outline:none;flex:none;display:block;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+canvas{background:#000;outline:none;flex:none;display:block;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;box-shadow:0 0 0 1px #34486a,0 14px 38px rgba(0,0,0,.55)}
+/* The frame is drawn with box-shadow only: it gives the picture a physical
+   edge on a wide desktop without changing its box, so autoscale and the
+   vendor pointer math keep measuring exactly the same rectangle. */
+canvas:focus{box-shadow:0 0 0 1px #5a94d6,0 14px 38px rgba(0,0,0,.55)}
 /* The firmware reports a lost video signal itself. This overlay explains the
    black canvas instead of letting the operator blame the VNC link. It never
    eats pointer events: if the signal returns, the canvas still receives them. */
@@ -234,10 +241,14 @@ body.sheet-open #stage{margin-bottom:0}
 }
 button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap;touch-action:manipulation}
 button:hover{background:#25405f}
-footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+header #zoom-mode{background:#1b3454;border-color:#3b6a9e}
+header #close{background:#3a2027;border-color:#78414c;color:#ffd6d6}
+header #close:hover{background:#512b34}
+footer{padding:6px 16px;font-size:11px;color:#8298b8;background:#0e192b;border-top:1px solid #24344d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* The input block starts as a single button. Nothing inside it is loaded
    until that button is pressed: the picture gets the whole window first. */
-#input-bar{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;padding:8px 10px;background:#0e192b;border-bottom:1px solid #24344d;flex:0 0 auto}
+#input-bar{display:flex;gap:12px;align-items:center;justify-content:flex-start;flex-wrap:wrap;padding:8px 12px;background:linear-gradient(180deg,#132039,#0e192b);border-bottom:1px solid #24344d;flex:0 0 auto}
+#input-bar #input-toggle{background:#24456d;border-color:#4a7db5}
 #input-hint{font-size:12px;color:#7288a6;line-height:1.5}
 /* Two sibling tabs switch the sheet between the soft keyboard and the long
    command box. Only one is mounted at a time, so the text box stays in FULL
@@ -270,19 +281,25 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 #paste-danger{margin-top:6px;padding:6px 8px;border:1px solid #a33;border-radius:6px;background:#2a0f12;color:#ff9d9d;font:12px/1.5 ui-monospace,Consolas,monospace}
 #paste-danger:empty{display:none}#paste-danger strong{color:#ffd0d0}
 #pastebar button{padding:4px 10px;font-size:13px}#pastebar button:disabled{opacity:.45;cursor:not-allowed}
-#softkey{border-top:1px solid #24344d;background:#0a1424;padding:8px 12px 8px}
-#softkey .head{display:flex;gap:10px;align-items:center;font-size:12px;color:#7288a6;margin-bottom:6px}
-#softkey .head strong{color:#e6eef8;font-size:13px;white-space:nowrap}
+#softkey{border-top:1px solid #24344d;background:linear-gradient(180deg,#0d1a2e,#0a1424);padding:10px 12px 8px}
+#softkey .head{display:flex;gap:8px;align-items:center;font-size:12px;color:#7288a6;margin-bottom:8px}
+#softkey .head strong{color:#e6eef8;font-size:14px;white-space:nowrap}
 #softkey .head .grow{flex:1}
 #softkey .head .hint{color:#8a94a6}
+.sk-tag{font:11px/1.4 ui-monospace,Consolas,monospace;color:#8fb6e8;background:#162941;border:1px solid #2c4266;border-radius:10px;padding:1px 7px;white-space:nowrap}
+/* The caveat used to share the title row and wrapped into two cramped lines.
+   It gets its own callout; JS only swaps the inner span's hint/on classes. */
+.sk-note{margin-bottom:9px;padding:6px 9px;border:1px solid #2c4266;border-left:3px solid #4d8fd0;border-radius:6px;background:#101f35;font-size:12px;line-height:1.5}
+.sk-note .hint{color:#9ab4d6}
+.sk-note .hint.on{color:#7fe0a6;font-weight:600}
 #sk-modstate.on{color:#7fe0a6;font-weight:600}
 #input-hint{display:none}
 #softkey button{font:13px/1.2 ui-monospace,Consolas,monospace}
 #sk-body.hidden{display:none}
 /* Page tabs. The keyboard used to stack every group into one tiny grid;
    splitting into pages keeps each key large and the panel short. */
-.sktabs{display:flex;gap:4px;margin-bottom:8px;border-bottom:1px solid #24344d;padding-bottom:6px}
-.sktab{flex:1;padding:6px 2px;font:600 12px/1.2 system-ui,sans-serif;border:1px solid #2b4266;background:#12223a;color:#9ab4d6;border-radius:6px;min-height:32px}
+.sktabs{display:flex;gap:4px;margin-bottom:9px}
+.sktab{flex:1 1 0;min-width:0;padding:6px 2px;font:600 12px/1.2 system-ui,sans-serif;border:1px solid #2b4266;background:#12223a;color:#9ab4d6;border-radius:6px;min-height:32px}
 .sktab:hover{background:#1a2f4d}
 .sktab.on{background:#21528a;border-color:#3f7cc0;color:#fff;box-shadow:inset 0 -2px 0 #6fb0ff}
 #sk-body .skrow{display:none}
@@ -291,11 +308,14 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 #sk-body[data-page="func"] .skrow[data-skpage="func"],
 #sk-body[data-page="nav"] .skrow[data-skpage="nav"],
 #sk-body[data-page="macros"] .skrow[data-skpage="macros"]{display:flex}
-.skrow{flex-wrap:wrap;gap:5px;margin-bottom:5px}
+.skrow{flex-wrap:wrap;gap:4px;margin-bottom:5px}
 .skrow.macros{gap:6px;margin-bottom:2px}
 /* Keys share leftover width evenly; --u still widens space/shift. No
    ellipsis: a truncated label reads as a broken key. */
-.sk{flex:var(--u,1) 1 0;min-width:0;min-height:34px;padding:6px 2px;border:1px solid #36507a;background:#1b2f4d;color:#eaf1fb;border-radius:6px;cursor:pointer;text-align:center;transition:background .08s,transform .05s}
+/* A zero flex-basis plus nowrap buttons let the last keys of a row run past
+   the dock edge in Safari. Give every key a real minimum and wrap instead:
+   two shorter rows read better than one clipped row. */
+.sk{flex:var(--u,1) 1 30px;min-width:30px;box-sizing:border-box;min-height:34px;padding:6px 2px;border:1px solid #36507a;background:#1b2f4d;color:#eaf1fb;border-radius:6px;cursor:pointer;text-align:center;transition:background .08s,transform .05s}
 .sk:hover:enabled{background:#2a4a75}
 .sk:active:enabled{background:#37699f;transform:translateY(1px)}
 .sk:disabled{opacity:.4;cursor:not-allowed}
@@ -306,7 +326,13 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 .skrow.macros .sk{flex:0 0 auto;padding:6px 12px;background:#3a2a52;border-color:#6a4f9a;color:#f0e7ff;font-size:12px}
 .sk[data-level=unverified]{border-bottom:2px dotted #c8a24a}
 .sk[data-level=known_broken]{border-color:#b05148;color:#ffc9c4}
-#sk-status{font-size:12px;color:#8fb6e8;min-height:1.4em;margin-top:2px}
+#sk-status{font-size:12px;color:#8fb6e8;min-height:26px;margin-top:8px;padding:5px 9px;background:#0d1a2d;border:1px solid #24344d;border-radius:6px;box-sizing:border-box}
+/* The dock is full height on a wide desktop; without this the keyboard
+   occupies the top third and the rest reads as an unfinished empty column. */
+.sk-help{margin-top:14px;padding-top:12px;border-top:1px solid #24344d;font-size:12px;line-height:1.65;color:#8298b8}
+.sk-help strong{display:block;color:#a8c8ef;font-size:12px;margin-bottom:5px}
+.sk-help p{margin:0 0 4px;padding-left:12px;position:relative}
+.sk-help p::before{content:'›';position:absolute;left:0;color:#4d8fd0}
 /* Touch targets stay large and the iOS address bar must not trigger input
    zoom (all inputs are >=16px). */
 @media (pointer:coarse){
@@ -341,7 +367,8 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 <div id="paste-preview-box"></div><div id="paste-status"></div><div id="paste-danger"></div>
 </div>
 <div id="softkey">
-<div class="head"><strong>软键盘</strong><span class="hint" id="sk-modstate">画面上直接键入会丢 Shift · 请用下方按键输入</span><span class="grow"></span><button id="softkey-toggle">收起</button></div>
+<div class="head"><strong>软键盘</strong><span class="sk-tag">US QWERTY</span><span class="grow"></span><button id="softkey-toggle">收起键盘</button></div>
+<div class="sk-note"><span class="hint" id="sk-modstate">画面上直接键入会丢 Shift · 请用下方按键输入</span></div>
 <div class="sktabs" id="sk-tabs"><button type="button" class="sktab on" data-skpage="chars">字符</button><button type="button" class="sktab" data-skpage="symbols">符号</button><button type="button" class="sktab" data-skpage="func">功能</button><button type="button" class="sktab" data-skpage="nav">导航</button><button type="button" class="sktab" data-skpage="macros">宏</button></div>
 <div id="sk-body">
 <div class="skrow macros" id="sk-macros" data-skpage="macros"></div>
@@ -385,6 +412,12 @@ footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344
 <button type="button" class="sk" data-send="ins">Ins</button><button type="button" class="sk" data-send="home">Home</button><button type="button" class="sk" data-send="pgup">PgUp</button><button type="button" class="sk" data-send="pgdn">PgDn</button><button type="button" class="sk" data-send="del">Del</button><button type="button" class="sk" data-send="end">End</button><button type="button" class="sk" data-send="left">&#8592;</button><button type="button" class="sk" data-send="down">&#8595;</button><button type="button" class="sk" data-send="up">&#8593;</button><button type="button" class="sk" data-send="right">&#8594;</button>
 </div>
 <div id="sk-status"></div>
+<div class="sk-help">
+<strong>操作提示</strong>
+<p>修饰键点亮后再点目标键，再点一次修饰键取消。</p>
+<p>「长命令」页可粘贴文本：先预检，再发送，随时可停止。</p>
+<p>画面只转发键鼠；电源与重置不在本页提供。</p>
+</div>
 </div>
 </div>
 </div>
@@ -1194,12 +1227,8 @@ REAL_CONSOLE_JS = """'use strict';
         return;
       }
       pasteKeymap = data;
-      // The long provenance note belongs in a tooltip, not in the status line:
-      // three lines of it push the picture up and the operator stops reading it
-      // after the first session.
       pasteStatusText('键位表已加载：' + Object.keys(data.keys).length + ' 个非字符键、'
         + (data.macros || []).length + ' 个快捷键；字符可靠性见逐字着色');
-      document.getElementById('softkey').title = data.note;
       pasteSendBtn.disabled = !pastePlan || pastePlan.strokes.length === 0;
       skApplyTable();
       skRenderMacros();
@@ -1416,7 +1445,7 @@ REAL_CONSOLE_JS = """'use strict';
   function skSetOpen(open) {
     if (open) skBody.classList.remove('hidden');
     else skBody.classList.add('hidden');
-    skToggle.textContent = open ? '收起' : '展开';
+    skToggle.textContent = open ? '收起键盘' : '展开键盘';
   }
   // First visit: open the keyboard only where it leaves room for the picture.
   // A remembered choice always wins, so an operator who collapsed it stays
@@ -1464,7 +1493,7 @@ REAL_CONSOLE_JS = """'use strict';
   // the buttons cannot be pressed before the table that defines them exists.
   inputToggle.onclick = function () {
     var collapsed = inputPanel.classList.toggle('collapsed');
-    inputToggle.textContent = collapsed ? '⌨ 输入' : '⌨ 收起';
+    inputToggle.textContent = collapsed ? '⌨ 输入' : '⌨ 收起面板';
     // The sheet shares the window with the picture: when it opens the stage
     // gives up the same height so the framebuffer scales into the top area and
     // stays fully visible (never hidden behind the keyboard).

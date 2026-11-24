@@ -37,6 +37,33 @@ _ALIAS = sa.table(
 )
 
 
+def backfill_aliases(conn) -> None:
+    claimed: set[tuple[str, str]] = set()
+    rows = conn.execute(sa.select(
+        _PUBLIC_IP.c.id, _PUBLIC_IP.c.tenant_id, _PUBLIC_IP.c.asset_id,
+        _PUBLIC_IP.c.primary_ip, _PUBLIC_IP.c.additional_ips,
+        _PUBLIC_IP.c.created, _PUBLIC_IP.c.updated).order_by(
+            _PUBLIC_IP.c.created, _PUBLIC_IP.c.id)).mappings()
+    for row in rows:
+        values = [row.primary_ip or ""]
+        values.extend(part.strip() for part in _SPLIT.split(row.additional_ips or ""))
+        for value in values:
+            ip = value.strip().lower()
+            if not ip:
+                continue
+            key = (row.tenant_id, ip)
+            if key in claimed:
+                print(f"WARNING: duplicate public IP claim ip={ip!r} "
+                      f"tenant={row.tenant_id!r} mapping={row.id!r} skipped; "
+                      "alias uniqueness guard does not cover this mapping")
+                continue
+            claimed.add(key)
+            conn.execute(_ALIAS.insert().values(
+                id=str(uuid.uuid4()), tenant_id=row.tenant_id, ip=ip,
+                asset_id=row.asset_id, mapping_id=row.id,
+                created=row.created or 0.0, updated=row.updated or 0.0))
+
+
 def upgrade() -> None:
     op.create_table(
         "kvm_public_ip_alias",
@@ -57,28 +84,7 @@ def upgrade() -> None:
     op.create_index("ix_kvm_public_ip_alias_asset", "kvm_public_ip_alias",
                     ["asset_id"])
 
-    conn = op.get_bind()
-    claimed: set[tuple[str, str]] = set()
-    rows = conn.execute(sa.select(
-        _PUBLIC_IP.c.id, _PUBLIC_IP.c.tenant_id, _PUBLIC_IP.c.asset_id,
-        _PUBLIC_IP.c.primary_ip, _PUBLIC_IP.c.additional_ips,
-        _PUBLIC_IP.c.created, _PUBLIC_IP.c.updated).order_by(
-            _PUBLIC_IP.c.created, _PUBLIC_IP.c.id)).mappings()
-    for row in rows:
-        values = [row.primary_ip or ""]
-        values.extend(part.strip() for part in _SPLIT.split(row.additional_ips or ""))
-        for value in values:
-            ip = value.strip().lower()
-            if not ip:
-                continue
-            key = (row.tenant_id, ip)
-            if key in claimed:
-                continue
-            claimed.add(key)
-            conn.execute(_ALIAS.insert().values(
-                id=str(uuid.uuid4()), tenant_id=row.tenant_id, ip=ip,
-                asset_id=row.asset_id, mapping_id=row.id,
-                created=row.created or 0.0, updated=row.updated or 0.0))
+    backfill_aliases(op.get_bind())
 
 
 def downgrade() -> None:

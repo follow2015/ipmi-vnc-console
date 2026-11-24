@@ -118,6 +118,8 @@ class Settings:
             for item in self.integration_trusted_proxies.split(","):
                 if item.strip():
                     ipaddress.ip_network(item.strip(), strict=False)
+        if self.is_prod and not self.bmc_allowed_networks:
+            raise ValueError("KVMHUB_BMC_ALLOWED_NETWORKS must be configured in production")
         if self.bmc_allowed_networks:
             import ipaddress
             for item in self.bmc_allowed_networks.split(","):

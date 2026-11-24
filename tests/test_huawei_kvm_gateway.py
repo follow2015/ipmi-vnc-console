@@ -142,6 +142,39 @@ def test_connect_pins_credentials_session_without_second_preflight(monkeypatch):
     assert seen["ssl"].fingerprint == bytes.fromhex(TEST_PIN)
 
 
+def test_connect_reports_certificate_mismatch_distinct_from_unreachable(tmp_path):
+    from kvmhub import huawei_kvm_upstream as U
+
+    ctx, _ = _self_signed_cert(tmp_path)
+
+    async def handle(reader, writer):
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                         b"Connection: close\r\n\r\nok")
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def run():
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+        port = server.sockets[0].getsockname()[1]
+        up = U.HuaweiKvmUpstream("127.0.0.1", "admin", "synthetic-password",
+                                 port=port, tls_pin="00" * 32)
+        up.host = f"127.0.0.1:{port}"
+        try:
+            with pytest.raises(U.UpstreamError) as excinfo:
+                await up.connect()
+            assert excinfo.value.code == "bmc_cert_pin_mismatch"
+            assert excinfo.value.status == 502
+        finally:
+            server.close()
+            await server.wait_closed()
+            await up.close()
+
+    asyncio.run(run())
+
+
 def test_pinned_connector_rejects_wrong_certificate_on_real_tls(tmp_path):
     from kvmhub import huawei_kvm_upstream as U
 

@@ -6,6 +6,7 @@ import argparse
 import datetime
 import ipaddress
 import json
+import os
 from pathlib import Path
 
 from cryptography import x509
@@ -20,8 +21,16 @@ def load_key(path: Path):
 
 def save(path: Path, data: bytes) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.chmod(0o600)
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(path)
 
 

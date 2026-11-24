@@ -1,11 +1,14 @@
 """Renewal must re-sign certs in place without rotating any secret or identity."""
 import datetime
 import json
+import stat
+from pathlib import Path
 
 from cryptography import x509
 
 from tools.bootstrap import generate
 from tools.renew_gateway_certs import main as renew_main
+from tools.renew_gateway_certs import save as renew_save
 
 
 def _not_after(path):
@@ -14,6 +17,19 @@ def _not_after(path):
 
 def _ca_public_numbers(cert_bytes):
     return x509.load_pem_x509_certificate(cert_bytes).public_key().public_numbers()
+
+
+def test_private_key_is_created_0600_without_a_post_write_chmod(tmp_path, monkeypatch):
+    target = tmp_path / "ca.key"
+
+    def forbidden_chmod(*args, **kwargs):
+        raise AssertionError("private key must be created 0600, not chmodded after write")
+
+    monkeypatch.setattr(Path, "chmod", forbidden_chmod)
+    renew_save(target, b"new-ca-private-key")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_renew_extends_validity_keeps_keys_and_identity(tmp_path, capsys):
