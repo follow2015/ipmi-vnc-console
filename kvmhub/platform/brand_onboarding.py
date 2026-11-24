@@ -14,14 +14,15 @@ from sqlalchemy.orm import Session
 from . import services
 from .data_plane import _template_regex
 from ..capability import parse_logout_path
-from ..common import (HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+from ..common import (ATEN_JAVA_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
                       IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID)
 from ..rfb_protocol import PROTOCOLS
 from .models import PROFILE_DRAFT, VendorProfile, json_field
 
 MESSAGE_PROFILES = frozenset({"standard", "insyde", "smc"})
 CONSOLE_IMPLS = frozenset({"passthrough", IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
-                           HUAWEI_IBMC_VNC_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID})
+                           HUAWEI_IBMC_VNC_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID,
+                           ATEN_JAVA_ADAPTER_ID})
 RFB_GREETING = re.compile(r"^RFB \d{3}\.\d{3}$")
 CODE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 

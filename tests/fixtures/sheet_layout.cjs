@@ -60,13 +60,13 @@ async function main() {
   await page.waitForFunction(() => parseFloat(document.getElementById('stage')?.getAttribute('data-scale') || '0') > 0,
     null, { timeout: 20000 });
   const before = await page.evaluate(() => {
-    const b = id => { const r = document.getElementById(id).getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), t: Math.round(r.top), b: Math.round(r.bottom) }; };
+    const b = id => { const r = document.getElementById(id).getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), t: Math.round(r.top), b: Math.round(r.bottom), l: Math.round(r.left), r: Math.round(r.right) }; };
     return { stage: b('stage'), canvas: b('screen'), panel: b('inputpanel') };
   });
   await page.evaluate(() => document.getElementById('input-toggle').click());
   await page.waitForTimeout(250);
   const after = await page.evaluate(() => {
-    const b = id => { const r = document.getElementById(id).getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), t: Math.round(r.top), b: Math.round(r.bottom) }; };
+    const b = id => { const r = document.getElementById(id).getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), t: Math.round(r.top), b: Math.round(r.bottom), l: Math.round(r.left), r: Math.round(r.right) }; };
     const soft = document.getElementById('softkey');
     const paste = document.getElementById('pastebar');
     return {

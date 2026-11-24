@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
-from .common import (HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+from .common import (ATEN_JAVA_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
                      IDRAC8_ADAPTER_ID,
                      IDRAC_VNC_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID, Problem,
                      bmc_allowed_networks_from_env, parse_controlled_networks)
@@ -603,12 +603,12 @@ class Store:
             return True
         if row["adapter"] not in (PASSTHROUGH_ADAPTER_ID, IDRAC8_ADAPTER_ID,
                                   IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                                  HUAWEI_IBMC_KVM_GATEWAY_ID):
+                                  HUAWEI_IBMC_KVM_GATEWAY_ID, ATEN_JAVA_ADAPTER_ID):
             return False
         if row["target"] not in self.passthrough_targets:
             return False
         if row["adapter"] in (IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                              HUAWEI_IBMC_KVM_GATEWAY_ID):
+                              HUAWEI_IBMC_KVM_GATEWAY_ID, ATEN_JAVA_ADAPTER_ID):
             import ipaddress
             from urllib.parse import urlsplit
             host = urlsplit(str(row["target"])).hostname

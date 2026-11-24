@@ -59,6 +59,15 @@ def test_real_console_page_has_the_input_box_and_loads_the_keymap():
     assert js.count("new RFB(") == 1
 
 
+def test_out_pump_arms_a_tick_after_the_final_frame():
+    js = worker.REAL_CONSOLE_JS
+    start = js.index("function outPump()")
+    block = js[start:js.index("function pasteSend()", start)]
+    assert "outTimer = setTimeout(step, item.delay || 0);" in block
+    assert "发送完成：' + pasteTotal" in js
+    assert "clearTimeout(outTimer); outTimer = null;" in js
+
+
 def test_worker_serves_the_keymap_route_from_the_single_source():
     source = worker.__file__
     with open(source, encoding="utf-8") as handle:

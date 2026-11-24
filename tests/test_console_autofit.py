@@ -46,8 +46,10 @@ def test_the_input_panel_is_one_shared_bottom_sheet():
     rule = _rule(worker.REAL_CONSOLE_HTML, "#inputpanel")
     html = worker.REAL_CONSOLE_HTML
     assert "position:fixed" in rule and "bottom:0" in rule, \
-        "the panel is a fixed bottom sheet on all devices"
-    assert "left:0;right:0" in rule, "the expanded sheet spans the full width"
+        "the panel is a fixed bottom sheet by default"
+    assert "left:0;right:0" in rule, "the expanded sheet spans the full width by default"
+    assert "@media (min-width:1100px)" in html, \
+        "wide desktops need a side dock to keep the picture readable"
     assert ":root{--sheet-h:min(48vh,430px)}" in html, \
         "one variable drives the sheet height on every resolution"
     assert "body.sheet-open #stage{margin-bottom:var(--sheet-h)}" in html, \

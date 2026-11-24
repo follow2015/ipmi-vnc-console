@@ -292,6 +292,82 @@ def read_credential(session: Session, cipher: CredentialCipher, credential_id: s
             "password": cipher.decrypt(cred.password_cipher, aad=cred.id + ":password")}
 
 
+
+
+def save_vnc_secret(session: Session, cipher: CredentialCipher, *, asset_id: str,
+                    username: str, password: str, actor: str,
+                    now: float | None = None,
+                    tenant_id: str | None = DEFAULT_TENANT_ID) -> Asset:
+    if not cipher.available:
+        raise PlatformError("credential_key_missing", "凭据主密钥未配置，无法写入 VNC 凭据", 503)
+    if not username or not password:
+        raise PlatformError("invalid_vnc_credential", "VNC 账号与口令均不能为空")
+    asset = session.get(Asset, asset_id)
+    if asset is None:
+        raise PlatformError("asset_not_found", "资产不存在", 404)
+    if tenant_id is not None and asset.tenant_id != tenant_id:
+        raise PlatformError("cross_tenant_asset", "资产不属于当前租户", 403)
+    stamp = time.time() if now is None else now
+    asset.vnc_username_cipher = cipher.encrypt(username, aad=asset.id + ":vnc_username")
+    asset.vnc_password_cipher = cipher.encrypt(password, aad=asset.id + ":vnc_password")
+    asset.vnc_key_version = 1
+    asset.updated = stamp
+    audit(session, actor, "vnc_secret_saved", asset_id=asset.id,
+          tenant_id=asset.tenant_id,
+          detail={"key_version": 1, "credential_id_unchanged": True}, now=stamp)
+    session.commit()
+    return asset
+
+
+def clear_vnc_secret(session: Session, *, asset_id: str, actor: str,
+                     now: float | None = None,
+                     tenant_id: str | None = DEFAULT_TENANT_ID) -> Asset:
+    asset = session.get(Asset, asset_id)
+    if asset is None:
+        raise PlatformError("asset_not_found", "资产不存在", 404)
+    if tenant_id is not None and asset.tenant_id != tenant_id:
+        raise PlatformError("cross_tenant_asset", "资产不属于当前租户", 403)
+    stamp = time.time() if now is None else now
+    asset.vnc_username_cipher = None
+    asset.vnc_password_cipher = None
+    asset.vnc_key_version = 1
+    asset.updated = stamp
+    audit(session, actor, "vnc_secret_cleared", asset_id=asset.id,
+          tenant_id=asset.tenant_id, now=stamp)
+    session.commit()
+    return asset
+
+
+def has_vnc_secret(asset: Asset) -> bool:
+    return bool(asset.vnc_username_cipher and asset.vnc_password_cipher)
+
+
+def read_vnc_secret(session: Session, cipher: CredentialCipher, asset_id: str,
+                    *, tenant_id: str | None = DEFAULT_TENANT_ID) -> dict:
+    asset = session.get(Asset, asset_id)
+    if asset is None:
+        raise PlatformError("asset_not_found", "资产不存在", 404)
+    if tenant_id is not None and asset.tenant_id != tenant_id:
+        raise PlatformError("cross_tenant_asset", "资产不属于当前租户", 403)
+    if not has_vnc_secret(asset):
+        raise PlatformError("vnc_secret_not_found", "该资产未配置隐藏 VNC 凭据", 404)
+    if not cipher.available:
+        raise PlatformError("credential_key_missing", "凭据主密钥未配置", 503)
+    return {
+        "username": cipher.decrypt(asset.vnc_username_cipher, aad=asset.id + ":vnc_username"),
+        "password": cipher.decrypt(asset.vnc_password_cipher, aad=asset.id + ":vnc_password"),
+    }
+
+
+def select_sync_secret(session: Session, cipher: CredentialCipher, asset: Asset,
+                       *, tenant_id: str | None = DEFAULT_TENANT_ID) -> tuple[dict, str]:
+    if has_vnc_secret(asset):
+        return read_vnc_secret(session, cipher, asset.id, tenant_id=tenant_id), "vnc_hidden"
+    if not asset.credential_id:
+        raise PlatformError("credential_missing", "资产未绑定 BMC 凭据", 404)
+    return read_credential(session, cipher, asset.credential_id, tenant_id=tenant_id), "bmc"
+
+
 def _assert_owned_refs(session: Session, tenant_id: str, *,
                        credential: str | None, profile: str | None,
                        capability: str | None) -> None:

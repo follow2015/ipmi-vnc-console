@@ -17,6 +17,7 @@ from . import common
 from .adapter import MockAdapter
 from .adapters.idrac8 import Idrac8Adapter
 from .adapters.idrac_vnc import IdracVncAdapter
+from .adapters.aten_java import AtenJavaAdapter
 from .adapters.huawei_ibmc_vnc import HuaweiIbmcVncAdapter
 from .adapters.huawei_ibmc_kvm_gateway import HuaweiIbmcKvmGatewayAdapter
 from .adapters.passthrough import ASSET_PATH as PASSTHROUGH_ASSET_PATH
@@ -218,6 +219,19 @@ canvas{background:#000;outline:none;flex:none;display:block;touch-action:none;-w
 #inputpanel.collapsed #input-toggle{padding:10px 20px}
 #inputpanel.collapsed #input-hint{display:none}
 body.sheet-open #stage{margin-bottom:var(--sheet-h)}
+/* Wide desktop: dock the input panel on the right instead of the bottom. A
+   bottom sheet steals ~430px of height on a 850px window, which squeezed a
+   1024x768 framebuffer down to ~46% -- the terminal text was unreadable. On a
+   wide window there is spare width: the panel takes a fixed side column and
+   the picture keeps the whole window height (~100% at 1:1). Narrow and touch
+   devices keep the single bottom sheet above, so a phone never gets squeezed
+   into a ~108px strip. */
+@media (min-width:1100px){
+:root{--dock-w:340px}
+body.sheet-open #work{margin-right:var(--dock-w)}
+body.sheet-open #stage{margin-bottom:0}
+#inputpanel:not(.collapsed){left:auto;right:0;top:0;bottom:0;width:var(--dock-w);height:auto;border-top:0;border-left:1px solid #3b5a86;box-shadow:-8px 0 26px rgba(0,0,0,.55)}
+}
 button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid #3b5a86;background:#1d2f4a;color:#e6eef8;cursor:pointer;white-space:nowrap;touch-action:manipulation}
 button:hover{background:#25405f}
 footer{padding:5px 16px;font-size:11px;color:#7288a6;border-top:1px solid #24344d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1081,7 +1095,12 @@ REAL_CONSOLE_JS = """'use strict';
           pasteStatusText('发送中 ' + pasteSent + '/' + pasteTotal + ' 帧');
         }
       }
-      if (outQueue.length) outTimer = setTimeout(step, item.delay);
+      // Always arm the next tick, including after the FINAL frame. The
+      // empty-queue branch at the top of step() is what reports "发送完成"
+      // and re-enables the button; without this trailing tick the last frame
+      // left pasteActive true and the page hung at "发送中 N/N 帧" forever,
+      // even though the bytes had already reached the host.
+      outTimer = setTimeout(step, item.delay || 0);
     }
   }
   function pasteSend() {
@@ -1355,6 +1374,10 @@ REAL_CONSOLE_JS = """'use strict';
   // Buttons stay disabled until the table is here and the console is live: a
   // click that silently does nothing reads as "the keyboard is broken".
   function skSync() {
+    // A retry starts RFB synchronously before the input panel below has
+    // initialized. Some vendor constructors immediately report "loaded";
+    // defer this first sync until skKeys exists instead of aborting reconnect.
+    if (!skKeys) return;
     var live = !!pasteKeymap && pasteReady();
     skKeys.forEach(function (button) {
       if (button.getAttribute('data-level') === 'unsupported') return;
@@ -1772,6 +1795,8 @@ def make_adapter(info):
         return HuaweiIbmcVncAdapter(info)
     if info["adapter"] == common.HUAWEI_IBMC_KVM_GATEWAY_ID:
         return HuaweiIbmcKvmGatewayAdapter(info)
+    if info["adapter"] == common.ATEN_JAVA_ADAPTER_ID:
+        return AtenJavaAdapter(info)
     raise Problem("adapter_not_verified", 403)
 
 
@@ -1788,6 +1813,7 @@ class Runtime:
     adapter: object
     lease_end: float
     asset_id: str = ""
+    display_address: str = ""
     ws: set = field(default_factory=set)
     closing: bool = False
     close_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -2149,7 +2175,8 @@ class Gateway:
                 result = await self.call(claims["sid"], "active")
             cookie = secrets.token_urlsafe(32)
             sess = Runtime(claims["sid"], digest(cookie), adapter, sent + result["lease_seconds"],
-                           asset_id=str(claims.get("aid") or info.get("asset_id") or ""))
+                           asset_id=str(claims.get("aid") or info.get("asset_id") or ""),
+                           display_address=str(info.get("display_address") or ""))
             sess.machine.to(Phase.LIVE, "activated")
             self.sessions[sess.sid] = sess
             task = asyncio.create_task(self.lease_watchdog(sess))
@@ -2190,7 +2217,7 @@ class Gateway:
         if not offered and isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
                                                       IdracVncAdapter,
                                                       HuaweiIbmcVncAdapter,
-                                                      HuaweiIbmcKvmGatewayAdapter)):
+                                                      HuaweiIbmcKvmGatewayAdapter, AtenJavaAdapter)):
             offered = ["binary"]
         if "binary" not in offered:
             raise Problem("subprotocol_required", 400)
@@ -2299,7 +2326,8 @@ class Gateway:
             cfg = getattr(sess.adapter, "cfg", None)
             host = (getattr(cfg, "host", "") if cfg is not None
                     else getattr(sess.adapter, "host", ""))
-            return web.json_response({"address": host or "未接入",
+            label = getattr(sess, "display_address", "") or host
+            return web.json_response({"address": label or "未接入",
                                       "asset_id": getattr(sess, "asset_id", ""),
                                       "input_protocol": input_protocol_for_adapter(sess.adapter)})
         if request.method != "GET" or request.query_string:
@@ -2307,7 +2335,7 @@ class Gateway:
         real = isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
                                         IdracVncAdapter,
                                         HuaweiIbmcVncAdapter,
-                                        HuaweiIbmcKvmGatewayAdapter))
+                                        HuaweiIbmcKvmGatewayAdapter, AtenJavaAdapter))
         asset_pattern = getattr(sess.adapter, "asset_pattern", PASSTHROUGH_ASSET_PATH)
         if real and asset_pattern.fullmatch(path):
             content_type, body = await sess.adapter.fetch_asset(path)

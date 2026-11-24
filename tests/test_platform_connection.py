@@ -11,7 +11,7 @@ from sqlalchemy import delete as sa_delete, select
 
 from kvmhub import capability as poc_capability
 from kvmhub.common import IDRAC8_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID
-from kvmhub.platform import connection, services, vendor_registry
+from kvmhub.platform import connection, public_ip, services, vendor_registry
 from kvmhub.platform.api import create_app
 from kvmhub.platform.config import Settings
 from kvmhub.platform.db import (init_schema, make_engine, seed_roles,
@@ -140,6 +140,24 @@ def test_idrac8_profile_produces_the_idrac8_data_plane_adapter(world):
     assert result["plan"]["console_impl"] == IDRAC8_ADAPTER_ID
 
 
+def test_aten_java_profile_keeps_its_adapter_and_insyde_layout(world):
+    from kvmhub.common import ATEN_JAVA_ADAPTER_ID
+    from kvmhub.platform.data_plane import assembled_info
+    with transaction(world.factory) as db:
+        profile = connection.approved_profile(db, PROFILE_CODE)
+        profile.console_impl = ATEN_JAVA_ADAPTER_ID
+        db.flush()
+        asset = db.get(Asset, world.ids["asset"])
+        result = connection.assembly(db, asset_id=asset.id, user_id=world.ids["admin"], actor="admin")
+        assert result["data_plane"]["adapter"] == ATEN_JAVA_ADAPTER_ID
+        info = assembled_info({"adapter": ATEN_JAVA_ADAPTER_ID}, result)
+        assert info["protocol_versions"] == ("RFB 003.008",)
+        assert info["message_profile"] == "insyde"
+        profile.status = "draft"
+        db.flush()
+        _refused(lambda: connection.capability_entry(profile, asset=asset), "profile_not_approved")
+
+
 def test_entry_is_accepted_and_approved_by_the_real_poc_store(world):
     entry = _entry(world)
     store = Store(":memory:")
@@ -173,6 +191,19 @@ def test_assembly_is_ready_and_never_exposes_the_credential(world):
                                 "credential": "by_id_only"}
     assert result["credential_id"] == world.ids["credential"]
     assert BMC_PASSWORD not in str(result) and "ADMIN" not in str(result)
+
+
+def test_assembly_carries_the_public_alias_as_display_address(world):
+    with transaction(world.factory) as db:
+        public_ip.upsert_public_ip(db, tenant_id=db.get(Asset, world.ids["asset"]).tenant_id,
+                                   asset_id=world.ids["asset"], raw="198.51.100.77, 198.51.100.78",
+                                   actor="admin")
+        result = connection.assembly(db, asset_id=world.ids["asset"],
+                                     user_id=world.ids["admin"], actor="admin")
+    assert result["display_address"] == "198.51.100.77"
+    assert result["address"] == "192.0.2.11"
+    from kvmhub.platform.data_plane import assembled_info
+    assert assembled_info({}, result)["display_address"] == "198.51.100.77"
 
 
 def test_a_viewer_cannot_assemble_without_console_open(world):

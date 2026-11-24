@@ -51,14 +51,25 @@ async function main() {
           emit(type, event) { (listeners[type] || []).forEach((fn) => fn(event)); },
         };
         this._sock = { _websocket: raw, send() {} };
+        this.options.onUpdateState(this, 'loaded', 'disconnected', 'ready');
       }
       connect() {
-        this._rfb_state = 'normal';
-        this.options.onUpdateState(this, 'normal', 'connecting', '');
+        setTimeout(() => {
+          this._rfb_state = 'normal';
+          this.options.onUpdateState(this, 'normal', 'connecting', '');
+        }, 0);
       }
       disconnect() { this._rfb_state = 'disconnected'; }
     };
   });
+
+  if (opt('retry', '0') === '1') {
+    await page.addInitScript(() => {
+      const sid = location.host;
+      sessionStorage.setItem('__kvm_recovery_v2_' + sid,
+        JSON.stringify({ sid, attempts: 1, total: 1 }));
+    });
+  }
 
   const read = () => page.evaluate(() => {
     const el = document.getElementById('frame-age');
@@ -80,7 +91,8 @@ async function main() {
   await page.waitForTimeout(1300);
   steps.push({ step: 'quiet-again', ...(await read()) });
 
-  console.log(JSON.stringify({ steps, errors }));
+  const health = await page.evaluate(() => window.__kvm_health);
+  console.log(JSON.stringify({ steps, errors, health }));
   await browser.close();
 }
 

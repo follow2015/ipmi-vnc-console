@@ -165,6 +165,7 @@ class ConsolePlane:
                 document = {
                     "asset_id": asset_id,
                     "tenant_id": tenant_id,
+                    "display_address": assembly.get("display_address"),
                     "profile": assembly.get("profile"),
                     "plan": assembly.get("plan"),
                     "data_plane": assembly.get("data_plane"),

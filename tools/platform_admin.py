@@ -156,6 +156,28 @@ def cmd_add_credential(args):
         print(json.dumps(cred.public(), ensure_ascii=False))
 
 
+def cmd_set_vnc_secret(args):
+    _, _, factory, cipher = _context(args)
+    with transaction(factory) as db:
+        asset = services.save_vnc_secret(
+            db, cipher, asset_id=args.asset,
+            username=_required_env("VNC_USER"),
+            password=_required_env("VNC_PASSWORD"),
+            actor=args.actor, tenant_id=None)
+        print(json.dumps({"ok": True, "asset_id": asset.id,
+                          "vnc_secret_set": True, "credential_id": asset.credential_id},
+                         ensure_ascii=False))
+
+
+def cmd_clear_vnc_secret(args):
+    _, _, factory, _ = _context(args)
+    with transaction(factory) as db:
+        asset = services.clear_vnc_secret(db, asset_id=args.asset,
+                                          actor=args.actor, tenant_id=None)
+        print(json.dumps({"ok": True, "asset_id": asset.id,
+                          "vnc_secret_set": False}, ensure_ascii=False))
+
+
 def cmd_add_asset(args):
     _, _, factory, _ = _context(args)
     with transaction(factory) as db:
@@ -504,17 +526,19 @@ def cmd_sync_data_plane(args):
             users = [args.user] if args.user else grants
             target = asset.address if "://" in asset.address else f"https://{asset.address}"
             targets.append(target)
+            secret, secret_source = services.select_sync_secret(
+                db, cipher, asset, tenant_id=asset.tenant_id)
             plan.append({"asset_id": asset.id, "name": asset.name,
                          "vendor": asset.vendor, "model": asset.model,
                          "firmware": asset.firmware, "fingerprint": asset.fingerprint,
                          "target": target, "entry": entry, "users": users,
-                         "secret": services.read_credential(db, cipher, asset.credential_id,
-                                                            tenant_id=asset.tenant_id),
+                         "secret": secret,
                          "licence": profile.licence,
                          "console_impl": profile.console_impl or "passthrough"})
             services.audit(db, args.actor, "data_plane_sync_planned", asset_id=asset.id,
                            tenant_id=asset.tenant_id,
-                           detail={"capability_entry": entry["id"], "users": users}, now=stamp)
+                           detail={"capability_entry": entry["id"], "users": users,
+                                   "secret_source": secret_source}, now=stamp)
     summary = {"dry_run": bool(args.dry_run), "store": str(args.store),
                "synced": [{"asset": p["asset_id"], "capability": p["entry"]["id"],
                            "users": len(p["users"]), "target": p["target"]} for p in plan],
@@ -634,6 +658,12 @@ def parser():
                    help="mint a strong password locally and print it once; no env var needed")
     q.set_defaults(fn=cmd_reset_password)
     q = sub.add_parser("add-credential"); q.add_argument("--label", required=True); q.set_defaults(fn=cmd_add_credential)
+    q = sub.add_parser("set-vnc-secret", help="store a hidden VNC-only account on an asset (VNC_USER/VNC_PASSWORD env)")
+    q.add_argument("--asset", required=True, help="asset row id")
+    q.set_defaults(fn=cmd_set_vnc_secret)
+    q = sub.add_parser("clear-vnc-secret", help="remove an asset's hidden VNC secret (fall back to BMC credential)")
+    q.add_argument("--asset", required=True, help="asset row id")
+    q.set_defaults(fn=cmd_clear_vnc_secret)
     q = sub.add_parser("add-asset")
     for name in ("name", "address"):
         q.add_argument("--" + name, required=True)

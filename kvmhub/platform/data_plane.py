@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 
 from .. import capability as poc_capability
-from ..common import (HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
+from ..common import (ATEN_JAVA_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
                       IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
                       PASSTHROUGH_ADAPTER_ID, Problem)
 from ..rfb_protocol import PROTOCOLS
@@ -102,7 +102,7 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
     plan = assembly.get("plan") or {}
     allowed_adapters = (PASSTHROUGH_ADAPTER_ID, IDRAC8_ADAPTER_ID,
                         IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                        HUAWEI_IBMC_KVM_GATEWAY_ID)
+                        HUAWEI_IBMC_KVM_GATEWAY_ID, ATEN_JAVA_ADAPTER_ID)
     if data_plane.get("adapter") not in (None, *allowed_adapters):
         raise Problem("invalid_target_policy", 502)
     if entry.get("adapter") and entry["adapter"] not in allowed_adapters:
@@ -149,5 +149,6 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
         "protocol": protocol,
         "assembly_id": assembly.get("assembly_id"),
         "assembly_profile": (assembly.get("profile") or {}).get("code"),
+        "display_address": assembly.get("display_address"),
     })
     return result

@@ -54,7 +54,8 @@ def test_the_indicator_marks_a_long_silence_without_calling_it_a_failure():
     assert "链路" in worker.REAL_CONSOLE_HTML or "链路" in js
 
 
-def test_the_indicator_goes_quiet_and_recovers():
+@pytest.mark.parametrize("retry", [False, True])
+def test_the_indicator_goes_quiet_and_recovers(retry):
     playwright = os.environ.get("KVM_PLAYWRIGHT") or _find_playwright()
     chrome = _chrome()
     node = shutil.which("node")
@@ -74,7 +75,7 @@ def test_the_indicator_goes_quiet_and_recovers():
         result = subprocess.run(
             [node, str(FIXTURE),
              "--html", str(directory / "page.html"),
-             "--keymap", str(directory / "keymap.json")],
+             "--keymap", str(directory / "keymap.json"), "--retry", "1" if retry else "0"],
             capture_output=True, text=True, timeout=120, env=env,
         )
         assert result.returncode == 0, result.stderr[-2000:]
@@ -83,6 +84,10 @@ def test_the_indicator_goes_quiet_and_recovers():
         shutil.rmtree(directory, ignore_errors=True)
 
     assert report["errors"] == []
+    assert report["health"]["state"] == "normal"
+    assert report["health"]["exhausted"] is False
+    if retry:
+        assert report["health"]["recovered"] == 1
     steps = {step["step"]: step for step in report["steps"]}
     assert steps["just-connected"]["text"] == "链路 正常"
     assert re.fullmatch(r"链路 [23]s 未收到数据", steps["quiet-2s"]["text"]), \

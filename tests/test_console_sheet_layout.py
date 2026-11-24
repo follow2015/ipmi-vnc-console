@@ -55,11 +55,20 @@ def test_picture_stays_visible_above_sheet(page_files, name, width, height, touc
     view_w = after["viewportW"]
     assert before["stage"]["w"] == view_w
     assert after["sheetOpen"] is True
-    assert after["panel"]["w"] == view_w
-    assert after["stage"]["w"] == view_w
+    if width >= 1100:
+        assert after["panel"]["t"] <= 2 and after["panel"]["b"] >= height - 2, \
+            f"wide panel is not a full-height side dock at {name}"
+        assert after["panel"]["r"] >= view_w - 2
+        assert after["stage"]["r"] <= after["panel"]["l"] + 2, \
+            f"side dock overlaps the picture at {name}"
+        assert after["stage"]["b"] >= height - 60, \
+            f"picture lost window height at {name}: stage {after['stage']['b']}"
+    else:
+        assert after["panel"]["w"] == view_w
+        assert after["stage"]["w"] == view_w
+        assert after["stage"]["b"] <= after["panel"]["t"] + 2, \
+            f"stage overlaps the sheet at {name}"
     assert after["canvas"]["b"] <= after["stage"]["b"] + 2, \
         f"picture hidden behind the sheet at {name}: canvas {after['canvas']['b']} stage {after['stage']['b']}"
-    assert after["stage"]["b"] <= after["panel"]["t"] + 2, \
-        f"stage overlaps the sheet at {name}"
     assert after["keyboardFirst"] is True
     assert after["visibleKeyCount"] >= 40

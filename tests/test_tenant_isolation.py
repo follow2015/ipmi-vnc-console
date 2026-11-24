@@ -468,6 +468,9 @@ def test_legacy_database_upgrades_in_place(tmp_path):
             assert values == {None}, table
         assert {row[0] for row in conn.execute(
             "SELECT actor_type FROM kvm_audit_log")} == {"user"}
+        asset_columns = {row[1] for row in conn.execute("PRAGMA table_info(kvm_asset)")}
+        assert {"vnc_username_cipher", "vnc_password_cipher",
+                "vnc_key_version"} <= asset_columns
         with sqlite3.connect(db_path) as check:
             check.execute("INSERT INTO kvm_user (id, tenant_id, username, password_hash, "
                           "is_active, failed_attempts, locked_until, created) "
@@ -495,7 +498,7 @@ def test_migration_reports_its_head_and_downgrade_is_reversible(tmp_path):
     _legacy_db(db_path)
     assert _alembic(db_path, "upgrade", "head").returncode == 0
     head = _alembic(db_path, "current")
-    assert "0011_public_ip_alias_unique (head)" in head.stdout + head.stderr
+    assert "0012_asset_vnc_secret (head)" in head.stdout + head.stderr
     down = _alembic(db_path, "downgrade", "0001_baseline")
     assert down.returncode == 0, down.stdout + down.stderr
     with sqlite3.connect(db_path) as conn:
