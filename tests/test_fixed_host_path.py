@@ -80,6 +80,7 @@ async def test_fetch_asset_receives_unprefixed_path(identities, path_mode, monke
     app, gateway, runtime = _install_session(cfg, sid)
 
     class _FakeAdapter:
+        adapter_id = worker_module.PASSTHROUGH_ADAPTER_ID
         connection_limit = 4
         asset_pattern = re.compile(r"^/novnc/include/[A-Za-z0-9_.-]{1,64}\.js$")
         calls = []
@@ -90,7 +91,6 @@ async def test_fetch_asset_receives_unprefixed_path(identities, path_mode, monke
 
     fake = _FakeAdapter()
     runtime.adapter = fake
-    monkeypatch.setattr(worker_module, "PassthroughAdapter", _FakeAdapter, raising=True)
     async with TestServer(app) as server:
         async with aiohttp.ClientSession() as browser:
             async with browser.get(server.make_url(f"/s/{sid}/novnc/include/rfb.js"),
@@ -203,7 +203,8 @@ async def test_path_mode_accept_303_uses_ticket_sid(identities, path_mode, monke
     gateway.apply_assembly = apply
     gateway.report = report
     monkeypatch.setattr(worker_module, "make_adapter", lambda _info: FakeAdapter())
-    monkeypatch.setattr(worker_module, "wire_recovery", lambda adapter, _recovery: adapter)
+    monkeypatch.setattr(worker_module, "wire_recovery",
+                        lambda adapter, _recovery, **_kwargs: adapter)
 
     async with TestServer(app) as server:
         async with aiohttp.ClientSession() as browser:

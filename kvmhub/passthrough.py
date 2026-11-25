@@ -247,10 +247,15 @@ class RfbPassthroughSession:
                  allowed_client_messages=ALLOWED_CLIENT_MESSAGES,
                  message_sizes: dict[int, int] | None = None,
                  recovery: RecoveryPolicy | None = None,
+                 before_connect=None,
+                 require_before_connect: bool = False,
                  input_shaping: InputShapingConfig | None = None) -> None:
         self.upstream = upstream
         self.handshake = handshake
-        self.recovery: RecoveryState | None = RecoveryState(recovery) if recovery else None
+        self.recovery: RecoveryState | None = (
+            RecoveryState(recovery, before_connect=before_connect,
+                          require_before_connect=require_before_connect)
+            if recovery else None)
         self._framer = ClientMessageFramer(allowed_client_messages, sizes=message_sizes)
         self._out: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=queue_size)
         self._relay_task: asyncio.Task | None = None
@@ -476,6 +481,10 @@ class RfbPassthroughSession:
         expected = self.handshake._server_init[:20]
         started = time.monotonic()
         await self.upstream.drop_websocket()
+        if state.require_before_connect and state.before_connect is None:
+            state.fail("operation_permit_invalid")
+            state.give_up("operation_permit_invalid")
+            return False
         for attempt in range(1, state.policy.attempts + 1):
             await asyncio.sleep(state.policy.delay(attempt))
             if self._closed:
@@ -487,6 +496,9 @@ class RfbPassthroughSession:
             state.attempt()
             attempt_started = time.monotonic()
             try:
+                decision = await state.before_connect(attempt) if state.before_connect else None
+                if decision and float(decision.get("start_deadline") or 0) <= time.time():
+                    raise Problem("operation_permit_invalid", 401)
                 await self.upstream.reopen(request_frames=False)
             except Problem as exc:
                 state.fail(exc.code)

@@ -2,17 +2,18 @@
 from urllib.parse import urlsplit
 
 from ..aten_java_upstream import AtenJavaUpstream
+from ..driver_specs import DRIVERS
 from ..common import (ATEN_JAVA_ADAPTER_ID, Problem, bmc_allowed_networks_from_env)
 from ..passthrough import (BrowserHandshake, INSYDE_CLIENT_MESSAGES,
                            INSYDE_MESSAGE_SIZES, RfbPassthroughSession)
-from .idrac8 import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
+from ..client_assets import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS, fetch_asset as fetch_client_asset
 
 
 class AtenJavaAdapter:
     adapter_id = ATEN_JAVA_ADAPTER_ID
-    connection_limit = 1
-    supports_upstream_recovery = False
-    login_budget = 26.0
+    connection_limit = DRIVERS[adapter_id].connection_limit
+    supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
+    login_budget = DRIVERS[adapter_id].login_budget
 
     def __init__(self, info, *, networks=None):
         try:
@@ -56,14 +57,8 @@ class AtenJavaAdapter:
         await self.session.start()
         return self.session
 
-    async def fetch_asset(self, path):
-        match = ASSET_PATH.fullmatch(path or "")
-        name = match.group(1) if match else ""
-        if name and not name.endswith(".js"):
-            name += ".js"
-        if name not in KNOWN_ASSETS:
-            raise Problem("route_denied", 404)
-        return "application/javascript", (ASSET_DIR / name).read_bytes()
+    async def fetch_asset(self, path: str) -> tuple[str, bytes]:
+        return await fetch_client_asset(path)
 
     async def close(self):
         if self.session is not None:

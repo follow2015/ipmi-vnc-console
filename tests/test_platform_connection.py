@@ -10,16 +10,20 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete as sa_delete, select
 
 from kvmhub import capability as poc_capability
-from kvmhub.common import IDRAC8_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID
-from kvmhub.platform import connection, public_ip, services, vendor_registry
+from kvmhub.common import PASSTHROUGH_ADAPTER_ID
+from kvmhub.platform import (connection, connection_config, public_ip, services,
+                             vendor_registry)
 from kvmhub.platform.api import create_app
 from kvmhub.platform.config import Settings
 from kvmhub.platform.db import (init_schema, make_engine, seed_roles,
                                 session_factory, transaction)
-from kvmhub.platform.models import AccessGrant, Asset, Capability, VendorProfile
+from kvmhub.platform.models import (AccessGrant, Asset, AssetConnection,
+                                    Capability, DeviceAdmission, ExecutionDomain,
+                                    PlaneProjection, VendorProfile)
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher
 from kvmhub.store import Store
+from kvmhub.video import client_v2
 
 KEY = b"0123456789abcdef0123456789abcdef"
 ADMIN_PASSWORD = "synthetic-password"
@@ -121,25 +125,6 @@ def test_entry_carries_the_measured_protocol_and_logout_path(world):
     assert poc_capability.window_parses(entry)
 
 
-def test_idrac8_profile_produces_the_idrac8_data_plane_adapter(world):
-    with transaction(world.factory) as db:
-        profile = connection.approved_profile(db, PROFILE_CODE)
-        profile.console_impl = IDRAC8_ADAPTER_ID
-        db.flush()
-        asset = db.get(Asset, world.ids["asset"])
-        entry = connection.capability_entry(
-            profile, asset=asset,
-            detection={"model": asset.model, "firmware": asset.firmware,
-                       "raw": {"Manufacturer": MANUFACTURER}})
-        assert entry["adapter"] == IDRAC8_ADAPTER_ID
-        assert entry["protocol_versions"] == ["RFB 003.008"]
-        result = connection.assembly(db, asset_id=asset.id, user_id=world.ids["admin"],
-                                     actor="admin")
-    assert result["ready"] is True
-    assert result["data_plane"]["adapter"] == IDRAC8_ADAPTER_ID
-    assert result["plan"]["console_impl"] == IDRAC8_ADAPTER_ID
-
-
 def test_aten_java_profile_keeps_its_adapter_and_insyde_layout(world):
     from kvmhub.common import ATEN_JAVA_ADAPTER_ID
     from kvmhub.platform.data_plane import assembled_info
@@ -156,6 +141,95 @@ def test_aten_java_profile_keeps_its_adapter_and_insyde_layout(world):
         profile.status = "draft"
         db.flush()
         _refused(lambda: connection.capability_entry(profile, asset=asset), "profile_not_approved")
+
+
+def _lane_ready(world) -> str:
+    stamp = time.time()
+    aid = world.ids["asset"]
+    with transaction(world.factory) as db:
+        profile = connection.approved_profile(db, PROFILE_CODE)
+        profile.recipe_id = "huawei-recipe-v1"
+        profile.recipe_revision = 3
+        profile.config_schema_version = "v1"
+        capability = db.scalar(select(Capability).where(
+            Capability.profile_id == profile.id).limit(1))
+        capability.bundle_revision = "bundle-20261125"
+        db.flush()
+        connection_config.record_change(db, asset_ids=[aid], reason="pipeline_identity",
+                                        actor="tester", now=stamp, domain_id="dom-lane")
+        db.add(ExecutionDomain(domain_id="dom-lane", store_id="store-1",
+                               endpoint="https://internal.invalid",
+                               supported_schema='["v2"]', policy_fingerprint="policy-1",
+                               generation="gen-1", health="healthy"))
+        connection_config.admit_asset(
+            db, asset_id=aid, tenant_id=None, approver="operator",
+            evidence="docs/implementation/adapter-v1-scheduling-g1-20261125.md",
+            review_due=stamp + 86400, expires=stamp + 86400,
+            domain_id="dom-lane", actor="operator", now=stamp)
+    with transaction(world.factory) as db:
+        connection_row = db.scalar(select(AssetConnection)
+                                   .where(AssetConnection.asset_id == aid)
+                                   .order_by(AssetConnection.revision.desc()))
+        projection = db.scalar(select(PlaneProjection).where(
+            PlaneProjection.asset_id == aid, PlaneProjection.domain_id == "dom-lane"))
+        projection.desired_revision = connection_row.revision
+        projection.desired_digest = connection_row.digest
+        projection.applied_revision = connection_row.revision
+        projection.applied_digest = connection_row.digest
+        projection.generation = "gen-1"
+        projection.policy_fingerprint = "policy-1"
+        projection.status = "ready"
+        projection.ack_at = stamp
+    return aid
+
+
+def test_video_lane_is_only_assembled_on_a_ready_projection(world):
+    stamp = time.time()
+    with transaction(world.factory) as db:
+        profile = connection.approved_profile(db, PROFILE_CODE)
+        profile.recipe_id = "huawei-recipe-v1"
+        profile.recipe_revision = 3
+        profile.config_schema_version = "v1"
+        capability = db.scalar(select(Capability).where(
+            Capability.profile_id == profile.id).limit(1))
+        capability.bundle_revision = "bundle-20261125"
+        db.flush()
+        connection_config.record_change(db, asset_ids=[world.ids["asset"]],
+                                        reason="pipeline_identity", actor="tester",
+                                        now=stamp)
+    with transaction(world.factory) as db:
+        result = connection.assembly(db, asset_id=world.ids["asset"],
+                                     user_id=world.ids["admin"], actor="admin")
+    assert result["g0"]["ready"] is False
+    assert result["g0"]["reason"] == "snapshot_pending"
+    assert result["worker_requirements"] == {}
+
+
+def test_video_lane_versions_are_named_after_what_they_carry(world):
+    aid = _lane_ready(world)
+    with transaction(world.factory) as db:
+        result = connection.assembly(db, asset_id=aid,
+                                     user_id=world.ids["admin"], actor="admin")
+    assert result["g0"]["ready"] is True
+    assert result["worker_requirements"] == {
+        "lane": "transcode-v1",
+        "versions": {"recipe_id": "huawei-recipe-v1", "recipe_revision": "3",
+                     "protocol_contract": client_v2.protocol_contract(),
+                     "schema_version": "v1"}}
+    assert result["checks"]["client_build"] == "diverges"
+    assert result["client_contract"] == client_v2.protocol_contract()
+    assert result["client_bundle"] == "bundle-20261125"
+
+
+def test_stale_contract_is_refused_instead_of_falling_back(world, monkeypatch):
+    aid = _lane_ready(world)
+    monkeypatch.setattr(client_v2, "PROTOCOL_CONTRACT", "console-rfb/2")
+    with transaction(world.factory) as db:
+        with pytest.raises(connection.ConnectionRefused) as refused:
+            connection.assembly(db, asset_id=aid,
+                                user_id=world.ids["admin"], actor="admin")
+    assert refused.value.code == "pipeline_version_unavailable"
+    assert "refresh-lane-contract" in refused.value.message
 
 
 def test_entry_is_accepted_and_approved_by_the_real_poc_store(world):
@@ -188,7 +262,7 @@ def test_assembly_is_ready_and_never_exposes_the_credential(world):
     assert result["plan"]["message_profile"] == "insyde"
     assert result["data_plane"]["capability_entry"]["logout_path"] == "/cgi/logout.cgi"
     assert result["checks"] == {"profile": "approved", "capability": "verified",
-                                "credential": "by_id_only"}
+                                "credential": "by_id_only", "g0_snapshot": "pending"}
     assert result["credential_id"] == world.ids["credential"]
     assert BMC_PASSWORD not in str(result) and "ADMIN" not in str(result)
 
@@ -220,7 +294,7 @@ def test_an_owner_assembles_without_a_grant(world):
         result = connection.assembly(db, asset_id=world.ids["asset"],
                                      user_id=world.ids["admin"], actor="admin")
     assert result["checks"] == {"profile": "approved", "capability": "verified",
-                                "credential": "by_id_only"}
+                                "credential": "by_id_only", "g0_snapshot": "pending"}
 
 
 @pytest.mark.parametrize("gate,expected", [

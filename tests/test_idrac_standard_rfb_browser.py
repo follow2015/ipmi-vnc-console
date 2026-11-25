@@ -93,7 +93,6 @@ def test_keymap_document_carries_keysyms_for_the_browser():
 
 def test_input_protocol_declared_per_adapter():
     from kvmhub.adapters.idrac_vnc import IdracVncAdapter
-    from kvmhub.adapters.idrac8 import Idrac8Adapter
     from kvmhub.adapters.passthrough import PassthroughAdapter
 
     class Stub:
@@ -101,8 +100,6 @@ def test_input_protocol_declared_per_adapter():
 
     vnc = object.__new__(IdracVncAdapter)
     assert worker.input_protocol_for_adapter(vnc) == "standard8"
-    html5 = object.__new__(Idrac8Adapter)
-    assert worker.input_protocol_for_adapter(html5) == "view_only"
     passthrough = object.__new__(PassthroughAdapter)
     assert worker.input_protocol_for_adapter(passthrough) == "insyde18"
     assert worker.input_protocol_for_adapter(Stub()) == "insyde18"

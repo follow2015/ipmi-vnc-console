@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.orm import Session
 
+from . import governance
 from .models import (AccessGrant, Asset, AssetGroup, AssetGroupMember, AuditLog,
                      Capability, Credential, DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID,
                      Permission, GrantSource, Role, RolePermission,
@@ -276,7 +277,7 @@ def save_credential(session: Session, cipher: CredentialCipher, *, label: str,
     session.add(cred)
     audit(session, actor, "credential_created", tenant_id=tenant_id,
           detail={"credential_id": cred.id, "label": label}, now=now)
-    session.commit()
+    session.flush()
     return cred
 
 
@@ -307,14 +308,27 @@ def save_vnc_secret(session: Session, cipher: CredentialCipher, *, asset_id: str
         raise PlatformError("asset_not_found", "资产不存在", 404)
     if tenant_id is not None and asset.tenant_id != tenant_id:
         raise PlatformError("cross_tenant_asset", "资产不属于当前租户", 403)
+    if has_vnc_secret(asset):
+        try:
+            current = read_vnc_secret(session, cipher, asset.id, tenant_id=None)
+        except Exception:  # noqa: BLE001 - a key rotation must not block a rewrite
+            current = None
+        if current == {"username": username, "password": password}:
+            return asset
     stamp = time.time() if now is None else now
     asset.vnc_username_cipher = cipher.encrypt(username, aad=asset.id + ":vnc_username")
     asset.vnc_password_cipher = cipher.encrypt(password, aad=asset.id + ":vnc_password")
     asset.vnc_key_version = 1
+    asset.vnc_secret_revision = (asset.vnc_secret_revision or 0) + 1
     asset.updated = stamp
     audit(session, actor, "vnc_secret_saved", asset_id=asset.id,
           tenant_id=asset.tenant_id,
-          detail={"key_version": 1, "credential_id_unchanged": True}, now=stamp)
+          detail={"key_version": 1, "secret_revision": asset.vnc_secret_revision,
+                  "credential_id_unchanged": True}, now=stamp)
+    from . import connection_config
+
+    connection_config.record_change(session, asset_ids=[asset.id],
+                                    reason="vnc_secret_saved", actor=actor, now=stamp)
     session.flush()
     return asset
 
@@ -327,13 +341,21 @@ def clear_vnc_secret(session: Session, *, asset_id: str, actor: str,
         raise PlatformError("asset_not_found", "资产不存在", 404)
     if tenant_id is not None and asset.tenant_id != tenant_id:
         raise PlatformError("cross_tenant_asset", "资产不属于当前租户", 403)
+    if not has_vnc_secret(asset):
+        return asset
     stamp = time.time() if now is None else now
     asset.vnc_username_cipher = None
     asset.vnc_password_cipher = None
     asset.vnc_key_version = 1
+    asset.vnc_secret_revision = (asset.vnc_secret_revision or 0) + 1
     asset.updated = stamp
     audit(session, actor, "vnc_secret_cleared", asset_id=asset.id,
-          tenant_id=asset.tenant_id, now=stamp)
+          tenant_id=asset.tenant_id,
+          detail={"secret_revision": asset.vnc_secret_revision}, now=stamp)
+    from . import connection_config
+
+    connection_config.record_change(session, asset_ids=[asset.id],
+                                    reason="vnc_secret_cleared", actor=actor, now=stamp)
     session.flush()
     return asset
 
@@ -418,7 +440,8 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
                                 "该 IPMI 地址已被本租户其它资产占用", 409)
     public_ip_module.assert_ipmi_available(session, tenant_id, address,
                                            existing.id if existing else None)
-    if existing is None:
+    created = existing is None
+    if created:
         enforce_asset_quota(session, tenant_id)
         existing = Asset(id=str(uuid.uuid4()), tenant_id=tenant_id, name=name,
                          address=address, created=stamp, updated=stamp)
@@ -427,6 +450,12 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
         action = "asset_created"
     else:
         action = "asset_updated"
+    previous = None
+    if existing is not None:
+        previous = (existing.address, existing.vendor, existing.model,
+                    existing.firmware, existing.fingerprint, existing.credential_id,
+                    existing.profile_id, existing.capability_id)
+    changed = created
     existing.name = name
     existing.address = address
     existing.vendor, existing.model, existing.firmware = vendor, model, firmware
@@ -435,6 +464,11 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
     existing.profile_id = profile_id
     existing.capability_id = capability_id
     existing.licence, existing.notes = licence, notes
+    if previous is not None:
+        current = (existing.address, existing.vendor, existing.model,
+                   existing.firmware, existing.fingerprint, existing.credential_id,
+                   existing.profile_id, existing.capability_id)
+        changed = changed or current != previous
     existing.updated = stamp
     if public_ips is not None:
         public_ip_module.upsert_public_ip(session, tenant_id=tenant_id,
@@ -443,11 +477,43 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
     audit(session, actor, action, asset_id=existing.id, tenant_id=tenant_id,
           detail={"address": address, "vendor": vendor, "model": model,
                   "firmware": firmware, "profile_id": profile_id}, now=stamp)
-    session.commit()
+    if changed:
+        from . import connection_config
+
+        connection_config.record_change(session, asset_ids=[existing.id],
+                                        reason=action, actor=actor, now=stamp)
+    session.flush()
     return existing
 
 
-_ENV_PIN_ADAPTERS = frozenset({"huawei-ibmc-vnc-tls", "huawei-ibmc-kvm-gateway"})
+_ENV_PIN_ADAPTERS = frozenset()
+
+_ASSET_PIN_ADAPTERS = frozenset({"huawei-ibmc-vnc-tls", "huawei-ibmc-kvm-gateway"})
+
+
+def _blocked_brand(row: VendorProfile, reason: str, *, stamp: float,
+                   capabilities: list[Capability] | None = None) -> dict:
+    caps = capabilities or []
+    expiry = max((c.expires or 0) for c in caps) if caps else None
+    if reason in (governance.CAPABILITY_NOT_VERIFIED, governance.CAPABILITY_EXPIRED):
+        state = ("missing" if not caps
+                 else governance.capability_state("verified", expiry,
+                                                  None, stamp))
+    else:
+        state = governance.profile_state(row.status, row.review_due, stamp)
+    detail = {
+        governance.PROFILE_NOT_APPROVED:
+            f"品牌档案仍是 {row.status}，尚未完成带外批准，不产生连接方案。",
+        governance.PROFILE_REVIEW_OVERDUE:
+            "品牌档案复核已到期，需在「品牌档案」页重新审批后才能录入新设备。",
+        governance.CAPABILITY_NOT_VERIFIED:
+            "该品牌还没有带外验证的兼容矩阵行，先完成适配验证再录入。",
+        governance.CAPABILITY_EXPIRED:
+            "该品牌的兼容矩阵行已全部过期，需重新验证后才能录入。",
+    }[reason]
+    return {"profile_id": row.id, "code": row.code, "vendor": row.vendor,
+            "reason": reason, "state": state, "detail": detail,
+            "review_due": row.review_due, "expires": expiry}
 
 
 def asset_onboarding(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID,
@@ -459,22 +525,29 @@ def asset_onboarding(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID,
         .order_by(VendorProfile.priority, VendorProfile.code)
     ).all()
     brands = []
+    blocked = []
     for row in rows:
-        if row.status != "approved":
-            continue
-        if row.review_due and row.review_due < stamp:
+        refusal = governance.profile_refusal(row.status, row.review_due, stamp)
+        if refusal is not None:
+            blocked.append(_blocked_brand(row, refusal, stamp=stamp))
             continue
         caps = session.scalars(
             select(Capability)
             .where((Capability.profile_id == row.id)
                    & (Capability.status == "verified")
-                   & (Capability.expires > stamp)
                    & ((Capability.tenant_id.is_(None)) | (Capability.tenant_id == tenant_id)))
             .order_by(Capability.expires.desc())
         ).all()
+        usable = [c for c in caps
+                  if governance.capability_refusal(c.status, c.expires, stamp) is None]
+        if not usable:
+            reason = (governance.CAPABILITY_EXPIRED if caps
+                      else governance.CAPABILITY_NOT_VERIFIED)
+            blocked.append(_blocked_brand(row, reason, stamp=stamp, capabilities=caps))
+            continue
         cap_views = [{"id": c.id, "model": c.model, "firmware": c.firmware,
                       "adapter": c.adapter, "status": c.status, "expires": c.expires}
-                     for c in caps]
+                     for c in usable]
         env_pin = row.console_impl in _ENV_PIN_ADAPTERS
         brands.append({
             "profile_id": row.id,
@@ -489,14 +562,19 @@ def asset_onboarding(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID,
             "certificate_note": (
                 "该品牌证书指纹由平台统一管理，资产无需填写；连接时按服务端 pin 校验。"
                 if env_pin else
-                "如该 BMC 使用自签证书，请填写证书 SHA-256 指纹；留空则不校验证书。"),
+                ("请填写本机 iBMC 证书 SHA-256 指纹（探测可自动带出）；"
+                 "同型号不同证书的设备各填各的。留空则回退平台统一 pin，两者都无时拒绝连接。"
+                 if row.console_impl in _ASSET_PIN_ADAPTERS else
+                 "如该 BMC 使用自签证书，请填写证书 SHA-256 指纹；留空则不校验证书。")),
             "default_capability_id": cap_views[0]["id"] if cap_views else None,
             "capabilities": cap_views,
         })
     return {
         "brands": brands,
-        "note": ("只能选择已完成适配并批准的品牌。未适配品牌请先在「品牌档案」页走"
-                 "新品牌适配流程；草稿档案不会产生连接方案。"),
+        "blocked": blocked,
+        "note": ("只能选择已完成适配、批准且在复核期内、有可用兼容矩阵行的品牌。"
+                 "未通过其中任一条的品牌会列在不可用清单里并注明原因；"
+                 "未适配品牌请先在「品牌档案」页走新品牌适配流程，草稿档案不会产生连接方案。"),
     }
 
 
@@ -507,19 +585,21 @@ def resolve_asset_defaults(session: Session, *, profile_id: str,
     profile = session.get(VendorProfile, profile_id)
     if profile is None or profile.tenant_id not in (None, tenant_id):
         raise PlatformError("profile_not_found", "品牌档案不存在", 400)
-    if profile.status != "approved":
-        raise PlatformError("profile_not_approved",
-                            f"品牌档案 {profile.code} 尚未批准，请先走新品牌适配", 400)
-    if profile.review_due and profile.review_due < stamp:
-        raise PlatformError("profile_review_overdue", "品牌档案复核已到期，请带外重新审批", 400)
-    capability = session.scalar(
+    refusal = governance.profile_refusal(profile.status, profile.review_due, stamp)
+    if refusal == governance.PROFILE_NOT_APPROVED:
+        raise PlatformError(refusal, f"品牌档案 {profile.code} 尚未批准，请先走新品牌适配", 400)
+    if refusal == governance.PROFILE_REVIEW_OVERDUE:
+        raise PlatformError(refusal, "品牌档案复核已到期，请带外重新审批", 400)
+    candidates = session.scalars(
         select(Capability)
         .where((Capability.profile_id == profile.id)
                & (Capability.status == "verified")
-               & (Capability.expires > stamp)
                & ((Capability.tenant_id.is_(None)) | (Capability.tenant_id == tenant_id)))
         .order_by(Capability.expires.desc())
-    )
+    ).all()
+    capability = next((c for c in candidates
+                       if governance.capability_refusal(c.status, c.expires, stamp) is None),
+                      None)
     return {
         "vendor": profile.vendor,
         "model_pattern": profile.model_pattern,
@@ -564,7 +644,11 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
         session.flush()
         audit(session, actor, "asset_assigned", asset_id=asset.id, tenant_id=target,
               detail={"address": addr, "to": tenant.code, "action": "created"}, now=stamp)
-        session.commit()
+        from . import connection_config
+
+        connection_config.record_change(session, asset_ids=[asset.id],
+                                        reason="asset_created", actor=actor, now=stamp)
+        session.flush()
         return {"asset": asset.public(), "action": "created", "previous_tenant": None}
 
     same = next((row for row in candidates if row.tenant_id == target), None)
@@ -572,7 +656,7 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
         if name and name.strip() and same.name != name.strip():
             same.name = name.strip()
             same.updated = stamp
-            session.commit()
+            session.flush()
         return {"asset": same.public(), "action": "unchanged", "previous_tenant": None}
 
     if len(candidates) > 1:
@@ -632,7 +716,11 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
     audit(session, actor, f"asset_{action}", asset_id=asset.id, tenant_id=target,
           detail={"address": addr, "from": origin_code,
                   "to": tenant.code if tenant is not None else None}, now=stamp)
-    session.commit()
+    from . import connection_config
+
+    connection_config.revoke_admission(session, asset_id=asset.id,
+                                       actor=actor, now=stamp)
+    session.flush()
     return {"asset": asset.public(), "action": action, "previous_tenant": origin_code}
 
 

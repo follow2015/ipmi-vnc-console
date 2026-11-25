@@ -71,11 +71,11 @@ def test_vnc_secret_read_back_and_aad_bound_to_asset(ctx):
 
 def test_save_vnc_secret_joins_caller_transaction(ctx):
     _, factory, cipher = ctx
-    asset_id = None
+    with transaction(factory) as db:
+        _, asset = _asset_with_bmc_credential(db, cipher)
+    asset_id = asset.id
     with pytest.raises(RuntimeError, match="abort"):
         with transaction(factory) as db:
-            _, asset = _asset_with_bmc_credential(db, cipher)
-            asset_id = asset.id
             services.save_vnc_secret(db, cipher, asset_id=asset_id,
                                      username="vnc", password="unit-test-password",
                                      actor="cli")

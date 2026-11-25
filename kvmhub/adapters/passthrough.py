@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlsplit
 
 from ..ast2100_protocol import RFB_VERSION, client_protocol_version
+from ..driver_specs import DRIVERS
 from ..common import PASSTHROUGH_ADAPTER_ID, Problem
 from ..input_shaping import InputShapingConfig
 from ..passthrough import (
@@ -41,8 +42,8 @@ def content_type_for(path: str) -> str:
 
 class PassthroughAdapter:
     adapter_id = PASSTHROUGH_ADAPTER_ID
-    connection_limit = 1
-    supports_upstream_recovery = True
+    connection_limit = DRIVERS[adapter_id].connection_limit
+    supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
 
     def __init__(self, info):
         target = urlsplit(info["target"])
@@ -84,6 +85,8 @@ class PassthroughAdapter:
         self.upstream: RfbUpstream | None = None
         self.session: RfbPassthroughSession | None = None
         self.recovery = None
+        self.recovery_before_connect = None
+        self.recovery_requires_permit = False
         self.cleanup_outcome: str | None = None
 
     async def login(self, username, password):
@@ -106,6 +109,8 @@ class PassthroughAdapter:
             allowed_client_messages=allowed,
             message_sizes=sizes,
             recovery=self.recovery,
+            before_connect=self.recovery_before_connect,
+            require_before_connect=self.recovery_requires_permit,
             input_shaping=self.input_shaping)
         await session.start()
         self.session = session

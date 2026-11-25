@@ -13,6 +13,8 @@ LEASE_PREFIX = "kvmhub:lease:"
 WORKER_PREFIX = "kvmhub:worker:"
 REVOCATION_CHANNEL = "kvmhub:revoke"
 QUOTA_PREFIX = "kvmhub:quota:"
+RESOURCE_PREFIX = "kvmhub:transcode:"
+RESOURCE_TOLERANCE_MS = 5000
 
 QUOTA_TOLERANCE_MS = 5000
 
@@ -42,6 +44,11 @@ class State(Protocol):
     async def release_quota(self, key: str, member: str) -> None: ...
     async def quota_usage(self, key: str) -> int: ...
     async def quota_members(self, key: str) -> list[str]: ...
+    async def reserve_worker_resources(self, worker_id: str, sid: str, *,
+                                       capacity: int, cpu_budget: float, mem_budget: float,
+                                       cpu_need: float, mem_need: float, ttl: int) -> bool: ...
+    async def release_worker_resources(self, worker_id: str, sid: str) -> None: ...
+    async def worker_resources(self, worker_id: str) -> dict: ...
     async def subscribe_revocations(self) -> AsyncIterator[str]: ...
     async def close(self) -> None: ...
 
@@ -65,6 +72,7 @@ class MemoryState:
         self._values: dict[str, tuple[float, str]] = {}
         self._listeners: list[str] = []
         self._zsets: dict[str, dict[str, float]] = {}
+        self._transcode: dict[str, dict[str, tuple[float, dict]]] = {}
         self._revocations: asyncio.Queue[str] | None = None
 
     async def _set(self, key: str, value: dict, ttl: int) -> None:
@@ -199,9 +207,59 @@ class MemoryState:
     async def quota_members(self, key: str) -> list[str]:
         return list(self._prune(key, self._clock()).keys())
 
+
+    def _resources(self, worker_id: str, now: float | None = None) -> dict[str, tuple[float, dict]]:
+        now = self._clock() if now is None else now
+        rows = self._transcode.setdefault(worker_id, {})
+        for sid, (expires, _) in list(rows.items()):
+            if expires <= now:
+                rows.pop(sid, None)
+        return rows
+
+    @staticmethod
+    def _resource_numbers(capacity, cpu_budget, mem_budget, cpu_need, mem_need, ttl):
+        values = (capacity, cpu_budget, mem_budget, cpu_need, mem_need, ttl)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or value != value or value in (float('inf'), float('-inf')) for value in values):
+            raise ValueError('invalid transcode budget')
+        if int(capacity) < 1 or min(cpu_budget, mem_budget, cpu_need, mem_need) <= 0:
+            raise ValueError('invalid transcode budget')
+        return int(capacity), float(cpu_budget), float(mem_budget), float(cpu_need), float(mem_need), int(ttl)
+
+    async def reserve_worker_resources(self, worker_id: str, sid: str, *,
+                                       capacity: int, cpu_budget: float, mem_budget: float,
+                                       cpu_need: float, mem_need: float, ttl: int) -> bool:
+        capacity, cpu_budget, mem_budget, cpu_need, mem_need, ttl = self._resource_numbers(
+            capacity, cpu_budget, mem_budget, cpu_need, mem_need, ttl)
+        now = self._clock()
+        rows = self._resources(worker_id, now)
+        if sid in rows or len(rows) >= capacity:
+            return False
+        used_cpu = sum(float(item['cpu']) for _, item in rows.values())
+        used_mem = sum(float(item['mem']) for _, item in rows.values())
+        if used_cpu + cpu_need > cpu_budget or used_mem + mem_need > mem_budget:
+            return False
+        rows[sid] = (now + max(1, ttl), {'cpu': cpu_need, 'mem': mem_need})
+        return True
+
+    async def release_worker_resources(self, worker_id: str, sid: str) -> None:
+        rows = self._transcode.get(worker_id)
+        if rows is not None:
+            rows.pop(sid, None)
+            if not rows:
+                self._transcode.pop(worker_id, None)
+
+    async def worker_resources(self, worker_id: str) -> dict:
+        rows = self._resources(worker_id)
+        return {'count': len(rows),
+                'cpu': sum(float(item['cpu']) for _, item in rows.values()),
+                'mem': sum(float(item['mem']) for _, item in rows.values()),
+                'sids': sorted(rows)}
+
     async def close(self) -> None:
         self._values.clear()
         self._zsets.clear()
+        self._transcode.clear()
 
 
 class RedisState:
@@ -312,6 +370,88 @@ class RedisState:
 
     async def quota_members(self, key: str) -> list[str]:
         return [str(member) for member in await self._client.zrange(key, 0, -1)]
+
+
+    @staticmethod
+    def _resource_keys(worker_id: str) -> tuple[str, str]:
+        root = RESOURCE_PREFIX + worker_id
+        return root + ':sessions', root + ':usage'
+
+    _RESERVE_RESOURCE_SCRIPT = """
+    local now = redis.call('TIME')
+    local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+    local tolerance = tonumber(ARGV[8])
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms - tolerance)
+    local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+    local used_cpu, used_mem = 0, 0
+    for _, member in ipairs(members) do
+        local raw = redis.call('HGET', KEYS[2], member)
+        if raw then
+            local ok, usage = pcall(cjson.decode, raw)
+            if ok then
+                used_cpu = used_cpu + tonumber(usage.cpu or 0)
+                used_mem = used_mem + tonumber(usage.mem or 0)
+            end
+        end
+    end
+    if #members >= tonumber(ARGV[2]) then return 0 end
+    if used_cpu + tonumber(ARGV[5]) > tonumber(ARGV[3]) then return 0 end
+    if used_mem + tonumber(ARGV[6]) > tonumber(ARGV[4]) then return 0 end
+    redis.call('ZADD', KEYS[1], now_ms + tonumber(ARGV[7]) * 1000, ARGV[1])
+    redis.call('HSET', KEYS[2], ARGV[1],
+               cjson.encode({cpu = tonumber(ARGV[5]), mem = tonumber(ARGV[6])}))
+    local last = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+    if last[2] then
+        local expiry = math.ceil(tonumber(last[2]) + tolerance)
+        redis.call('PEXPIREAT', KEYS[1], expiry)
+        redis.call('PEXPIREAT', KEYS[2], expiry)
+    end
+    return 1
+    """
+
+    _USAGE_RESOURCE_SCRIPT = """
+    local now = redis.call('TIME')
+    local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms - tonumber(ARGV[1]))
+    local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+    local out = {#members, 0, 0}
+    for _, member in ipairs(members) do
+        local raw = redis.call('HGET', KEYS[2], member)
+        if raw then
+            local ok, usage = pcall(cjson.decode, raw)
+            if ok then
+                out[2] = out[2] + tonumber(usage.cpu or 0)
+                out[3] = out[3] + tonumber(usage.mem or 0)
+            end
+        end
+        table.insert(out, member)
+    end
+    return out
+    """
+
+    async def reserve_worker_resources(self, worker_id: str, sid: str, *,
+                                       capacity: int, cpu_budget: float, mem_budget: float,
+                                       cpu_need: float, mem_need: float, ttl: int) -> bool:
+        capacity, cpu_budget, mem_budget, cpu_need, mem_need, ttl = MemoryState._resource_numbers(
+            capacity, cpu_budget, mem_budget, cpu_need, mem_need, ttl)
+        zkey, hkey = self._resource_keys(worker_id)
+        granted = await self._client.eval(self._RESERVE_RESOURCE_SCRIPT, 2, zkey, hkey,
+                                          sid, capacity, cpu_budget, mem_budget,
+                                          cpu_need, mem_need, max(1, ttl),
+                                          RESOURCE_TOLERANCE_MS)
+        return bool(granted)
+
+    async def release_worker_resources(self, worker_id: str, sid: str) -> None:
+        zkey, hkey = self._resource_keys(worker_id)
+        await self._client.zrem(zkey, sid)
+        await self._client.hdel(hkey, sid)
+
+    async def worker_resources(self, worker_id: str) -> dict:
+        zkey, hkey = self._resource_keys(worker_id)
+        raw = await self._client.eval(self._USAGE_RESOURCE_SCRIPT, 2, zkey, hkey,
+                                      RESOURCE_TOLERANCE_MS)
+        return {'count': int(raw[0]), 'cpu': float(raw[1]), 'mem': float(raw[2]),
+                'sids': sorted(str(item) for item in raw[3:])}
 
     def _subscription_client(self):
         if self._subscriber is None:

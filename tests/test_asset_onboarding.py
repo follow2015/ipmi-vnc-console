@@ -78,6 +78,27 @@ def test_onboarding_carries_autofill_defaults(world):
     assert brand["certificate_mode"] in ("env_pin", "asset_fingerprint")
 
 
+def test_huawei_brand_allows_per_asset_fingerprint(world):
+    c, ids, platform = world
+    with transaction(platform.factory) as db:
+        huawei = db.query(VendorProfile).filter(
+            VendorProfile.code == "huawei-ibmc-kvm-gateway").one()
+        huawei.status = "approved"
+        huawei.review_due = time.time() + 86400 * 365
+        db.add(Capability(id=str(uuid.uuid4()), vendor=huawei.vendor, model="2288H V5",
+                          firmware="", adapter=huawei.console_impl, profile_id=huawei.id,
+                          status="verified", expires=time.time() + 86400 * 365,
+                          evidence="evidence.json", approver="test",
+                          console_impl=huawei.console_impl, licence=huawei.licence,
+                          created=time.time()))
+        db.flush()
+    body = c.get("/api/v2/asset-onboarding").json()
+    brand = next(b for b in body["brands"] if b["code"] == "huawei-ibmc-kvm-gateway")
+    assert brand["certificate_mode"] == "asset_fingerprint"
+    assert "各填各的" in brand["certificate_note"]
+    assert "回退平台统一 pin" in brand["certificate_note"]
+
+
 def test_asset_post_autofills_from_brand(world):
     c, ids, _ = world
     r = c.post("/api/v2/assets", headers=_headers(world),
@@ -120,6 +141,61 @@ def test_overdue_profile_is_not_offered_nor_bindable(world):
                json={"name": "bad", "address": "192.0.2.34", "profile_id": ids["profile_id"]})
     assert r.status_code == 400
     assert r.json()["error"] == "profile_review_overdue"
+
+
+def test_blocked_brand_says_why_instead_of_vanishing(world):
+    c, ids, platform = world
+    due = time.time() - 60
+    with transaction(platform.factory) as db:
+        profile = db.query(VendorProfile).filter(VendorProfile.id == ids["profile_id"]).one()
+        profile.review_due = due
+    body = c.get("/api/v2/asset-onboarding").json()
+    assert body["brands"] == []
+    entry = next(b for b in body["blocked"] if b["profile_id"] == ids["profile_id"])
+    assert entry["reason"] == "profile_review_overdue"
+    assert entry["state"] == "overdue"
+    assert entry["review_due"] == pytest.approx(due)
+    assert "重新审批" in entry["detail"]
+
+
+def test_brand_whose_capability_rows_expired_is_not_offered(world):
+    c, ids, platform = world
+    expired_at = time.time() - 60
+    with transaction(platform.factory) as db:
+        cap = db.get(Capability, ids["cap_id"])
+        cap.expires = expired_at
+    body = c.get("/api/v2/asset-onboarding").json()
+    assert body["brands"] == []
+    entry = next(b for b in body["blocked"] if b["profile_id"] == ids["profile_id"])
+    assert entry["reason"] == "capability_expired"
+    assert entry["expires"] == pytest.approx(expired_at)
+
+
+def test_brand_with_no_verified_row_is_not_a_choice(world):
+    c, ids, platform = world
+    with transaction(platform.factory) as db:
+        cap = db.get(Capability, ids["cap_id"])
+        cap.status = "draft"
+    body = c.get("/api/v2/asset-onboarding").json()
+    assert body["brands"] == []
+    entry = next(b for b in body["blocked"] if b["profile_id"] == ids["profile_id"])
+    assert entry["reason"] == "capability_not_verified"
+    assert entry["state"] == "missing"
+    assert entry["expires"] is None
+
+
+def test_picker_and_assembly_share_one_boundary(world):
+    c, ids, platform = world
+    due = 1_800_000_000.0
+    with transaction(platform.factory) as db:
+        profile = db.query(VendorProfile).filter(VendorProfile.id == ids["profile_id"]).one()
+        profile.review_due = due
+        at_due = services.asset_onboarding(db, now=due)
+        before = services.asset_onboarding(db, now=due - 1)
+    assert [b["profile_id"] for b in at_due["brands"]] == []
+    assert next(b for b in at_due["blocked"]
+                if b["profile_id"] == ids["profile_id"])["reason"] == "profile_review_overdue"
+    assert ids["profile_id"] in [b["profile_id"] for b in before["brands"]]
 
 
 def test_legacy_asset_without_profile_still_works(world):

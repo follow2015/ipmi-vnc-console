@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -11,6 +13,8 @@ log = logging.getLogger("kvmhub.huawei_kvm_gateway")
 
 from aiohttp import WSMessage, WSMsgType
 
+from ..driver_specs import DRIVERS
+from ..video_metrics import VideoMetrics
 from ..common import (HUAWEI_IBMC_KVM_GATEWAY_ID, Problem,
                       bmc_allowed_networks_from_env, require_controlled_host)
 from ..huawei_kvm_input import BrowserInputTranslator, packet_command
@@ -18,11 +22,12 @@ from ..huawei_kvm_jpeg import jpeg_header
 from ..huawei_kvm_protocol import (C_CMD_KEYBOARD, C_CMD_MOUSE,
                                    HuaweiFrameDecoder)
 from ..huawei_kvm_upstream import (HuaweiKvmUpstream, UpstreamError,
-                                   huawei_kvm_pin_from_env, valid_pin)
+                                   huawei_kvm_pin_from_env, resolve_huawei_pin,
+                                   valid_pin)
 from ..passthrough import BrowserHandshake, BrowserHandshakeError
 from ..rfb_server import (build_raw_fbu_from_bgrx32, build_server_init_32bpp,
                           rgb24_to_bgrx32)
-from .idrac8 import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
+from ..client_assets import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS, fetch_asset as fetch_client_asset
 
 OUTPUT_QUEUE_BYTES = 16 * 1024 * 1024
 VIEW_NAME = "iBMC-KVM"
@@ -32,7 +37,8 @@ class HuaweiKvmRfbSession:
 
     protocol = "binary"
 
-    def __init__(self, upstream: HuaweiKvmUpstream, width: int, height: int) -> None:
+    def __init__(self, upstream: HuaweiKvmUpstream, width: int, height: int, *,
+                 measure_video: bool = False) -> None:
         self.upstream = upstream
         self.width = width
         self.height = height
@@ -42,7 +48,8 @@ class HuaweiKvmRfbSession:
             security_type=BrowserHandshake.SECURITY_TYPE_NONE)
         self.handshake = handshake
         self.input = BrowserInputTranslator(upstream.tag_id, width, height)
-        self.decoder = HuaweiFrameDecoder()
+        self.video_metrics = VideoMetrics() if measure_video else None
+        self.decoder = HuaweiFrameDecoder(observations=self.video_metrics)
         self._out: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
         self._relay_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -130,12 +137,26 @@ class HuaweiKvmRfbSession:
                 if self._closed:
                     break
                 header = jpeg_header(quant)
-                bgr = self.decoder.decode(blocks, width, height, quant, header)
-                bgrx = rgb24_to_bgrx32(bgr, self.width, self.height)
+                with (self.video_metrics.measure('decode_convert') if self.video_metrics
+                      else contextlib.nullcontext()):
+                    bgr = self.decoder.decode(blocks, width, height, quant, header)
+                    bgrx = rgb24_to_bgrx32(bgr, self.width, self.height)
                 emitted = 0
-                for message in build_raw_fbu_from_bgrx32(
-                        bgrx, self.width, self.height):
-                    await self._emit(message)
+                messages = build_raw_fbu_from_bgrx32(bgrx, self.width, self.height)
+                if self.video_metrics is not None:
+                    messages = self.video_metrics.messages(messages)
+                for message in messages:
+                    if self.video_metrics is None:
+                        await self._emit(message)
+                    else:
+                        started = time.perf_counter()
+                        queued_before = self.server_bytes
+                        await self._emit(message)
+                        self.video_metrics.queued_video_bytes += self.server_bytes - queued_before
+                        elapsed = time.perf_counter() - started
+                        self.video_metrics.stage_wall['enqueue'] += elapsed
+                        self.video_metrics.stage_max_wall['enqueue'] = max(
+                            self.video_metrics.stage_max_wall['enqueue'], elapsed)
                     emitted += 1
                 self.frames += 1
                 if self.frames <= 3 or self.frames % 30 == 0:
@@ -183,6 +204,7 @@ class HuaweiKvmRfbSession:
             "protocol": self.protocol,
             "handshake_completed": self.handshake.completed,
             "frames": self.frames,
+            "video_metrics": self.video_metrics.public() if self.video_metrics else None,
             "decode_ok_blocks": self.decoder.decoded_blocks,
             "decode_failed_blocks": self.decoder.failed_blocks,
             "client_messages": self.client_messages,
@@ -207,9 +229,9 @@ def _rgb_to_pixels(rgb: bytes) -> list[int]:
 
 class HuaweiIbmcKvmGatewayAdapter:
     adapter_id = HUAWEI_IBMC_KVM_GATEWAY_ID
-    connection_limit = 1
-    supports_upstream_recovery = False
-    login_budget = 35.0
+    connection_limit = DRIVERS[adapter_id].connection_limit
+    supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
+    login_budget = DRIVERS[adapter_id].login_budget
 
     def __init__(self, info: dict, *, networks=None) -> None:
         target = urlsplit(info["target"])
@@ -223,7 +245,10 @@ class HuaweiIbmcKvmGatewayAdapter:
             bmc_allowed_networks_from_env() if networks is None else networks,
             adapter_id=self.adapter_id,
         )
-        expected_pin = huawei_kvm_pin_from_env()
+        asset_pin = str(info.get("fingerprint") or "").strip().lower().replace(":", "")
+        if asset_pin and not valid_pin(asset_pin):
+            raise Problem("bmc_cert_pin_invalid", 400)
+        expected_pin = resolve_huawei_pin(info, huawei_kvm_pin_from_env())
         if not valid_pin(expected_pin):
             raise Problem("bmc_cert_pin_unconfigured", 503)
         self.target = info["target"]
@@ -231,6 +256,18 @@ class HuaweiIbmcKvmGatewayAdapter:
         self.tls_pin = expected_pin
         self.upstream: HuaweiKvmUpstream | None = None
         self.session: HuaweiKvmRfbSession | None = None
+        self.video_lane = info.get('video_lane') or ''
+        if self.video_lane and (self.video_lane != 'transcode-v1' or not info.get('video_binding')):
+            raise Problem('pipeline_version_unavailable', 503)
+        self.client_v2 = False
+        if self.video_lane:
+            from ..video.client_v2 import protocol_contract, verify_bundle
+            if str(info.get('video_contract') or '') != protocol_contract():
+                raise Problem('pipeline_version_unavailable', 503)
+            verify_bundle()
+            self.client_v2 = True
+        self.video_before_resync = None
+        self._video_connected_once = False
 
     async def login(self, username: str, password: str) -> None:
         if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
@@ -247,35 +284,53 @@ class HuaweiIbmcKvmGatewayAdapter:
             raise Problem("subprotocol_required", 400)
         if self.session is not None and not self.session.closed:
             raise Problem("connection_limit")
+        if self.video_lane and self.session is not None and self.session.release_failed:
+            raise Problem('upstream_handshake_failed', 502)
         if self.upstream is None or not self.upstream.connected or self.upstream.ticket is None:
             raise Problem("upstream_handshake_failed", 502)
+        if self.video_lane:
+            if self.video_before_resync is None:
+                raise Problem('pipeline_version_unavailable', 503)
+            if self._video_connected_once:
+                await self.video_before_resync()
+                old = self.upstream
+                await old.close()
+                self.upstream = HuaweiKvmUpstream(self.host, old.username, old.password,
+                                                  tls_pin=self.tls_pin)
+                try:
+                    await self.upstream.connect()
+                except UpstreamError as exc:
+                    raise Problem(exc.code, exc.status) from exc
+            from ..video.huawei_session import HuaweiV1RfbSession
+            session = HuaweiV1RfbSession(self.upstream,
+                self.upstream.framebuffer_width, self.upstream.framebuffer_height,
+                before_resync=self.video_before_resync)
+            try:
+                await session.start()
+            except (ValueError, RuntimeError, OSError, TimeoutError) as exc:
+                raise Problem('pipeline_version_unavailable', 503) from exc
+            self._video_connected_once = True
+            self.session = session
+            return session
         width = self.upstream.framebuffer_width
         height = self.upstream.framebuffer_height
-        session = HuaweiKvmRfbSession(self.upstream, width, height)
+        session = HuaweiKvmRfbSession(self.upstream, width, height,
+            measure_video=os.environ.get("KVMHUB_HUAWEI_VIDEO_METRICS", "") == "1")
         await session.start()
         self.session = session
         return session
 
     async def fetch_asset(self, path: str) -> tuple[str, bytes]:
-        match = ASSET_PATH.fullmatch(path or "")
-        if match is None:
-            raise Problem("route_denied", 404)
-        name = match.group(1)
-        if not name.endswith(".js"):
-            name += ".js"
-        if name not in KNOWN_ASSETS:
-            raise Problem("route_denied", 404)
-        target = ASSET_DIR / name
-        if not target.is_file():
-            raise Problem("route_denied", 404)
-        return "application/javascript", target.read_bytes()
+        return await fetch_client_asset(path)
 
     async def close(self) -> bool:
+        input_cleanup_ok = True
         if self.session is not None:
             await self.session.close()
+            input_cleanup_ok = not getattr(self.session, 'release_failed', False)
             self.session = None
         if self.upstream is None:
             return False
         upstream, self.upstream = self.upstream, None
         await upstream.close()
-        return True
+        return input_cleanup_ok

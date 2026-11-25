@@ -1,6 +1,7 @@
 """M3 stage 1: the gateway rebuilds the BMC console without losing the session."""
 import asyncio
 import struct
+import time
 
 import pytest
 
@@ -24,7 +25,8 @@ def browser_hello(version=b"RFB 055.008\n"):
     return version + bytes([16]) + AUTH_REPLY + b"\x01"
 
 
-async def session_on(server, policy):
+async def session_on(server, policy, *, before_connect=None,
+                    require_before_connect=False):
     upstream = RfbUpstream(config_for(server, handshake_timeout=5, request_timeout=5))
     await upstream.login("operator", password=server.password)
     await upstream.open(request_frames=False)
@@ -32,7 +34,8 @@ async def session_on(server, policy):
     session = RfbPassthroughSession(
         upstream, BrowserHandshake(upstream.server_init_raw, version=version),
         allowed_client_messages=INSYDE_CLIENT_MESSAGES,
-        message_sizes=INSYDE_MESSAGE_SIZES, recovery=policy)
+        message_sizes=INSYDE_MESSAGE_SIZES, recovery=policy,
+        before_connect=before_connect, require_before_connect=require_before_connect)
     await session.start()
     return upstream, session, version
 
@@ -83,6 +86,40 @@ async def test_a_dropped_console_is_rebuilt_and_frames_resume(server):
     assert session.recovery.state == "relaying"
     assert session.recovery.last_latency_ms is not None
     assert not session.closed, "the browser stream must survive the rebuild"
+    await session.close()
+    await upstream.close()
+
+
+async def test_managed_rebuild_asks_for_a_fresh_permit_before_each_reopen(server):
+    calls = []
+
+    async def permit(attempt):
+        calls.append(attempt)
+        return {"start_deadline": time.time() + 30}
+
+    policy = RecoveryPolicy(attempts=1, first_delay=0.05, deadline=10)
+    upstream, session, version = await session_on(
+        server, policy, before_connect=permit, require_before_connect=True)
+    await complete_browser_side(session, version)
+
+    seen = await read_until(session, saw_last_frame)
+    assert saw_last_frame(seen), f"no frame after the authorized rebuild: {seen[-3:]!r}"
+    assert calls == [1], "one reopen, one fresh permit"
+    assert server.console_opens == 2
+    await session.close()
+    await upstream.close()
+
+
+async def test_managed_rebuild_without_the_hook_refuses_to_reopen(server):
+    policy = RecoveryPolicy(attempts=2, first_delay=0.02, deadline=10)
+    upstream, session, version = await session_on(
+        server, policy, require_before_connect=True)
+    await complete_browser_side(session, version)
+
+    await read_until(session, lambda messages: False)
+    assert server.console_opens == 1, "no unpermitted reopen"
+    assert session.recovery.state == "given_up"
+    assert session.recovery.last_error == "operation_permit_invalid"
     await session.close()
     await upstream.close()
 

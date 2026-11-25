@@ -458,10 +458,3 @@ def test_assembly_allows_standard_message_profile_for_builtin_vnc():
     assert applied["message_profile"] == "standard"
 
 
-def test_worker_serves_real_console_page_for_builtin_vnc():
-    import inspect
-
-    from kvmhub import worker
-
-    source = inspect.getsource(worker.Gateway.handle)
-    assert "IdracVncAdapter" in source

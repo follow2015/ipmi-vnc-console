@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 NON_RETRYABLE = frozenset({
     "bmc_auth_failed",
@@ -13,6 +13,8 @@ NON_RETRYABLE = frozenset({
     "client_message_malformed",
     "connection_limit",
     "subprotocol_required",
+    "session_revoked", "device_not_admitted", "operation_permit_invalid",
+    "operation_permit_replayed", "connection_revision_mismatch",
 })
 
 NON_RETRYABLE_CLOSE_CODES = frozenset({12592})
@@ -77,6 +79,8 @@ class RecoveryState:
     last_latency_ms: int | None = None
     state: str = "relaying"
     history: list[str] = field(default_factory=list)
+    before_connect: Callable[[int], Awaitable[dict]] | None = None
+    require_before_connect: bool = False
 
     def may_try(self, error: str | None, close_code: int | None = None) -> bool:
         if self.state == "given_up" or self.policy.attempts <= 0:

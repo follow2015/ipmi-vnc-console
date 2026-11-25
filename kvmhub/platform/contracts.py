@@ -108,6 +108,17 @@ class AssetOccupancy(Contract):
     queue: str
 
 
+class DeviceAdmissionStatus(Contract):
+
+    asset_id: str
+    checked_at: float
+    state: str
+    available: bool
+    reason: str | None = None
+    desired: dict[str, Any] | None = None
+    applied: dict[str, Any] | None = None
+
+
 class Asset(Contract):
     id: str
     tenant_id: str | None = None
@@ -127,6 +138,7 @@ class Asset(Contract):
     grant_expires: float | None = None
     occupancy: AssetOccupancy | None = None
     occupancy_available: bool = False
+    admission: DeviceAdmissionStatus | None = None
 
 
 class PublicIpMapping(Contract):
@@ -218,9 +230,22 @@ class OnboardBrand(Contract):
     capabilities: list[OnboardCapability]
 
 
+class OnboardBlockedBrand(Contract):
+
+    profile_id: str
+    code: str
+    vendor: str
+    reason: str
+    state: str
+    detail: str
+    review_due: float | None = None
+    expires: float | None = None
+
+
 class AssetOnboarding(Contract):
 
     brands: list[OnboardBrand]
+    blocked: list[OnboardBlockedBrand]
     note: str
 
 
@@ -365,6 +390,7 @@ class DataPlaneAssembly(Contract):
 
 class ConnectionAssembly(Contract):
     ready: bool
+    overlay: dict[str, Any] | None = None
     delivery: str
     asset_id: str
     address: str
@@ -498,6 +524,28 @@ class AuditRow(Contract):
     detail: dict[str, Any]
 
 
+class OverlayFirmwareWindow(Contract):
+    min: str
+    max: str
+
+
+class ProfileOverlayView(Contract):
+    id: str
+    base_profile_id: str
+    revision: int
+    base_revision: int
+    state: str
+    model_subset: list[str]
+    firmware_subset: OverlayFirmwareWindow
+    concurrency: int
+
+
+class OverlayBindingResult(Contract):
+    asset_id: str
+    overlay_id: str
+    revision: int
+
+
 CONTRACT_MODELS: dict[str, type[BaseModel]] = {
     name: value for name, value in list(globals().items())
     if isinstance(value, type) and value.__module__ == __name__
@@ -516,6 +564,11 @@ def contract_components() -> dict[str, dict]:
 
 
 CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
+    '/api/v2/profile-overlays': {'get': 'list:ProfileOverlayView'},
+    '/api/v2/profile-overlays/{profile_id}': {'put': 'ProfileOverlayView'},
+    '/api/v2/profile-overlays/{overlay_id}/disable': {'post': 'ProfileOverlayView'},
+    '/api/v2/assets/{asset_id}/profile-overlay': {'put': 'OverlayBindingResult'},
+    '/api/v2/platform/profile-overlays/{overlay_id}/withdraw': {'post': 'ProfileOverlayView'},
     "/healthz": {"get": "Healthz"},
     "/readyz": {"get": "Readyz"},
     "/api/v2/login": {"post": "LoginResult"},
@@ -528,6 +581,7 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/users/{user_id}/active": {"post": "OkResult"},
     "/api/v2/users/{user_id}/password": {"post": "OkResult"},
     "/api/v2/assets": {"get": "list:Asset", "post": "Asset"},
+    "/api/v2/assets/{asset_id}/admission": {"get": "DeviceAdmissionStatus"},
     "/api/v2/asset-onboarding": {"get": "AssetOnboarding"},
     "/api/v2/assets/probe": {"post": "AssetProbeResult"},
     "/api/v2/public-ips": {"get": "list:PublicIpMapping"},
@@ -567,6 +621,7 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/platform/assets/assign": {"post": "AssetAssignment"},
     "/api/v2/platform/assets/grant": {"post": "PlatformGrantResult"},
     "/api/v2/platform/assets/{asset_id}/reset": {"post": "AssetResetResult"},
+    "/api/v2/platform/assets/{asset_id}/admission": {"get": "DeviceAdmissionStatus"},
     "/api/v2/platform/audit": {"get": "list:AuditRow"},
     "/api/v2/platform/quota-usage": {"get": "list:QuotaUsage"},
     "/api/v2/platform/sessions": {"get": "list:SessionView"},

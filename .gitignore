@@ -30,11 +30,15 @@ deploy/certbot/renewal-hooks/
 
 # Front-end build output and dependencies (the lockfile IS committed)
 frontend/node_modules/
+.pnpm-store/
 frontend/dist/
 *.tsbuildinfo
 
 # 并发 pytest 的独立 basetemp；证据落在 docs 后这些只是中间产物
 .pytest-tmp-*/
+
+# 本计划的隔离施工工作区（不进主仓、不进公开仓）
+.worktrees/
 
 # 公开部署仓（sync_to_deploy.py 的目标，独立 git 仓，不进主仓）
 ipmi-vnc-console-deploy/

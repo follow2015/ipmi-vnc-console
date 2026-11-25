@@ -168,6 +168,30 @@ def test_adapter_requires_pin_and_controlled_network(monkeypatch):
     assert exc.value.code == "bmc_cert_pin_unconfigured"
 
 
+def test_vnc_adapter_prefers_asset_fingerprint_over_env_pin(monkeypatch):
+    monkeypatch.setenv(PIN_ENV, "ef" * 32)
+    monkeypatch.setenv("KVMHUB_BMC_ALLOWED_NETWORKS", "192.0.2.0/24")
+    asset_pin = "cd" * 32
+    adapter = make_adapter(dict(INFO, fingerprint=asset_pin))
+    assert adapter.pin == asset_pin
+
+
+def test_vnc_adapter_uses_asset_fingerprint_without_env_pin(monkeypatch):
+    monkeypatch.delenv(PIN_ENV, raising=False)
+    monkeypatch.setenv("KVMHUB_BMC_ALLOWED_NETWORKS", "192.0.2.0/24")
+    asset_pin = "cd" * 32
+    adapter = make_adapter(dict(INFO, fingerprint=asset_pin))
+    assert adapter.pin == asset_pin
+
+
+def test_vnc_adapter_rejects_malformed_asset_fingerprint(monkeypatch):
+    monkeypatch.setenv(PIN_ENV, "ef" * 32)
+    monkeypatch.setenv("KVMHUB_BMC_ALLOWED_NETWORKS", "192.0.2.0/24")
+    with pytest.raises(Problem) as exc:
+        make_adapter(dict(INFO, fingerprint="bad"))
+    assert exc.value.code == "bmc_cert_pin_invalid"
+
+
 def test_store_gate_applies_controlled_network_to_huawei():
     from kvmhub.store import Store
     store = Store.__new__(Store)

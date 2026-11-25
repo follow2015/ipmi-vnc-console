@@ -11,7 +11,8 @@ from xml.etree import ElementTree as ET
 import aiohttp
 
 from .ast2100_protocol import parse_server_init, parse_server_init_extension
-from .common import Problem, require_controlled_host
+from .common import (Problem, aten_http_codebase_hosts_from_env,
+                     require_controlled_host)
 from .rfb_protocol import SupermicroProtocol
 
 JAVA_LAUNCH_PATH = "/cgi/url_redirect.cgi?url_name=ikvm&url_type=jwsk"
@@ -19,7 +20,7 @@ MAX_HTTP_BYTES = 512 * 1024
 RFB_VERSION = b"RFB 003.008\n"
 
 
-def parse_java_launch(body: bytes, host: str) -> tuple[str, str]:
+def parse_java_launch(body: bytes, host: str, *, allow_http_codebase: bool = False) -> tuple[str, str]:
     if (len(body) > MAX_HTTP_BYTES or b"\0" in body
             or re.search(rb"<!\s*(?:DOCTYPE|ENTITY)", body, re.I)):
         raise ValueError("invalid_java_launch")
@@ -28,14 +29,18 @@ def parse_java_launch(body: bytes, host: str) -> tuple[str, str]:
         codebase = urlsplit(root.get("codebase", ""))
         app = root.find("application-desc")
         args = [node.text or "" for node in app.findall("argument")] if app is not None else []
+        secure_codebase = (codebase.scheme == "https" and codebase.port in (None, 443))
+        allowed_http_codebase = (
+            allow_http_codebase and codebase.scheme == "http" and codebase.port == 80)
         valid = (
-            root.tag == "jnlp" and codebase.scheme == "https"
-            and codebase.hostname == host and codebase.port in (None, 443)
+            root.tag == "jnlp" and (secure_codebase or allowed_http_codebase)
+            and codebase.hostname == host
             and codebase.username is None and codebase.password is None
             and codebase.path in ("", "/") and not codebase.query and not codebase.fragment
             and app is not None and app.get("main-class") == "tw.com.aten.ikvm.KVMMain"
             and len(args) in (10, 11) and args[0] == host
-            and args[4] == "5900" and args[8] == "0"
+            and args[4] == "5900"
+            and args[8] in (("0", "1") if allow_http_codebase else ("0",))
             and all(re.fullmatch(r"[A-Za-z0-9_-]{16}", value) for value in args[1:3])
         )
     except (ET.ParseError, ValueError, TypeError):
@@ -47,11 +52,15 @@ def parse_java_launch(body: bytes, host: str) -> tuple[str, str]:
 
 class AtenJavaUpstream:
 
-    def __init__(self, host: str, fingerprint: str, *, networks) -> None:
+    def __init__(self, host: str, fingerprint: str, *, networks,
+                 allow_http_codebase: bool | None = None) -> None:
         require_controlled_host(host, networks)
         if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
             raise Problem("invalid_target_policy", 502)
         self.host = host
+        self.allow_http_codebase = (
+            host in aten_http_codebase_hosts_from_env()
+            if allow_http_codebase is None else bool(allow_http_codebase))
         self._fingerprint = bytes.fromhex(fingerprint)
         self._http: aiohttp.ClientSession | None = None
         self._cookies: dict[str, str] = {}
@@ -102,7 +111,8 @@ class AtenJavaUpstream:
                 if status != 200:
                     raise Problem("upstream_invalid_response", 502)
                 try:
-                    ticket_user, ticket_password = parse_java_launch(body, self.host)
+                    ticket_user, ticket_password = parse_java_launch(
+                        body, self.host, allow_http_codebase=self.allow_http_codebase)
                 except ValueError:
                     raise Problem("upstream_invalid_response", 502) from None
                 body = b""

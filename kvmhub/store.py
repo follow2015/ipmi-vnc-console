@@ -11,9 +11,9 @@ from contextlib import contextmanager
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
-from .common import (ATEN_JAVA_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                     IDRAC8_ADAPTER_ID,
-                     IDRAC_VNC_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID, Problem,
+from .operation_permit import verify_operation_permit
+from .driver_specs import DRIVERS, REAL_ADAPTER_IDS
+from .common import (PASSTHROUGH_ADAPTER_ID, Problem,
                      bmc_allowed_networks_from_env, parse_controlled_networks)
 from .sql_backend import (INTEGRITY_ERRORS, mysql_capability_ddl, open_store,
                           parse_store_dsn)
@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS asset (
 CREATE TABLE IF NOT EXISTS access_grant (
  user_id TEXT NOT NULL, asset_id TEXT NOT NULL REFERENCES asset(id), expires REAL NOT NULL,
  PRIMARY KEY(user_id,asset_id));
+CREATE TABLE IF NOT EXISTS connection_snapshot (
+ asset_id TEXT NOT NULL, revision INTEGER NOT NULL, payload_cipher BLOB NOT NULL,
+ digest TEXT NOT NULL, `schema` TEXT NOT NULL, domain_id TEXT NOT NULL,
+ generation TEXT NOT NULL, policy_fingerprint TEXT NOT NULL, created REAL NOT NULL,
+ PRIMARY KEY(asset_id,revision));
+CREATE TABLE IF NOT EXISTS plane_projection (
+ asset_id TEXT PRIMARY KEY, domain_id TEXT NOT NULL, current_revision INTEGER NOT NULL,
+ current_digest TEXT NOT NULL, generation TEXT NOT NULL, policy_fingerprint TEXT NOT NULL,
+ status TEXT NOT NULL, ack_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS subject_authz (
  user_id TEXT PRIMARY KEY, console_allowed INTEGER NOT NULL DEFAULT 1,
  epoch INTEGER NOT NULL DEFAULT 0);
@@ -63,6 +72,9 @@ CREATE TABLE IF NOT EXISTS session (
  epoch INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS asset_slot (
  asset_id TEXT PRIMARY KEY REFERENCES asset(id), session_id TEXT NOT NULL UNIQUE REFERENCES session(id));
+CREATE TABLE IF NOT EXISTS operation_consumption (
+ jti TEXT PRIMARY KEY, sid TEXT NOT NULL, operation TEXT NOT NULL,
+ binding_digest TEXT NOT NULL, expires REAL NOT NULL, consumed_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, trace_id TEXT NOT NULL,
  actor TEXT NOT NULL, action TEXT NOT NULL, session_id TEXT, detail TEXT NOT NULL);
@@ -95,6 +107,16 @@ CREATE TABLE IF NOT EXISTS asset (
 CREATE TABLE IF NOT EXISTS access_grant (
  user_id VARCHAR(128) NOT NULL, asset_id VARCHAR(64) NOT NULL, expires DOUBLE NOT NULL,
  PRIMARY KEY(user_id,asset_id), INDEX ix_grant_asset (asset_id), INDEX ix_grant_expiry (expires));
+CREATE TABLE IF NOT EXISTS connection_snapshot (
+ asset_id VARCHAR(64) NOT NULL, revision INT NOT NULL, payload_cipher LONGBLOB NOT NULL,
+ digest VARCHAR(64) NOT NULL, `schema` VARCHAR(32) NOT NULL, domain_id VARCHAR(128) NOT NULL,
+ generation VARCHAR(64) NOT NULL, policy_fingerprint VARCHAR(128) NOT NULL,
+ created DOUBLE NOT NULL, PRIMARY KEY(asset_id,revision), INDEX ix_snapshot_asset (asset_id));
+CREATE TABLE IF NOT EXISTS plane_projection (
+ asset_id VARCHAR(64) PRIMARY KEY, domain_id VARCHAR(128) NOT NULL,
+ current_revision INT NOT NULL, current_digest VARCHAR(64) NOT NULL,
+ generation VARCHAR(64) NOT NULL, policy_fingerprint VARCHAR(128) NOT NULL,
+ status VARCHAR(32) NOT NULL, ack_at DOUBLE NOT NULL);
 CREATE TABLE IF NOT EXISTS subject_authz (
  user_id VARCHAR(128) PRIMARY KEY, console_allowed INT NOT NULL DEFAULT 1,
  epoch INT NOT NULL DEFAULT 0);
@@ -110,6 +132,10 @@ CREATE TABLE IF NOT EXISTS session (
  INDEX ix_session_created (created));
 CREATE TABLE IF NOT EXISTS asset_slot (
  asset_id VARCHAR(64) PRIMARY KEY, session_id VARCHAR(64) NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS operation_consumption (
+ jti VARCHAR(64) PRIMARY KEY, sid VARCHAR(64) NOT NULL, operation VARCHAR(32) NOT NULL,
+ binding_digest VARCHAR(64) NOT NULL, expires DOUBLE NOT NULL, consumed_at DOUBLE NOT NULL,
+ INDEX ix_operation_session (sid), INDEX ix_operation_expires (expires));
 CREATE TABLE IF NOT EXISTS audit (
  id BIGINT AUTO_INCREMENT PRIMARY KEY, ts DOUBLE NOT NULL, trace_id VARCHAR(64) NOT NULL,
  actor VARCHAR(128) NOT NULL, action VARCHAR(96) NOT NULL, session_id VARCHAR(64),
@@ -142,6 +168,14 @@ CAPABILITY_COLUMNS = {
 
 SESSION_COLUMNS = {
     "end_evidence": "TEXT",
+    "binding_digest": "TEXT NOT NULL DEFAULT ''",
+    "domain_id": "TEXT NOT NULL DEFAULT ''",
+    "connection_revision": "INTEGER NOT NULL DEFAULT 0",
+    "admission_revision": "INTEGER NOT NULL DEFAULT 0",
+    "lease_not_after": "REAL NOT NULL DEFAULT 0",
+    "snapshot_digest": "TEXT NOT NULL DEFAULT ''",
+    "tenant_id": "TEXT NOT NULL DEFAULT ''",
+    "generation": "TEXT NOT NULL DEFAULT ''",
     "epoch": "INTEGER NOT NULL DEFAULT 0",
 }
 
@@ -162,7 +196,8 @@ class Store:
     def __init__(self, path, key: bytes | None = None, clock=time.time, lease_seconds=30,
                  passthrough_targets: tuple[str, ...] = (),
                  strict_grants: bool | None = None,
-                 bmc_allowed_networks: tuple[str, ...] | None = None):
+                 bmc_allowed_networks: tuple[str, ...] | None = None,
+                 generation: str | None = None):
         self._dsn = parse_store_dsn(str(path))
         self.dialect = self._dsn.dialect
         self.strict_grants = _env_strict_grants() if strict_grants is None else strict_grants
@@ -178,6 +213,9 @@ class Store:
         self._migrate()
         self.cipher = AESGCM(key) if key is not None else None
         self.clock, self.lease_seconds = clock, lease_seconds
+        self._generation_explicit = generation is not None
+        self.generation = generation or uuid.uuid4().hex
+        self.projection_conflicts = 0
         self.passthrough_targets = frozenset(passthrough_targets)
         raw_networks = (bmc_allowed_networks_from_env()
                         if bmc_allowed_networks is None else bmc_allowed_networks)
@@ -563,6 +601,176 @@ class Store:
                        detail={"asset": asset_id, "capability": capability_id,
                                "user": user_id, "target": target})
 
+
+    def put_connection_snapshot(self, asset_id: str, revision: int, snapshot: dict, *,
+                                digest: str, domain_id: str, generation: str,
+                                policy_fingerprint: str) -> dict:
+        if not asset_id or not isinstance(revision, int) or revision < 1:
+            raise Problem("invalid_request", 400)
+        digest = str(digest or "").strip().lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise Problem("invalid_request", 400)
+        if not all((domain_id, generation, policy_fingerprint)):
+            raise Problem("invalid_request", 400)
+        if self._generation_explicit and not secrets.compare_digest(
+                str(self.generation), str(generation)):
+            raise Problem("connection_snapshot_conflict", 409)
+        if not isinstance(snapshot, dict):
+            raise Problem("invalid_request", 400)
+        forbidden = {"password", "passwd", "secret", "private_key", "credential"}
+        if any(key.lower() in forbidden for key in snapshot):
+            raise Problem("invalid_request", 400)
+        schema = str(snapshot.get("schema") or "v2")
+        if schema not in ("v2", "tombstone"):
+            raise Problem("invalid_request", 400)
+        if self.cipher is None:
+            raise Problem("credential_unavailable", 503)
+
+        payload = dict(snapshot)
+        payload["schema"] = schema
+        nonce = secrets.token_bytes(12)
+        encrypted = nonce + self.cipher.encrypt(
+            nonce,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            f"{asset_id}:{revision}".encode())
+
+        with self.tx():
+            existing = self.db.execute(
+                "SELECT digest FROM connection_snapshot WHERE asset_id=? AND revision=?",
+                (asset_id, revision)).fetchone()
+            projection = self.db.execute(
+                "SELECT current_revision,current_digest,status FROM plane_projection "
+                "WHERE asset_id=?", (asset_id,)).fetchone()
+
+            if existing is not None and existing["digest"] != digest:
+                self.projection_conflicts += 1
+                logger.warning("connection_snapshot_conflict asset=%s revision=%s",
+                               asset_id, revision)
+                raise Problem("connection_snapshot_conflict", 409)
+            if (projection is not None
+                    and int(projection["current_revision"]) == revision
+                    and projection["current_digest"] != digest):
+                self.projection_conflicts += 1
+                logger.warning("projection_digest_conflict asset=%s revision=%s",
+                               asset_id, revision)
+                raise Problem("connection_snapshot_conflict", 409)
+
+            if existing is None:
+                self.db.execute(
+                    "INSERT INTO connection_snapshot(asset_id,revision,payload_cipher,digest,"
+                    "`schema`,domain_id,generation,policy_fingerprint,created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (asset_id, revision, encrypted, digest, schema, domain_id,
+                     generation, policy_fingerprint, self.clock()))
+
+            status = "revoked" if schema == "tombstone" else "pending"
+            if projection is None:
+                self.db.execute(
+                    "INSERT INTO plane_projection(asset_id,domain_id,current_revision,"
+                    "current_digest,generation,policy_fingerprint,status,ack_at) "
+                    "VALUES(?,?,?,?,?,?,?,0)",
+                    (asset_id, domain_id, revision, digest, generation,
+                     policy_fingerprint, status))
+            elif int(projection["current_revision"]) < revision:
+                self.db.execute(
+                    "UPDATE plane_projection SET domain_id=?,current_revision=?,"
+                    "current_digest=?,generation=?,policy_fingerprint=?,status=?,ack_at=0 "
+                    "WHERE asset_id=?",
+                    (domain_id, revision, digest, generation, policy_fingerprint,
+                     status, asset_id))
+        if not self._generation_explicit:
+            self.generation = str(generation)
+        return self.projection_state(asset_id) or {}
+
+    def projection_state(self, asset_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM plane_projection WHERE asset_id=?", (asset_id,)).fetchone()
+        if row is None:
+            return None
+        generation_ok = secrets.compare_digest(str(row["generation"]), self.generation)
+        status = str(row["status"])
+        usable = generation_ok and status == "ready"
+        if not generation_ok:
+            reason = "generation_mismatch"
+        elif status == "revoked":
+            reason = "revoked"
+        elif status != "ready":
+            reason = "projection_not_acknowledged"
+        else:
+            reason = None
+        return {
+            "asset_id": asset_id,
+            "domain_id": row["domain_id"],
+            "current_revision": int(row["current_revision"]),
+            "current_digest": row["current_digest"],
+            "generation": row["generation"],
+            "policy_fingerprint": row["policy_fingerprint"],
+            "status": status,
+            "ack_at": float(row["ack_at"] or 0),
+            "usable": usable,
+            "reason": reason,
+        }
+
+    def ack_projection(self, asset_id: str, revision: int, *, digest: str) -> bool:
+        digest = str(digest or "").strip().lower()
+        with self.tx():
+            row = self.db.execute(
+                "SELECT current_revision,current_digest,status FROM plane_projection "
+                "WHERE asset_id=?", (asset_id,)).fetchone()
+            if (row is None or int(row["current_revision"]) != revision
+                    or row["current_digest"] != digest or row["status"] != "pending"):
+                return False
+            self.db.execute(
+                "UPDATE plane_projection SET status='ready',ack_at=? WHERE asset_id=?",
+                (self.clock(), asset_id))
+        return True
+
+
+    def consume_operation(self, permit: str, *, public_key, operation: str, sid: str,
+                          binding: str, expected: dict | None = None,
+                          now: float | None = None) -> dict:
+        stamp = self.clock() if now is None else now
+        checks = {"op": operation, "sid": sid}
+        checks.update(expected or {})
+        claims = verify_operation_permit(public_key, permit, expected=checks, now=stamp)
+        if claims["exp"] <= stamp or claims["lna"] and claims["lna"] <= stamp:
+            raise Problem("operation_permit_invalid", 401)
+        if not binding or len(binding) != 64:
+            raise Problem("operation_permit_invalid", 401)
+        try:
+            self.db.execute(
+                "INSERT INTO operation_consumption(jti,sid,operation,binding_digest,expires,consumed_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (claims["jti"], sid, operation, binding, claims["exp"], stamp))
+        except INTEGRITY_ERRORS:
+            raise Problem("operation_permit_replayed", 409) from None
+        return claims
+
+    def purge_operations(self, now: float | None = None, *, retention: float = 300.0) -> int:
+        stamp = self.clock() if now is None else now
+        with self.tx():
+            cursor = self.db.execute(
+                "DELETE FROM operation_consumption WHERE expires<?", (stamp - retention,))
+            return cursor.rowcount or 0
+
+    def start_operation(self, sid: str, worker: str, instance: str, operation: str,
+                        *, permit: str, public_key, binding: str,
+                        expected: dict | None = None) -> dict:
+        with self.tx():
+            row = self.worker_row(sid, worker, instance)
+            if row["status"] not in ("active", "connecting") or row.get("binding_digest") != binding:
+                raise Problem("connection_revision_mismatch", 409)
+            claims = self.consume_operation(
+                permit, public_key=public_key, operation=operation, sid=sid,
+                binding=binding, expected=expected)
+            stamp = self.clock()
+            ceiling = min(claims["lna"] or stamp + 5, stamp + 5, row["hard_until"])
+            if ceiling <= stamp:
+                raise Problem("operation_permit_invalid", 401)
+        self.event(worker, "operation_permit_consumed", sid,
+                   {"operation": operation}, trace=None)
+        return {"start_deadline": ceiling, "lease_not_after": claims["lna"]}
+
     def assets(self, user):
         return [dict(r) for r in self.db.execute(
             "SELECT a.id,a.name FROM asset a JOIN access_grant g ON a.id=g.asset_id WHERE g.user_id=? AND g.expires>?",
@@ -601,14 +809,11 @@ class Store:
     def _adapter_allowed(self, row) -> bool:
         if row["adapter"] == "mock-v1":
             return True
-        if row["adapter"] not in (PASSTHROUGH_ADAPTER_ID, IDRAC8_ADAPTER_ID,
-                                  IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                                  HUAWEI_IBMC_KVM_GATEWAY_ID, ATEN_JAVA_ADAPTER_ID):
+        if row["adapter"] not in REAL_ADAPTER_IDS:
             return False
         if row["target"] not in self.passthrough_targets:
             return False
-        if row["adapter"] in (IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                              HUAWEI_IBMC_KVM_GATEWAY_ID, ATEN_JAVA_ADAPTER_ID):
+        if DRIVERS[row["adapter"]].controlled_network:
             import ipaddress
             from urllib.parse import urlsplit
             host = urlsplit(str(row["target"])).hostname
@@ -631,26 +836,47 @@ class Store:
             raise Problem("permission_denied", 403)
         return row
 
-    def allocate(self, aid, user, worker, instance, trace, *, hard_cap: float | None = None):
+    def allocate(self, aid, user, worker, instance, trace, *, hard_cap: float | None = None,
+                 sid: str | None = None, permit: str | None = None, public_key=None,
+                 binding: str = "", expected: dict | None = None):
         now = self.clock()
+        if sid is not None and (not isinstance(sid, str) or len(sid) != 32):
+            raise Problem("operation_permit_invalid", 400)
+        candidate = sid or uuid.uuid4().hex
         with self.tx():
             asset = self.eligible(aid, user)
             if self.db.execute("SELECT 1 FROM asset_slot WHERE asset_id=?", (aid,)).fetchone():
                 raise Problem("asset_busy", 409)
-            sid = uuid.uuid4().hex
-            hard = min(now + 4 * 3600, asset["grant_expires"], asset["cap_expires"])
+            if permit is not None:
+                claims = self.consume_operation(
+                    permit, public_key=public_key, operation="allocate", sid=candidate,
+                    binding=binding, expected=expected)
+                ceiling = claims["lna"] or now + 4 * 3600
+            else:
+                ceiling = now + 4 * 3600
+            hard = min(ceiling, asset["grant_expires"], asset["cap_expires"])
             if hard_cap is not None:
                 hard = min(hard, hard_cap)
             _, subject_epoch = self.subject_state(user)
-            self.db.execute("INSERT INTO session(id,user_id,asset_id,worker_id,instance_id,jti,status,created,phase_until,lease_until,hard_until,epoch) "
-                            "VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?)",
-                            (sid, user, aid, worker, instance, uuid.uuid4().hex, now, min(now + 60, hard), 0, hard, subject_epoch))
+            self.db.execute("INSERT INTO session(id,user_id,asset_id,worker_id,instance_id,jti,status,"
+                            "created,phase_until,lease_until,hard_until,epoch,binding_digest,domain_id,"
+                            "connection_revision,admission_revision,lease_not_after,snapshot_digest,"
+                            "generation,tenant_id) "
+                            "VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (candidate, user, aid, worker, instance, uuid.uuid4().hex, now,
+                             min(now + 60, hard), 0, hard, subject_epoch, binding,
+                             str((expected or {}).get("dom", "")),
+                             int((expected or {}).get("cr", 0)),
+                             int((expected or {}).get("ar", 0)), ceiling,
+                             str((expected or {}).get("dgs", "")),
+                             str((expected or {}).get("gen", "")),
+                             str((expected or {}).get("tid", ""))))
             try:
-                self.db.execute("INSERT INTO asset_slot VALUES(?,?)", (aid, sid))
+                self.db.execute("INSERT INTO asset_slot VALUES(?,?)", (aid, candidate))
             except INTEGRITY_ERRORS:
                 raise Problem("asset_busy", 409) from None
-            self.event(user, "session_requested", sid, trace=trace)
-        return self.get(sid)
+            self.event(user, "session_requested", candidate, trace=trace)
+        return self.get(candidate)
 
     def pending_cleanups(self, now=None, *, threshold=300.0) -> list[dict]:
         current = self.clock() if now is None else now
@@ -674,7 +900,8 @@ class Store:
         if row["status"] in ("closed", "failed", "lost") and row["cleanup"] in ("confirmed", "not_needed"):
             self.db.execute("DELETE FROM asset_slot WHERE session_id=?", (sid,))
 
-    def exchange(self, claims, trace):
+    def exchange(self, claims, trace, *, permit: str | None = None, public_key=None,
+                 binding: str = "", assembly_binding: str = ""):
         sid = claims["sid"]
         with self.tx():
             row = self.get(sid)
@@ -683,14 +910,35 @@ class Store:
                 raise Problem("invalid_ticket", 403)
             if row["status"] != "pending" or row["consumed"] or row["phase_until"] <= self.clock():
                 raise Problem("ticket_consumed_or_expired", 409)
+            ceiling = float(row["lease_not_after"] or 0) or None
+            if permit is not None:
+                if not (binding and binding == assembly_binding
+                        and binding == row["binding_digest"]):
+                    raise Problem("connection_revision_mismatch", 409)
+                if claims.get("bdg") and claims["bdg"] != binding:
+                    raise Problem("connection_revision_mismatch", 409)
+                expected = {"aid": row["asset_id"], "usr": row["user_id"],
+                            "dom": row["domain_id"], "wid": row["worker_id"],
+                            "iid": row["instance_id"], "cr": row["connection_revision"],
+                            "ar": row["admission_revision"]}
+                consumed = self.consume_operation(
+                    permit, public_key=public_key, operation="exchange", sid=sid,
+                    binding=binding, expected=expected)
+                ceiling = min(consumed["lna"] or ceiling or float("inf"),
+                              ceiling or float("inf"))
+            elif claims.get("bdg") and row["binding_digest"] and claims["bdg"] != row["binding_digest"]:
+                raise Problem("connection_revision_mismatch", 409)
             asset = self.eligible(row["asset_id"], row["user_id"])
             now = self.clock()
-            lease = min(now + self.lease_seconds, row["hard_until"])
+            lease = min(now + self.lease_seconds, row["hard_until"],
+                        ceiling or float("inf"))
+            if lease <= now:
+                raise Problem("ticket_consumed_or_expired", 409)
             updated = self.db.execute(
                 "UPDATE session SET consumed=1,status='connecting',cleanup='pending',"
                 "version=version+1,phase_until=?,lease_until=? "
                 "WHERE id=? AND consumed=0 AND status='pending'",
-                (min(now+30,row["hard_until"]), lease, sid))
+                (min(now + 30, row["hard_until"], ceiling or float("inf")), lease, sid))
             if not updated.rowcount:
                 raise Problem("ticket_consumed_or_expired", 409)
             self.event(row["worker_id"], "ticket_consumed", sid, trace=trace)
@@ -724,9 +972,11 @@ class Store:
             raise Problem("instance_mismatch", 403)
         return row
 
-    def renew(self, sid, worker, instance, activate=False, trace=None):
+    def renew(self, sid, worker, instance, activate=False, trace=None, *,
+              permit: str | None = None, public_key=None, binding: str = ""):
         try:
-            return self._renew(sid, worker, instance, activate, trace)
+            return self._renew(sid, worker, instance, activate, trace,
+                               permit=permit, public_key=public_key, binding=binding)
         except _CapabilityLost:
             with self.tx():
                 row = self.get(sid)
@@ -738,7 +988,8 @@ class Store:
                                {"cause": "renew_gate_closed"})
             raise Problem("capability_withdrawn", 410) from None
 
-    def _renew(self, sid, worker, instance, activate, trace):
+    def _renew(self, sid, worker, instance, activate, trace, *, permit=None, public_key=None,
+               binding=""):
         subject_revoked_reason = None
         with self.tx():
             row = self.worker_row(sid, worker, instance)
@@ -747,6 +998,19 @@ class Store:
                     or row["lease_until"] <= now or row["hard_until"] <= now
                     or (activate and row["phase_until"] <= now)):
                 raise Problem("session_revoked", 410)
+            ceiling = float(row["lease_not_after"] or 0) or None
+            if permit is not None:
+                if not binding or binding != row["binding_digest"]:
+                    raise Problem("connection_revision_mismatch", 409)
+                operation = "activate" if activate else "renew"
+                consumed = self.consume_operation(
+                    permit, public_key=public_key, operation=operation, sid=sid,
+                    binding=binding,
+                    expected={"aid": row["asset_id"], "usr": row["user_id"],
+                              "dom": row["domain_id"], "wid": worker, "iid": instance,
+                              "cr": row["connection_revision"], "ar": row["admission_revision"]})
+                ceiling = min(consumed["lna"] or ceiling or float("inf"),
+                              ceiling or float("inf"))
             console_allowed, subject_epoch = self.subject_state(row["user_id"])
             if not console_allowed or int(row["epoch"]) < subject_epoch:
                 subject_revoked_reason = "revoked" if not console_allowed else "role_downgraded"
@@ -764,7 +1028,10 @@ class Store:
                         raise _CapabilityLost() from None
                     raise
                 until = min(now + self.lease_seconds, row["hard_until"],
-                            asset["grant_expires"], asset["cap_expires"])
+                            asset["grant_expires"], asset["cap_expires"],
+                            ceiling or float("inf"))
+                if until <= now:
+                    raise Problem("session_revoked", 410)
                 expected = "connecting" if activate else "active"
                 updated = self.db.execute(
                     "UPDATE session SET status='active',lease_until=?,version=version+1 "
@@ -856,6 +1123,7 @@ class Store:
             for r in stale:
                 self.release_confirmed(r["id"])
             now = self.clock()
+            self.db.execute("DELETE FROM operation_consumption WHERE expires<?", (now - 300,))
             for r in self.db.execute("SELECT * FROM session WHERE status IN ('pending','connecting','active','closing')").fetchall():
                 status = None
                 deadline_col = None

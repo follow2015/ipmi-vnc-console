@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import os
 import secrets
 import time
 import uuid
@@ -14,20 +15,23 @@ from aiohttp import WSMsgType, web
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 from . import common
+from .driver_specs import spec_for_adapter
+from .driver_factory import make_adapter
 from .adapter import MockAdapter
-from .adapters.idrac8 import Idrac8Adapter
 from .adapters.idrac_vnc import IdracVncAdapter
 from .adapters.aten_java import AtenJavaAdapter
 from .adapters.huawei_ibmc_vnc import HuaweiIbmcVncAdapter
 from .adapters.huawei_ibmc_kvm_gateway import HuaweiIbmcKvmGatewayAdapter
 from .adapters.passthrough import ASSET_PATH as PASSTHROUGH_ASSET_PATH
 from .adapters.passthrough import PassthroughAdapter
+from .admission_runtime import TRUSTED_AUTHORITY_CODES
 from .common import (HOST_LABEL, PASSTHROUGH_ADAPTER_ID, PATH_SESSION,
                      SESSION_END_CODES, WORKER_HOST_SUFFIX, Problem,
                      accept_redirect_location, client_tls,
                      cookie_name_for, digest, path_segment_is_safe,
                      route_prefix_for, user_message, verify)
 from .platform.data_plane import assembled_info, verify_tenant
+from .platform.bus import LANE_VERSION_KEYS, pipeline_identity
 from .platform.text_input import keymap_document
 from .recovery import RecoveryPolicy, live_state
 from .session_state import Phase, SessionMachine
@@ -69,12 +73,20 @@ def cookie_max_age(hard_until: float, now: float) -> int:
 
 
 def input_protocol_for_adapter(adapter) -> str:
-    if isinstance(adapter, Idrac8Adapter):
-        return "view_only"
-    if isinstance(adapter, (IdracVncAdapter, HuaweiIbmcVncAdapter,
-                            HuaweiIbmcKvmGatewayAdapter)):
-        return "standard8"
-    return "insyde18"
+    spec = spec_for_adapter(adapter)
+    return spec.input_protocol if spec else "insyde18"
+
+
+def apply_client_bundle(adapter, info: dict) -> bool:
+    spec = spec_for_adapter(adapter)
+    if spec is None or spec.input_protocol != 'standard8' or spec.client_bundle != 'local_novnc':
+        adapter.client_v2 = False
+        return False
+    if hasattr(adapter, 'client_v2'):
+        return bool(adapter.client_v2)
+    from .video.client_v2 import select_for
+    adapter.client_v2 = select_for(info)
+    return adapter.client_v2
 
 
 def localize_console(text: str, request) -> str:
@@ -1836,27 +1848,13 @@ REAL_CONSOLE_JS = """'use strict';
 })();"""
 
 
-def make_adapter(info):
-    if info["adapter"] == "mock-v1":
-        return MockAdapter(info)
-    if info["adapter"] == PASSTHROUGH_ADAPTER_ID:
-        return PassthroughAdapter(info)
-    if info["adapter"] == common.IDRAC8_ADAPTER_ID:
-        return Idrac8Adapter(info)
-    if info["adapter"] == common.IDRAC_VNC_ADAPTER_ID:
-        return IdracVncAdapter(info)
-    if info["adapter"] == common.HUAWEI_IBMC_VNC_ADAPTER_ID:
-        return HuaweiIbmcVncAdapter(info)
-    if info["adapter"] == common.HUAWEI_IBMC_KVM_GATEWAY_ID:
-        return HuaweiIbmcKvmGatewayAdapter(info)
-    if info["adapter"] == common.ATEN_JAVA_ADAPTER_ID:
-        return AtenJavaAdapter(info)
-    raise Problem("adapter_not_verified", 403)
 
-
-def wire_recovery(adapter, policy):
+def wire_recovery(adapter, policy, *, before_connect=None,
+                  require_before_connect: bool = False):
     if getattr(adapter, "supports_upstream_recovery", False):
         adapter.recovery = policy
+        adapter.recovery_before_connect = before_connect
+        adapter.recovery_requires_permit = bool(require_before_connect)
     return adapter
 
 
@@ -1868,6 +1866,8 @@ class Runtime:
     lease_end: float
     asset_id: str = ""
     display_address: str = ""
+    binding: str = ""
+    transcode_lane: str = ""
     ws: set = field(default_factory=set)
     closing: bool = False
     close_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -1907,15 +1907,33 @@ class Gateway:
         self.task = None
         self.watchdogs = set()
         self.accepting = set()
+        self.transcode_reserved: set[str] = set()
+        try:
+            self.transcode_capacity = max(0, int(os.environ.get(
+                "KVMHUB_WORKER_TRANSCODE_CAPACITY", "0") or 0))
+        except (TypeError, ValueError):
+            self.transcode_capacity = 0
+        identity = pipeline_identity()
+        self.transcode_lane = identity['lane']
+        self.recipe_id = identity['recipe_id']
+        self.recipe_revision = identity['recipe_revision']
+        self.protocol_contract = identity['protocol_contract']
+        self.bundle_revision = identity['bundle_revision']
+        self.pipeline_schema = identity['schema_version']
+        self.lane_identity = {key: identity[key] for key in LANE_VERSION_KEYS}
 
-    async def apply_assembly(self, sid: str, info: dict, *, tenant_id: str = "") -> dict:
+    async def take_assembly_document(self, sid: str, *, tenant_id: str = "") -> dict:
         if self.assembly_bus is None:
-            return info
+            return {}
         assembly = await self.assembly_bus.take_assembly(sid)
         if assembly is None:
             raise Problem("assembly_missing", 502)
         verify_tenant(assembly, tenant_id)
-        return assembled_info(info, assembly)
+        return assembly
+
+    async def apply_assembly(self, sid: str, info: dict, *, tenant_id: str = "") -> dict:
+        assembly = await self.take_assembly_document(sid, tenant_id=tenant_id)
+        return assembled_info(info, assembly) if assembly else info
 
     def trace_for(self, sid):
         if sid is None:
@@ -1929,6 +1947,12 @@ class Gateway:
             return uuid.uuid4().hex
         return self.traces.get(sid) or uuid.uuid4().hex
 
+    async def _authorize_recover(self, sid: str) -> dict:
+        decision = await self.call(sid, "recover", {})
+        if float(decision.get("start_deadline") or 0) <= time.time():
+            raise Problem("operation_permit_invalid", 401)
+        return decision
+
     async def call(self, sid, operation, data=None):
         async with self.control.post(self.cfg["manager_internal"] + f"/internal/v1/sessions/{sid}/{operation}",
                                      json=data or {}, headers={"X-Trace-ID": self.trace_for(sid)},
@@ -1938,7 +1962,8 @@ class Gateway:
                         410: "session_revoked"}.get(response.status, "manager_unavailable")
                 with contextlib.suppress(Exception):
                     body = await response.json(content_type=None)
-                    if isinstance(body, dict) and body.get("error") in SESSION_END_CODES:
+                    if isinstance(body, dict) and body.get("error") in (
+                            SESSION_END_CODES | TRUSTED_AUTHORITY_CODES):
                         code = body["error"]
                 raise ManagerRejected(code, response.status)
             try:
@@ -2063,6 +2088,8 @@ class Gateway:
                     async with asyncio.timeout(3):
                         await ws.close(code=1001, message=b"session ended")
             cleaned = await sess.adapter.close()
+            if getattr(sess, "transcode_lane", ""):
+                self.transcode_reserved.discard(sess.sid)
             cleanup = "confirmed" if cleaned else "pending"
             sess.telemetry.cleanup_outcome = getattr(sess.adapter, "cleanup_outcome", None)
             record = self.record_end(sess, reason, cleanup)
@@ -2195,6 +2222,16 @@ class Gateway:
             raise Problem("authentication_required", 401)
         return sess
 
+    def _admit_transcode_lane(self, sid: str, lane: str, expected: dict,
+                             *, binding: str = "") -> None:
+        if lane != self.transcode_lane or self.transcode_capacity < 1 or not binding:
+            raise Problem("pipeline_version_unavailable")
+        if not isinstance(expected, dict) or expected != self.lane_identity:
+            raise Problem("pipeline_version_unavailable")
+        if sid in self.transcode_reserved or len(self.transcode_reserved) >= self.transcode_capacity:
+            raise Problem("transcode_capacity_exhausted")
+        self.transcode_reserved.add(sid)
+
     async def accept(self, request):
         if request.method != "POST" or request.headers.get("Origin") != self.cfg["manager_origin"]:
             raise Problem("csrf_rejected", 403)
@@ -2215,12 +2252,39 @@ class Gateway:
         started = time.monotonic()
         info = None
         adapter = None
+        lane = ""
+        reserved_for_lane = False
+        lane_rejected = ""
         try:
-            info = await self.call(claims["sid"], "exchange", {"ticket": tokens[0]})
-            info = await self.apply_assembly(claims["sid"], info,
-                                             tenant_id=str(claims.get("tid") or ""))
+            tenant_id = str(claims.get("tid") or "")
+            assembly = await self.take_assembly_document(claims["sid"], tenant_id=tenant_id)
+            binding = str(assembly.get("binding") or "")
+            lane = str(assembly.get("lane") or "")
+            if lane:
+                try:
+                    self._admit_transcode_lane(claims["sid"], lane,
+                                               assembly.get("pipeline_versions") or {},
+                                               binding=binding)
+                except Problem as exc:
+                    lane_rejected = exc.code
+                    raise
+                reserved_for_lane = True
+            info = await self.call(claims["sid"], "exchange",
+                                   {"ticket": tokens[0], "binding": binding})
+            if assembly:
+                info = assembled_info(info, assembly)
             hard_until = info["hard_until"]
-            adapter = wire_recovery(make_adapter(info), self.recovery)
+            before_connect = None
+            if binding:
+                before_connect = lambda _attempt, sid=claims["sid"]: self._authorize_recover(sid)
+            adapter = wire_recovery(make_adapter(info), self.recovery,
+                                    before_connect=before_connect,
+                                    require_before_connect=bool(binding))
+            apply_client_bundle(adapter, info)
+            if lane:
+                if not hasattr(adapter, 'video_before_resync'):
+                    raise Problem('pipeline_version_unavailable', 503)
+                adapter.video_before_resync = lambda sid=claims['sid']: self._authorize_recover(sid)
             deadline = started + info["lease_seconds"]
             login_budget = float(getattr(adapter, "login_budget", 10.0))
             async with asyncio.timeout(max(0.01, min(login_budget, deadline-time.monotonic()))):
@@ -2230,17 +2294,23 @@ class Gateway:
             cookie = secrets.token_urlsafe(32)
             sess = Runtime(claims["sid"], digest(cookie), adapter, sent + result["lease_seconds"],
                            asset_id=str(claims.get("aid") or info.get("asset_id") or ""),
-                           display_address=str(info.get("display_address") or ""))
+                           display_address=str(info.get("display_address") or ""),
+                           binding=binding, transcode_lane=lane)
             sess.machine.to(Phase.LIVE, "activated")
             self.sessions[sess.sid] = sess
             task = asyncio.create_task(self.lease_watchdog(sess))
             self.watchdogs.add(task)
             task.add_done_callback(self.watchdogs.discard)
         except (Exception, asyncio.CancelledError) as exc:
+            if reserved_for_lane:
+                self.transcode_reserved.discard(claims["sid"])
             if adapter is None:
                 if not isinstance(exc, Problem) or exc.code not in (
                         "ticket_consumed_or_expired", "worker_request_rejected", "session_revoked"):
-                    await self.report(claims["sid"], "not_needed", "exchange_failed")
+                    evidence = ({"cleanup_outcome": lane_rejected}
+                                if lane_rejected else None)
+                    await self.report(claims["sid"], "not_needed", "exchange_failed",
+                                      evidence=evidence)
             else:
                 cleaned = await adapter.close()
                 await self.report(claims["sid"], "confirmed" if cleaned else "pending", "login_failed")
@@ -2268,10 +2338,8 @@ class Gateway:
             raise Problem("session_revoked", 410)
         offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
         browser_offered = bool(offered)
-        if not offered and isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
-                                                      IdracVncAdapter,
-                                                      HuaweiIbmcVncAdapter,
-                                                      HuaweiIbmcKvmGatewayAdapter, AtenJavaAdapter)):
+        spec = spec_for_adapter(sess.adapter)
+        if not offered and spec is not None and spec.real_console:
             offered = ["binary"]
         if "binary" not in offered:
             raise Problem("subprotocol_required", 400)
@@ -2280,6 +2348,10 @@ class Gateway:
         sess.opening += 1
         self.cancel_idle(sess)
         try:
+            if sess.binding:
+                decision = await self.call(sess.sid, "reconnect", {})
+                if float(decision.get("start_deadline") or 0) <= time.time():
+                    raise Problem("operation_permit_invalid", 401)
             upstream = await sess.adapter.connect(offered)
         except Problem as exc:
             if exc.code != "connection_limit":
@@ -2305,7 +2377,7 @@ class Gateway:
 
             async def pump(src, dst):
                 async for message in src:
-                    async with asyncio.timeout(3):
+                    async with asyncio.timeout(min(3, getattr(src, 'send_timeout', 3))):
                         if message.type == WSMsgType.BINARY:
                             await dst.send_bytes(message.data)
                         elif message.type == WSMsgType.TEXT:
@@ -2368,10 +2440,24 @@ class Gateway:
             await self.finish(sess, "client_closed")
             return web.json_response({"ok": True})
         if path == "/_platform/limits" and request.method == "GET":
+            lane = getattr(sess, "transcode_lane", "")
+            occupied = len(self.transcode_reserved - {sess.sid})
+            deny = None
+            if lane and occupied >= self.transcode_capacity:
+                deny = "transcode_capacity_exhausted"
             return web.json_response({"limit": connection_limit(sess.adapter),
                                       "connections": len(sess.ws),
                                       "opening": sess.opening,
-                                      "closing": sess.closing})
+                                      "closing": sess.closing,
+                                      "lane": lane or None,
+                                      "recipe_id": self.recipe_id or None,
+                                      "recipe_revision": self.recipe_revision or None,
+                                      "protocol_contract": self.protocol_contract or None,
+                                      "bundle_revision": self.bundle_revision or None,
+                                      "schema_version": self.pipeline_schema or None,
+                                      "transcode_capacity": self.transcode_capacity,
+                                      "transcode_occupied": occupied,
+                                      "deny_reason": deny})
         if path == "/_platform/stats" and request.method == "GET":
             return web.json_response(self.stats(sess))
         if path == "/_platform/keymap" and request.method == "GET":
@@ -2383,10 +2469,15 @@ class Gateway:
                                       "input_protocol": input_protocol_for_adapter(sess.adapter)})
         if request.method != "GET" or request.query_string:
             raise Problem("route_denied", 403)
-        real = isinstance(sess.adapter, (PassthroughAdapter, Idrac8Adapter,
-                                        IdracVncAdapter,
-                                        HuaweiIbmcVncAdapter,
-                                        HuaweiIbmcKvmGatewayAdapter, AtenJavaAdapter))
+        if getattr(sess.adapter, 'client_v2', False):
+            from .video import client_v2
+            if path == '/':
+                return web.Response(text=client_v2.HTML, content_type='text/html')
+            if path.startswith('/_platform/client-v2/'):
+                content_type, body = client_v2.fetch(path)
+                return web.Response(body=body, content_type=content_type)
+        spec = spec_for_adapter(sess.adapter)
+        real = spec is not None and spec.real_console
         asset_pattern = getattr(sess.adapter, "asset_pattern", PASSTHROUGH_ASSET_PATH)
         if real and asset_pattern.fullmatch(path):
             content_type, body = await sess.adapter.fetch_asset(path)

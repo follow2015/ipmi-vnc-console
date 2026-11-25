@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "id": "novnc-v2-1.7.0",
+  "package": "noVNC upstream source",
+  "version": "1.7.0",
+  "commit": "63107bd06d9e1f6136ff21aeda8cd62cbf0d433e",
+  "source_archive_sha256": "06dac239be3973ed79a00e357a68aab996e6ed2fd496ee2cc6e6a34020344ac9",
+  "license": "MPL-2.0",
+  "files": {
+    "AUTHORS": {
+      "sha256": "16ee0ef356d5107a4bc039f91abc99a341dc62b9aa8dd47547a2baed38507509",
+      "bytes": 358,
+      "content_type": "text/plain"
+    },
+    "LICENSE.BSD-2-Clause": {
+      "sha256": "f4371b28457e3e9f2db1fc972eb5ba16353dc5f8d7f42b2d5c3c2e576e40dd05",
+      "bytes": 1304,
+      "content_type": "text/plain"
+    },
+    "LICENSE.BSD-3-Clause": {
+      "sha256": "c08e5ef2e6d004c97f92d45eee4f3a0257b6c957a6c68c7b2053d013ec3725c2",
+      "bytes": 1507,
+      "content_type": "text/plain"
+    },
+    "LICENSE.MPL-2.0": {
+      "sha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+      "bytes": 16726,
+      "content_type": "text/plain"
+    },
+    "LICENSE.OFL-1.1": {
+      "sha256": "e564f06d018e7b95bc3594c96a17f1d41865af4038c375e7aa974dd69df38602",
+      "bytes": 4302,
+      "content_type": "text/plain"
+    },
+    "THIRD_PARTY_NOTICES.txt": {
+      "sha256": "8b9e235707f84f0fb98daadb542606f76de6ca7373defd4d0a5f3d72397bf9d2",
+      "bytes": 10015,
+      "content_type": "text/plain"
+    },
+    "source.json": {
+      "sha256": "e7557796f4e107951fe6c3c6d7104e643ac40977e4dffdbf1c03a3fbc02d32b2",
+      "bytes": 643792,
+      "content_type": "application/json"
+    },
+    "viewer.js": {
+      "sha256": "0b5a95add51a6f542cf969739ce48c64dec2f22d0c787f6c774b22af12413fc2",
+      "bytes": 320818,
+      "content_type": "application/javascript"
+    }
+  }
+}

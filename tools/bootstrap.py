@@ -78,6 +78,7 @@ def generate(root, *, impostor=False):
         impostor_cert, impostor_key, _ = identity(impostor_name, True)
         impostor_entry = {"common_name": impostor_name, "cert": impostor_cert, "key": impostor_key}
     mock_cert, mock_key, mock = identity("mock")
+    projector_cert, projector_key, _ = identity("kvmhub-projector", True)
     signing = ed25519.Ed25519PrivateKey.generate()
     signing_path = save("signing.key", key_bytes(signing))
     public = save("signing.pub", signing.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
@@ -97,6 +98,7 @@ def generate(root, *, impostor=False):
     manager = {"database": database, "encryption_key": encryption_path, "signing_key": signing_path,
                "worker_id": "w1", "instance_id": instance, "login_hash": digest(login),
                "worker_cert_cn": "w1-" + instance,
+               "projector_cert_cn": "kvmhub-projector",
                "worker_proof_hash": digest(proof), "manager_origin": UI_ORIGIN,
                "ca": ca_path, "server_cert": server_cert, "server_key": server_key}
     worker = {"worker_id": "w1", "instance_id": instance, "public_key": public,
@@ -104,7 +106,10 @@ def generate(root, *, impostor=False):
               "ca": ca_path, "client_cert": client_cert, "client_key": client_key,
               "worker_proof": proof_path, "server_cert": server_cert, "server_key": server_key}
     mock_cfg = {"username": mock_user, "password": mock_password, "cert": mock_cert, "key": mock_key}
-    for name, value in (("manager.json", manager), ("worker.json", worker), ("mock.json", mock_cfg)):
+    projector = {"endpoint": INTERNAL_ORIGIN, "ca": ca_path,
+                 "client_cert": projector_cert, "client_key": projector_key}
+    for name, value in (("manager.json", manager), ("worker.json", worker),
+                        ("mock.json", mock_cfg), ("projector.json", projector)):
         save(name, json.dumps(value, indent=2)+"\n")
     if impostor_entry:
         save("impostor.json", json.dumps(impostor_entry, indent=2)+"\n")

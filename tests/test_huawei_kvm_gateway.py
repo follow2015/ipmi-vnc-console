@@ -84,6 +84,43 @@ def test_gateway_accepts_valid_pin_and_stores_it():
     assert adapter.tls_pin == TEST_PIN
 
 
+ASSET_PIN = "cd" * 32
+
+
+def test_gateway_prefers_asset_fingerprint_over_env_pin(monkeypatch):
+    monkeypatch.setenv("KVMHUB_HUAWEI_VNC_PIN", "ef" * 32)
+    adapter = HuaweiIbmcKvmGatewayAdapter(dict(INFO, fingerprint=ASSET_PIN))
+    assert adapter.tls_pin == ASSET_PIN
+
+
+def test_gateway_uses_asset_fingerprint_without_env_pin(monkeypatch):
+    monkeypatch.delenv("KVMHUB_HUAWEI_VNC_PIN", raising=False)
+    adapter = HuaweiIbmcKvmGatewayAdapter(dict(INFO, fingerprint=ASSET_PIN))
+    assert adapter.tls_pin == ASSET_PIN
+
+
+def test_gateway_normalises_asset_fingerprint():
+    spread = ":".join(ASSET_PIN[i:i + 2] for i in range(0, 64, 2)).upper()
+    adapter = HuaweiIbmcKvmGatewayAdapter(dict(INFO, fingerprint=spread))
+    assert adapter.tls_pin == ASSET_PIN
+
+
+def test_gateway_rejects_malformed_asset_fingerprint_fail_closed(monkeypatch):
+    monkeypatch.setenv("KVMHUB_HUAWEI_VNC_PIN", TEST_PIN)
+    with pytest.raises(Problem) as exc:
+        HuaweiIbmcKvmGatewayAdapter(dict(INFO, fingerprint="zz" * 32))
+    assert exc.value.code == "bmc_cert_pin_invalid"
+
+
+def test_resolve_pin_precedence():
+    from kvmhub.huawei_kvm_upstream import resolve_huawei_pin
+    assert resolve_huawei_pin({"fingerprint": ASSET_PIN}, "ef" * 32) == ASSET_PIN
+    assert resolve_huawei_pin({}, "ef" * 32) == "ef" * 32
+    assert resolve_huawei_pin({"fingerprint": ""}, "ef" * 32) == "ef" * 32
+    assert resolve_huawei_pin({"fingerprint": "bad"}, "ef" * 32) == ""
+    assert resolve_huawei_pin({}, "") == ""
+
+
 def _self_signed_cert(tmp_path):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])

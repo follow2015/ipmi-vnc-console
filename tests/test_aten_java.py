@@ -18,11 +18,11 @@ PASS_TICKET = "p" * 16
 INIT = struct.pack(">HH", 720, 400) + bytes([32, 24, 0, 1]) + struct.pack(">HHH", 255, 255, 255) + bytes([16, 8, 0, 0, 0, 0]) + struct.pack(">I", 4) + b"test" + bytes(4) + struct.pack(">I", 7) + bytes([1, 1, 1, 1])
 
 
-def launch(**changes):
+def launch(codebase=None, **changes):
     args = [HOST, USER_TICKET, PASS_TICKET, "test", "5900", "623", "0", "0", "0", "test"]
     for key, val in changes.items():
         args[int(key)] = val
-    root = ET.Element("jnlp", codebase=f"https://{HOST}/")
+    root = ET.Element("jnlp", codebase=codebase or f"https://{HOST}/")
     app = ET.SubElement(root, "application-desc", {"main-class": "tw.com.aten.ikvm.KVMMain"})
     for value in args:
         ET.SubElement(app, "argument").text = value
@@ -51,6 +51,40 @@ def test_launcher_is_bounded_and_rejects_entities(body):
 def test_foreign_codebase_rejected():
     with pytest.raises(ValueError):
         parse_java_launch(launch().replace(HOST.encode(), b"192.0.2.99", 1), HOST)
+
+
+def test_http_codebase_requires_explicit_exact_host_exception():
+    body = launch(codebase=f"http://{HOST}:80/")
+    with pytest.raises(ValueError, match="^invalid_java_launch$"):
+        parse_java_launch(body, HOST)
+    assert parse_java_launch(body, HOST, allow_http_codebase=True) == (USER_TICKET, PASS_TICKET)
+    with pytest.raises(ValueError, match="^invalid_java_launch$"):
+        parse_java_launch(launch(codebase=f"http://{HOST}:8080/"), HOST,
+                          allow_http_codebase=True)
+    with pytest.raises(ValueError, match="^invalid_java_launch$"):
+        parse_java_launch(launch(codebase="http://192.0.2.99:80/"), HOST,
+                          allow_http_codebase=True)
+
+
+def test_http_codebase_firmware_variant_argument(monkeypatch):
+    variant = launch(codebase=f"http://{HOST}:80/", **{"8": "1"})
+    assert parse_java_launch(variant, HOST, allow_http_codebase=True) == (USER_TICKET, PASS_TICKET)
+    assert parse_java_launch(launch(**{"8": "1"}), HOST,
+                             allow_http_codebase=True) == (USER_TICKET, PASS_TICKET)
+    with pytest.raises(ValueError, match="^invalid_java_launch$"):
+        parse_java_launch(launch(**{"8": "1"}), HOST)
+    with pytest.raises(ValueError, match="^invalid_java_launch$"):
+        parse_java_launch(launch(codebase=f"http://{HOST}:80/", **{"8": "2"}), HOST,
+                          allow_http_codebase=True)
+
+
+def test_http_codebase_allowlist_is_ip_literal_only(monkeypatch):
+    monkeypatch.setenv("KVMHUB_ATEN_HTTP_CODEBASE_HOSTS",
+                       f"{HOST},not-an-ip,192.0.2.99:80,192.0.2.100/32")
+    from kvmhub.common import aten_http_codebase_hosts_from_env
+    assert aten_http_codebase_hosts_from_env() == frozenset({HOST})
+    upstream = AtenJavaUpstream(HOST, PIN, networks=[HOST + "/32"])
+    assert upstream.allow_http_codebase is True
 
 
 def test_network_and_pin_gate_precede_network(monkeypatch):

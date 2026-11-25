@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
-from kvmhub.common import IDRAC8_ADAPTER_ID
+from kvmhub.common import IDRAC_VNC_ADAPTER_ID
 from kvmhub.platform import brand_onboarding, services
 from kvmhub.platform.db import init_schema, make_engine, seed_roles, session_factory, transaction
 from kvmhub.platform.models import PROFILE_DRAFT, AuditLog, Capability, VendorProfile
@@ -68,9 +68,9 @@ def test_validate_spec_rejects_typos_and_missing_evidence(tmp_path):
     bad = dict(spec, console_impl="executable-adapter")
     with pytest.raises(brand_onboarding.SpecError, match="console_impl"):
         brand_onboarding.validate_spec(bad, evidence=str(evidence))
-    measured_idrac8 = brand_onboarding.validate_spec(
-        dict(spec, console_impl=IDRAC8_ADAPTER_ID), evidence=str(evidence))
-    assert measured_idrac8["console_impl"] == IDRAC8_ADAPTER_ID
+    measured_vnc = brand_onboarding.validate_spec(
+        dict(spec, console_impl=IDRAC_VNC_ADAPTER_ID), evidence=str(evidence))
+    assert measured_vnc["console_impl"] == IDRAC_VNC_ADAPTER_ID
     with pytest.raises(brand_onboarding.SpecError, match="evidence"):
         brand_onboarding.validate_spec(spec, evidence=str(tmp_path / "absent.json"))
 

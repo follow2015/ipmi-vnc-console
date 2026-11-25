@@ -39,6 +39,8 @@ CREDENTIAL_RULES = frozenset({
 })
 DOC_ROOT = "docs/"
 SCANNED_DOC_SUFFIXES = (".md",)
+CANARY_EVIDENCE_JSON = re.compile(
+    r"^docs/implementation/evidence/admission-canary-a1-a12-[^/]+\.json$")
 
 
 def check_document_plaintext_secrets(root: Path) -> list[str]:
@@ -63,7 +65,11 @@ def check_document_plaintext_secrets(root: Path) -> list[str]:
 
     findings: list[str] = []
     for name in result.stdout.split("\0"):
-        if not name or not name.startswith(DOC_ROOT) or not name.endswith(SCANNED_DOC_SUFFIXES):
+        if not name:
+            continue
+        is_doc = name.startswith(DOC_ROOT) and name.endswith(SCANNED_DOC_SUFFIXES)
+        is_canary_json = bool(CANARY_EVIDENCE_JSON.match(name))
+        if not (is_doc or is_canary_json):
             continue
         path = root / name
         if not path.is_file():

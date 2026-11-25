@@ -11,6 +11,7 @@ import jwt
 
 ISSUER = "kvmhub-local-manager"
 AUDIENCE = "kvm-worker"
+OPERATION_AUDIENCE = "kvmhub-device-operation-v2"
 CLAIMS = ["iss", "aud", "iat", "exp", "jti", "sub", "aid", "sid", "wid", "iid", "trc"]
 TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 
@@ -58,18 +59,35 @@ def path_segment_is_safe(path: str) -> bool:
     return "//" not in stripped
 
 PASSTHROUGH_ADAPTER_ID = "supermicro-x10-passthrough"
-IDRAC8_ADAPTER_ID = "dell-idrac8-html5"
 IDRAC_VNC_ADAPTER_ID = "dell-idrac-vnc-tcp"
 HUAWEI_IBMC_VNC_ADAPTER_ID = "huawei-ibmc-vnc-tls"
 HUAWEI_IBMC_KVM_GATEWAY_ID = "huawei-ibmc-kvm-gateway"
 ATEN_JAVA_ADAPTER_ID = "aten-java-rfb-tcp"
 
 BMC_ALLOWED_NETWORKS_ENV = "KVMHUB_BMC_ALLOWED_NETWORKS"
+ATEN_HTTP_CODEBASE_HOSTS_ENV = "KVMHUB_ATEN_HTTP_CODEBASE_HOSTS"
 
 
 def bmc_allowed_networks_from_env() -> tuple[str, ...]:
     raw = os.environ.get(BMC_ALLOWED_NETWORKS_ENV, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def aten_http_codebase_hosts_from_env(raw=None) -> frozenset[str]:
+    import ipaddress
+    if raw is None:
+        raw = os.environ.get(ATEN_HTTP_CODEBASE_HOSTS_ENV, "")
+    if isinstance(raw, str):
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        items = [str(item).strip() for item in (raw or ()) if str(item).strip()]
+    out = set()
+    for item in items:
+        try:
+            out.add(str(ipaddress.ip_address(item)))
+        except ValueError:
+            continue
+    return frozenset(out)
 
 
 def parse_controlled_networks(raw) -> tuple:
@@ -139,20 +157,37 @@ ERROR_STATUS = {
     "upstream_invalid_response": 502, "upstream_handshake_failed": 502,
     "upstream_redirect_denied": 502, "upstream_frame_too_large": 502,
     "upstream_budget_exceeded": 502, "connection_limit": 429,
+    "worker_capacity_exhausted": 503, "transcode_capacity_exhausted": 429,
+    "transcode_family_unsupported": 503,
+    "pipeline_version_unavailable": 503,
     "manager_unavailable": 502, "upstream_unavailable": 502,
     "credential_unavailable": 503, "subprotocol_required": 400,
     "internal_error": 500, "unknown_operation": 404, "session_not_found": 404,
     "worker_authentication_failed": 403, "instance_mismatch": 403,
     "worker_certificate_missing": 403, "worker_certificate_mismatch": 403,
+    "projector_certificate_missing": 403, "projector_certificate_mismatch": 403,
+    "projection_invalid": 400, "connection_snapshot_conflict": 409,
+    "device_not_admitted": 403, "device_admission_expired": 403,
+    "device_admission_review_overdue": 403, "connection_config_pending": 409,
+    "connection_revision_mismatch": 409, "execution_domain_unavailable": 503,
+    "target_network_denied": 403, "projection_schema_unsupported": 409,
+    "admission_service_unavailable": 503, "operation_permit_invalid": 401,
+    "operation_permit_replayed": 409,
+    "admission_certificate_missing": 403, "admission_certificate_mismatch": 403,
     "assembly_missing": 502,
     "asset_not_found": 404, "fingerprint_invalid": 400,
     "fingerprint_unchanged": 409, "rotation_incomplete": 400,
+    "bmc_cert_pin_invalid": 400,
 }
 
 
 USER_MESSAGES = {
     "asset_busy": "该资产当前有一场会话，或上一场正在等待上游注销确认；请稍后重试，不要重复点击。",
     "connection_limit": "该会话的控制台连接数已达上限，请关闭多余的标签页后刷新。",
+    "worker_capacity_exhausted": "Worker 会话容量已满，请稍后重试。",
+    "transcode_capacity_exhausted": "转码容量或预算已满，请稍后重试。",
+    "transcode_family_unsupported": "该设备的视频协议族没有可用的转码插件，连接被拒绝。",
+    "pipeline_version_unavailable": "没有匹配视频管线版本的 Worker，请联系管理员。",
     "cleanup_not_pending": "该会话的清理状态不允许人工放行。",
     "session_revoked": "该会话已被撤销，请返回 Manager 重新申请。",
     "session_not_found": "找不到该会话，可能已被清理。",
@@ -160,6 +195,23 @@ USER_MESSAGES = {
     "adapter_not_verified": "该资产的适配器未通过核验、已过期或未获批准。",
     "bmc_network_not_allowed": "该 BMC 不在允许的管理网段内，明文 VNC 控制台已被拒绝。",
     "authentication_required": "会话已失效，请重新登录。",
+    "projector_certificate_missing": "投影服务证书缺失，连接被拒绝。",
+    "projector_certificate_mismatch": "投影服务证书身份不匹配，连接被拒绝。",
+    "projection_invalid": "连接投影内容不合法，已被拒绝。",
+    "connection_snapshot_conflict": "连接配置版本冲突，拒绝覆盖已确认的配置。",
+    "device_not_admitted": "设备尚未准入或已被撤销，请联系管理员。",
+    "device_admission_expired": "设备准入已到期，请联系管理员续期。",
+    "device_admission_review_overdue": "设备准入复核已逾期，请联系管理员。",
+    "connection_config_pending": "设备连接配置尚未确认，请稍后重试。",
+    "connection_revision_mismatch": "连接配置版本不一致，请重新申请。",
+    "execution_domain_unavailable": "执行域不可用，请稍后重试。",
+    "target_network_denied": "目标地址不在允许的管理网段内。",
+    "projection_schema_unsupported": "连接投影版本不兼容，请联系管理员。",
+    "admission_service_unavailable": "准入服务暂不可用，请稍后重试。",
+    "operation_permit_invalid": "操作凭证无效，请重新申请。",
+    "operation_permit_replayed": "操作凭证已被使用，请重新申请。",
+    "admission_certificate_missing": "准入服务客户端证书缺失。",
+    "admission_certificate_mismatch": "准入服务客户端证书身份不匹配。",
 }
 
 
@@ -191,6 +243,13 @@ def expected_worker_cert_cn(cfg) -> str:
     if isinstance(declared, str) and declared.strip():
         return declared.strip()
     return f"{cfg['worker_id']}-{cfg['instance_id']}"
+
+
+def expected_projector_cert_cn(cfg) -> str:
+    declared = cfg.get("projector_cert_cn")
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip()
+    return "kvmhub-projector"
 
 
 END_REASON_MESSAGES = {
@@ -237,7 +296,7 @@ def secret_matches(value: str, expected_hash: str) -> bool:
 
 
 def issue(private_key, row: dict, now: float, ttl: float = 60, trace: str | None = None,
-          tenant_id: str = "") -> str:
+          tenant_id: str = "", binding: str = "") -> str:
     claims = {"iss": ISSUER, "aud": AUDIENCE, "iat": int(now),
               "exp": int(min(now + ttl, row["hard_until"])),
               "jti": row["jti"], "sub": row["user_id"],
@@ -246,6 +305,10 @@ def issue(private_key, row: dict, now: float, ttl: float = 60, trace: str | None
               "trc": trace if TRACE_ID.fullmatch(trace or "") else uuid.uuid4().hex}
     if tenant_id:
         claims["tid"] = tenant_id
+    if binding:
+        if not re.fullmatch(r"[0-9a-f]{64}", binding):
+            raise ValueError("invalid ticket binding")
+        claims["bdg"] = binding
     return jwt.encode(claims, private_key, algorithm="EdDSA",
                       headers={"kid": "local-v1"})
 
@@ -266,6 +329,8 @@ def verify(public_key, token: str, worker: str, instance: str) -> dict:
         if claims["exp"] - claims["iat"] > 60 or claims["wid"] != worker or claims["iid"] != instance:
             raise ValueError()
         if "tid" in claims and (not isinstance(claims["tid"], str) or not claims["tid"]):
+            raise ValueError()
+        if "bdg" in claims and not re.fullmatch(r"[0-9a-f]{64}", claims["bdg"]):
             raise ValueError()
         return claims
     except jwt.ExpiredSignatureError:

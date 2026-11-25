@@ -26,7 +26,7 @@ class ThreadRecordingStore:
     def __init__(self):
         self.threads = []
 
-    def renew(self, sid, worker, instance, activate, trace=None):
+    def renew(self, sid, worker, instance, activate, trace=None, **_kwargs):
         self.threads.append(threading.current_thread().name)
         return {"lease_seconds": 30}
 

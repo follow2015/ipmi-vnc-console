@@ -3,21 +3,23 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
+from ..driver_specs import DRIVERS
 from ..common import (IDRAC_VNC_ADAPTER_ID, Problem, bmc_allowed_networks_from_env,
                       require_controlled_host)
+from ..rfb_tcp_upstream import RfbTcpConfig, RfbTcpUpstream
 from ..passthrough import RfbPassthroughSession
-from ..rfb_tcp_upstream import (BROWSER_RFB_VERSION, RfbTcpConfig, RfbTcpUpstream,
-                                StandardRfbBrowserHandshake)
-from .idrac8 import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
+from ..client_assets import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
+from .rfb_tcp_family import RfbTcpFamilyAdapter
 
 IDRAC_VNC_PORT = 5901
 
 
-class IdracVncAdapter:
+
+class IdracVncAdapter(RfbTcpFamilyAdapter):
     adapter_id = IDRAC_VNC_ADAPTER_ID
-    connection_limit = 1
-    supports_upstream_recovery = False
-    login_budget = 28.0
+    connection_limit = DRIVERS[adapter_id].connection_limit
+    supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
+    login_budget = DRIVERS[adapter_id].login_budget
 
     def __init__(self, info: dict, *, networks=None) -> None:
         target = urlsplit(info["target"])
@@ -43,42 +45,3 @@ class IdracVncAdapter:
             host=self.host, port=self.port, password=password))
         self.upstream = upstream
         await upstream.connect()
-
-    async def connect(self, offered: list[str]) -> RfbPassthroughSession:
-        if "binary" not in offered:
-            raise Problem("subprotocol_required", 400)
-        if self.session is not None and not self.session.closed:
-            raise Problem("connection_limit")
-        if self.upstream is None or not self.upstream.server_init_raw:
-            raise Problem("upstream_handshake_failed", 502)
-        handshake = StandardRfbBrowserHandshake(
-            self.upstream.server_init_raw,
-            version=(BROWSER_RFB_VERSION + "\n").encode("ascii"))
-        session = RfbPassthroughSession(self.upstream, handshake)
-        await session.start()
-        self.session = session
-        return session
-
-    async def fetch_asset(self, path: str) -> tuple[str, bytes]:
-        match = ASSET_PATH.fullmatch(path or "")
-        if match is None:
-            raise Problem("route_denied", 404)
-        name = match.group(1)
-        if not name.endswith(".js"):
-            name += ".js"
-        if name not in KNOWN_ASSETS:
-            raise Problem("route_denied", 404)
-        target = ASSET_DIR / name
-        if not target.is_file():
-            raise Problem("route_denied", 404)
-        return "application/javascript", target.read_bytes()
-
-    async def close(self) -> bool:
-        if self.session is not None:
-            await self.session.close()
-            self.session = None
-        if self.upstream is None:
-            return False
-        upstream, self.upstream = self.upstream, None
-        await upstream.close()
-        return True

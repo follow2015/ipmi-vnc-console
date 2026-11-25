@@ -66,6 +66,30 @@ def capability_state(status: str, expires: float | None, review_due: float | Non
     return "expiring" if expiry - now <= DUE_SOON_SECONDS else "verified"
 
 
+PROFILE_NOT_APPROVED = "profile_not_approved"
+PROFILE_REVIEW_OVERDUE = "profile_review_overdue"
+CAPABILITY_NOT_VERIFIED = "capability_not_verified"
+CAPABILITY_EXPIRED = "capability_expired"
+
+
+def profile_refusal(status: str | None, review_due: float | None, now: float) -> str | None:
+    if status != PROFILE_APPROVED:
+        return PROFILE_NOT_APPROVED
+    due = float(review_due or 0)
+    if due and due <= now:
+        return PROFILE_REVIEW_OVERDUE
+    return None
+
+
+def capability_refusal(status: str | None, expires: float | None, now: float) -> str | None:
+    if status != CAPABILITY_VERIFIED:
+        return CAPABILITY_NOT_VERIFIED
+    expiry = float(expires or 0)
+    if not expiry or expiry <= now:
+        return CAPABILITY_EXPIRED
+    return None
+
+
 PROFILE_ACTIONABLE = ("draft", "overdue", "due_soon")
 CAPABILITY_ACTIONABLE = ("draft", "expired", "review_overdue", "expiring")
 PROFILE_RENEWAL = ("overdue", "due_soon")

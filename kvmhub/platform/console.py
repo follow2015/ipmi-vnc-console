@@ -9,12 +9,27 @@ import re
 from typing import Callable
 
 from .. import common
+from ..admission_runtime import (authority_request, binding_digest, binding_payload)
 from ..common import Problem, issue
 from ..store import Store
 from . import services
-from .bus import AssemblyBus, BusError
+from .bus import TRANSCODE_LANE, AssemblyBus, BusError
 
 DEFAULT_ACCEPT_TEMPLATE = "https://{worker_id}-{sid}.kvm.localhost:{port}/_platform/accept"
+
+
+def managed_operation_required(assembly: dict, managed_domains, authority) -> tuple[bool, dict]:
+    g0 = assembly.get("g0") or {}
+    domain_id = str(g0.get("domain_id") or "")
+    if not (managed_domains and domain_id in managed_domains):
+        return False, g0
+    if authority is None:
+        raise services.PlatformError(
+            "admission_service_unavailable", "管理域未配置准入服务，连接被拒绝", 503)
+    if not g0.get("ready"):
+        raise services.PlatformError(
+            "connection_config_pending", "管理域连接配置尚未确认，连接被拒绝", 409)
+    return True, g0
 
 
 class ConsolePlane:
@@ -22,7 +37,8 @@ class ConsolePlane:
                  store: Store | None = None,
                  store_factory: Callable[[], Store] | None = None,
                  accept_template: str | None = None, port: int = 9443,
-                 clock=time.time):
+                 clock=time.time, authority=None, authority_host: str = "",
+                 permit_public_key=None, managed_domains: tuple[str, ...] = ()):
         if (store is None) == (store_factory is None):
             raise ValueError("provide exactly one of store / store_factory")
         self.private_key = private_key
@@ -33,6 +49,10 @@ class ConsolePlane:
         self.accept_template = accept_template or DEFAULT_ACCEPT_TEMPLATE
         self.port = port
         self._clock = clock
+        self.authority = authority
+        self.authority_host = authority_host
+        self.permit_public_key = permit_public_key
+        self.managed_domains = frozenset(managed_domains)
 
     def _connect(self) -> tuple[Store, bool]:
         if self._owns_store:
@@ -130,12 +150,21 @@ class ConsolePlane:
         if not asset_id or not assembly.get("ready"):
             raise services.PlatformError("assembly_not_ready", "装配包未通过全部闸门", 409)
         tenant_id = str(assembly.get("tenant_id") or "")
+        managed, g0 = managed_operation_required(assembly, self.managed_domains, self.authority)
+        if assembly.get('overlay') and not managed:
+            raise services.PlatformError('overlay_requires_managed', '覆盖层需要受管准入域', 409)
         await self.reconcile_claims()
         await self.reconcile_quota(tenant_id)
+        requirements = dict(assembly.get("worker_requirements") or {})
+        if requirements.get("lane") and not managed:
+            raise services.PlatformError(
+                "pipeline_version_unavailable",
+                "转码通道只对管理域开放", 503)
         try:
-            worker = await self.bus.choose_worker()
+            worker = await self.bus.choose_worker(requirements or None)
         except BusError as exc:
-            raise services.PlatformError(exc.code, exc.message, 503) from exc
+            status = 429 if exc.code == "transcode_capacity_exhausted" else 503
+            raise services.PlatformError(exc.code, exc.message, status) from exc
         worker_id = str(worker["worker_id"])
         instance_id = str(worker["instance_id"])
         correlation = trace if len(trace) == 32 else uuid.uuid4().hex
@@ -143,9 +172,43 @@ class ConsolePlane:
         hard_cap = now + int(session_limit_minutes) * 60 if session_limit_minutes else None
         store, dispose = self._connect()
         try:
+            permit = None
+            permit_claims = None
+            candidate = None
+            binding = ""
+            resources_reserved = False
+            if managed:
+                candidate = uuid.uuid4().hex
+                binding = binding_digest(binding_payload(
+                    sid=candidate, asset_id=asset_id, tenant_id=tenant_id,
+                    user_id=user_id, domain_id=g0["domain_id"], worker_id=worker_id,
+                    instance_id=instance_id,
+                    connection_revision=int(g0["connection_revision"]),
+                    admission_revision=int(g0["admission_revision"]),
+                    digest=g0["digest"], generation=g0["generation"]))
+                request = authority_request(
+                    operation="allocate", sid=candidate, asset_id=asset_id,
+                    user_id=user_id, tenant_id=tenant_id, domain_id=g0["domain_id"],
+                    worker_id=worker_id, instance_id=instance_id,
+                    connection_revision=int(g0["connection_revision"]),
+                    admission_revision=int(g0["admission_revision"]),
+                    digest=g0["digest"], generation=g0["generation"],
+                    session_started_at=now,
+                    hard_until=now + (hard_cap or 4 * 3600))
+                answer = await self.authority.authorize(
+                    host=self.authority_host, **request)
+                permit, permit_claims = answer["permit"], answer["claims"]
             try:
-                row = store.allocate(asset_id, user_id, worker_id, instance_id, correlation,
-                                     hard_cap=hard_cap)
+                row = store.allocate(
+                    asset_id, user_id, worker_id, instance_id, correlation,
+                    hard_cap=hard_cap, sid=candidate, permit=permit,
+                    public_key=self.permit_public_key, binding=binding,
+                    expected=({"dom": g0["domain_id"], "wid": worker_id,
+                               "iid": instance_id, "cr": int(g0["connection_revision"]),
+                               "ar": int(g0["admission_revision"]), "aid": asset_id,
+                               "usr": user_id, "tid": tenant_id,
+                               "dgs": g0["digest"], "gen": g0["generation"]}
+                              if permit_claims else None))
             except Problem as exc:
                 raise services.PlatformError(exc.code, f"会话分配被拒绝：{exc.code}",
                                              exc.status) from exc
@@ -161,6 +224,16 @@ class ConsolePlane:
                 await self.bus.release_tenant_quota(tenant_id, sid)
                 raise services.PlatformError("worker_capacity_exhausted",
                                              "Worker 容量已满，请重试", 503)
+            if requirements.get("lane") == TRANSCODE_LANE:
+                if not await self.bus.reserve_worker_resources(worker_id, sid,
+                                                               ttl=hard_ttl, row=worker):
+                    store.revoke(sid, user_id, correlation)
+                    await self.bus.release_session(worker_id, sid)
+                    await self.bus.release_tenant_quota(tenant_id, sid)
+                    raise services.PlatformError(
+                        "transcode_capacity_exhausted",
+                        "转码容量已满或预算不足，请重试", 429)
+                resources_reserved = True
             try:
                 document = {
                     "asset_id": asset_id,
@@ -171,6 +244,11 @@ class ConsolePlane:
                     "data_plane": assembly.get("data_plane"),
                     "checks": assembly.get("checks"),
                     "credential_id": assembly.get("credential_id"),
+                    "binding": binding, "g0": g0,
+                    "lane": requirements.get("lane"),
+                    "pipeline_versions": requirements.get("versions"),
+                    "client_contract": assembly.get("client_contract") or "",
+                    "client_bundle": assembly.get("client_bundle") or "",
                 }
                 assembly_id = await self.bus.put_assembly(sid, document)
                 if common.SESSION_MODE == "path":
@@ -182,7 +260,7 @@ class ConsolePlane:
                         "tenant_id": tenant_id,
                     }, hard_ttl)
                 ticket = issue(self.private_key, row, now, trace=correlation,
-                               tenant_id=tenant_id)
+                               tenant_id=tenant_id, binding=binding)
             except BaseException:
                 with contextlib.suppress(Exception):
                     store.revoke(sid, user_id, correlation)
@@ -190,6 +268,9 @@ class ConsolePlane:
                     await self.bus.release_session(worker_id, sid)
                 with contextlib.suppress(Exception):
                     await self.bus.release_tenant_quota(tenant_id, sid)
+                if resources_reserved:
+                    with contextlib.suppress(Exception):
+                        await self.bus.release_worker_resources(worker_id, sid)
                 with contextlib.suppress(Exception):
                     await self.bus.delete_assembly(sid)
                 with contextlib.suppress(Exception):
@@ -220,6 +301,7 @@ class ConsolePlane:
                         row = None
                     if row is None or row["status"] not in store.LIVE_STATES:
                         await self.bus.release_session(worker_id, sid)
+                        await self.bus.release_worker_resources(worker_id, sid)
                         dead.add(sid)
                         released += 1
         finally:
@@ -267,6 +349,7 @@ class ConsolePlane:
             if dispose:
                 store.close()
         await self.bus.release_session(str(row["worker_id"]), sid)
+        await self.bus.release_worker_resources(str(row["worker_id"]), sid)
         tenant = tenant_id or await self._route_tenant(sid)
         await self.bus.release_tenant_quota(tenant, sid)
         await self.bus.delete_assembly(sid)
@@ -330,6 +413,7 @@ class ConsolePlane:
         await self.bus.delete_route(sid)
         await self.bus.delete_assembly(sid)
         await self.bus.release_session(str(outcome["worker_id"]), sid)
+        await self.bus.release_worker_resources(str(outcome["worker_id"]), sid)
         await self.bus.release_tenant_quota(tenant_id or route_tenant or "", sid)
         return {"ok": True, "sid": sid, "status": outcome["status"],
                 "asset_id": outcome["asset_id"], "was_live": outcome["was_live"],

@@ -1,9 +1,11 @@
 """Renewal must re-sign certs in place without rotating any secret or identity."""
 import datetime
 import json
+import os
 import stat
 from pathlib import Path
 
+import pytest
 from cryptography import x509
 
 from tools.bootstrap import generate
@@ -19,6 +21,7 @@ def _ca_public_numbers(cert_bytes):
     return x509.load_pem_x509_certificate(cert_bytes).public_key().public_numbers()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows has no POSIX 0600 mode")
 def test_private_key_is_created_0600_without_a_post_write_chmod(tmp_path, monkeypatch):
     target = tmp_path / "ca.key"
 

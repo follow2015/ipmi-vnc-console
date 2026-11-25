@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import secrets
@@ -13,16 +14,21 @@ import string
 import sys
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
 from kvmhub.platform.config import settings  # noqa: E402
 from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,  # noqa: E402
                                 init_schema, make_engine, seed_roles,
                                 session_factory, transaction)
 from kvmhub.platform.models import (AccessGrant, Asset as PlatformAsset,  # noqa: E402
+                                    AssetConnection, DeviceAdmission,
+                                    ExecutionDomain, PlaneProjection,
                                     PROFILE_APPROVED, ROLE_ADMIN, Capability,
                                     Credential, Role, User, UserRole, VendorProfile)
 from kvmhub.platform.security import CredentialCipher  # noqa: E402
@@ -44,6 +50,23 @@ def _required_env(name: str) -> str:
     if not value:
         raise SystemExit(f"{name} must be set (secrets are never CLI arguments)")
     return value
+
+
+def cmd_attest_overlay_identity(args):
+    from kvmhub.platform import overlays
+    path = Path(args.evidence)
+    if not path.is_file() or not path.stat().st_size:
+        raise SystemExit('evidence must be a non-empty measured report file')
+    cfg, engine, factory, _ = _context(args)
+    try:
+        with transaction(factory) as db:
+            row = overlays.attest(db, asset_id=args.asset, model_id=args.model_id,
+                firmware=args.firmware, actor=args.approver, evidence=str(path.resolve()),
+                expires=args.expires)
+            print(json.dumps({'asset_id': row.asset_id,
+                'admission_revision': row.admission_revision, 'model_id': row.model_id}))
+    finally:
+        engine.dispose()
 
 
 def _generated_password(length: int = 20) -> str:
@@ -284,6 +307,25 @@ def cmd_brand_onboard(args):
                      ensure_ascii=False, indent=1))
 
 
+def _emit_source_change(db, *, profile_id: str | None = None,
+                        capability_id: str | None = None, reason: str,
+                        actor: str, now: float) -> list[str]:
+    from kvmhub.platform import overlays
+    overlays.invalidate_sources(db, profile_id=profile_id, capability_id=capability_id,
+                                actor=actor, now=now)
+    query = select(PlatformAsset.id)
+    if profile_id:
+        query = query.where(PlatformAsset.profile_id == profile_id)
+    if capability_id:
+        query = query.where(PlatformAsset.capability_id == capability_id)
+    ids = list(db.scalars(query).all())
+    if not ids:
+        return []
+    from kvmhub.platform.connection_config import record_change
+
+    return record_change(db, asset_ids=ids, reason=reason, actor=actor, now=now)
+
+
 def cmd_approve_profile(args):
     if not args.evidence or not Path(args.evidence).exists():
         raise SystemExit("--evidence must point at an existing measured evidence file")
@@ -307,9 +349,132 @@ def cmd_approve_profile(args):
                        detail={"profile_id": profile.id, "code": profile.code,
                                "evidence": str(args.evidence), "review_due": profile.review_due,
                                "revision": profile.revision}, now=stamp)
+        _emit_source_change(db, profile_id=profile.id,
+                            reason="vendor_profile_approved",
+                            actor=args.approver, now=stamp)
         print(json.dumps({"ok": True, "code": profile.code, "approver": args.approver,
                           "renewed": renewing, "review_due": profile.review_due},
                          ensure_ascii=False))
+
+
+def cmd_set_pipeline_identity(args):
+    if not args.evidence or not Path(args.evidence).exists():
+        raise SystemExit("--evidence must point at an existing measured evidence file")
+    recipe_id = (args.recipe_id or "").strip()
+    schema = (args.schema or "").strip()
+    if not recipe_id or not schema:
+        raise SystemExit("--recipe-id and --schema are required for the video lane")
+    if args.recipe_revision < 1:
+        raise SystemExit("--recipe-revision must be a positive integer")
+    if not args.capability and args.bundle:
+        raise SystemExit("--bundle requires --capability: the bundle is per capability")
+    if args.bundle is not None and not args.bundle.strip():
+        raise SystemExit("--bundle must not be empty when given")
+
+    _, _, factory, _ = _context(args)
+    stamp = time.time()
+    with transaction(factory) as db:
+        profile = db.get(VendorProfile, args.profile)
+        if profile is None:
+            raise SystemExit("profile not found")
+        capability = None
+        if args.capability:
+            capability = db.get(Capability, args.capability)
+            if capability is None:
+                raise SystemExit("capability not found")
+            if capability.profile_id != profile.id:
+                raise SystemExit("capability does not belong to that profile")
+        previous = {"recipe_id": profile.recipe_id,
+                    "recipe_revision": profile.recipe_revision,
+                    "config_schema_version": profile.config_schema_version,
+                    "bundle_revision": capability.bundle_revision if capability else ""}
+        bundle = args.bundle.strip() if args.bundle is not None else None
+        recipe_changed = (str(profile.recipe_id or "") != recipe_id
+                          or int(profile.recipe_revision or 0) != int(args.recipe_revision)
+                          or str(profile.config_schema_version or "") != schema)
+        bundle_changed = bool(capability is not None and bundle is not None
+                              and str(capability.bundle_revision or "") != bundle)
+        if not recipe_changed and not bundle_changed:
+            print(json.dumps({"ok": True, "unchanged": True,
+                              "profile_id": profile.id, "code": profile.code},
+                             ensure_ascii=False, indent=1))
+            return
+        profile.recipe_id = recipe_id
+        profile.recipe_revision = int(args.recipe_revision)
+        profile.config_schema_version = schema
+        if recipe_changed:
+            profile.revision = int(profile.revision or 0) + 1
+        if capability is not None and bundle is not None:
+            capability.bundle_revision = bundle
+            if recipe_changed:
+                capability.revision = int(capability.revision or 0) + 1
+        services.audit(db, args.approver, "pipeline_identity_recorded",
+                       detail={"profile_id": profile.id, "code": profile.code,
+                               "capability_id": capability.id if capability else None,
+                               "evidence": str(args.evidence),
+                               "previous": previous,
+                               "recipe_id": recipe_id,
+                               "recipe_revision": profile.recipe_revision,
+                               "config_schema_version": schema,
+                               "bundle_revision": (capability.bundle_revision
+                                                   if capability else ""),
+                               "bundle_only": not recipe_changed},
+                       now=stamp)
+        reissued = []
+        if recipe_changed:
+            reissued = _emit_source_change(
+                db, profile_id=profile.id,
+                capability_id=capability.id if capability else None,
+                reason="pipeline_identity_recorded", actor=args.approver, now=stamp)
+        print(json.dumps({"ok": True, "profile_id": profile.id,
+                          "recipe_id": recipe_id,
+                          "recipe_revision": profile.recipe_revision,
+                          "config_schema_version": schema,
+                          "bundle_revision": capability.bundle_revision if capability else "",
+                          "bundle_only": not recipe_changed,
+                          "profile_revision": profile.revision,
+                          "reprojected_assets": len(reissued)},
+                         ensure_ascii=False, indent=1))
+
+
+def cmd_refresh_lane_contract(args):
+    from kvmhub.platform import connection_config
+    from kvmhub.platform.models import parse_json
+    from kvmhub.video.client_v2 import protocol_contract
+
+    contract = protocol_contract()
+    _, _, factory, _ = _context(args)
+    stamp = time.time()
+    with transaction(factory) as db:
+        query = (select(PlatformAsset.id)
+                 .join(VendorProfile, PlatformAsset.profile_id == VendorProfile.id)
+                 .where(VendorProfile.recipe_id != ""))
+        if args.asset:
+            query = query.where(PlatformAsset.id == args.asset)
+        if args.profile:
+            query = query.where(PlatformAsset.profile_id == args.profile)
+        candidates = list(db.scalars(query).all())
+        ids = []
+        for aid in candidates:
+            row = db.scalar(select(AssetConnection)
+                            .where(AssetConnection.asset_id == aid)
+                            .order_by(AssetConnection.revision.desc()).limit(1))
+            stored = parse_json(row.source_versions_json, {}) if row is not None else {}
+            if not isinstance(stored, dict) or stored.get("protocol_contract") != contract:
+                ids.append(aid)
+        if not ids:
+            print(json.dumps({"ok": True, "assets": 0, "candidates": len(candidates),
+                              "contract": contract,
+                              "note": "车道资产的快照已绑定当前契约，无需重投影"},
+                             ensure_ascii=False, indent=1))
+            return
+        events = connection_config.record_change(
+            db, asset_ids=ids, reason="lane_contract_refresh",
+            actor=args.actor, now=stamp)
+        print(json.dumps({"ok": True, "assets": len(ids), "candidates": len(candidates),
+                          "events": len(events), "contract": contract,
+                          "note": "投影确认前车道保持关闭：等待 G1 投影 ack 后 g0.reason 才会清空"},
+                         ensure_ascii=False, indent=1))
 
 
 def cmd_capabilities(args):
@@ -344,6 +509,9 @@ def cmd_approve_capability(args):
         row.revision = int(row.revision or 0) + 1
         services.audit(db, args.approver, "capability_approved",
                        detail={"capability_id": row.id, "evidence": args.evidence}, now=stamp)
+        _emit_source_change(db, capability_id=row.id,
+                            reason="capability_approved",
+                            actor=args.approver, now=stamp)
         print(json.dumps({"ok": True, "id": row.id, "status": row.status}))
 
 
@@ -576,11 +744,159 @@ def cmd_sync_data_plane(args):
     engine.dispose()
 
 
+MIGRATION_REPORT_CATEGORIES = (
+    "db_asset_missing_target", "target_without_asset", "duplicate_endpoint",
+    "noncanonical_target", "missing_approval_evidence",
+    "capability_not_verified_or_expired", "cross_tenant_reference",
+    "network_or_pin_denied", "config_process_mismatch",
+    "admission_pending", "projection_revision_behind", "projection_digest_mismatch",
+    "domain_generation_mismatch", "domain_policy_mismatch",
+)
+
+
+def _canonical_endpoint(value: str) -> tuple[str | None, bool]:
+    raw = (value or "").strip()
+    if not raw:
+        return None, True
+    if "://" in raw:
+        try:
+            parts = urlsplit(raw)
+            host = parts.hostname or ""
+            ipaddress.ip_address(host)
+            port = parts.port or (443 if parts.scheme in ("https", "wss") else 5900)
+        except ValueError:
+            return raw, True
+        path = parts.path.rstrip("/")
+        endpoint = f"{host}:{port}" + (f":{path}" if path else "")
+        bad = bool(parts.username or parts.password or parts.query or parts.fragment)
+        return endpoint, bad
+    try:
+        ipaddress.ip_address(raw)
+        return f"{raw}:443", False
+    except ValueError:
+        return raw, True
+
+
+def build_migration_report(*, db: Session, store: Store, now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    categories: dict[str, list] = {key: [] for key in MIGRATION_REPORT_CATEGORIES}
+
+    users = {row[0]: row[1] for row in db.execute(select(User.id, User.tenant_id)).all()}
+    capabilities = {row.id: row for row in db.scalars(select(Capability)).all()}
+    control: dict[str, dict] = {}
+    for asset in db.scalars(select(PlatformAsset)).all():
+        endpoint, bad = _canonical_endpoint(asset.address)
+        control[asset.id] = {"asset": asset.id, "address": asset.address,
+                             "endpoint": endpoint, "tenant_id": asset.tenant_id}
+        if bad:
+            categories["noncanonical_target"].append(
+                {"asset": asset.id, "target": asset.address})
+        cap = capabilities.get(asset.capability_id)
+        if cap is None or not cap.evidence:
+            categories["missing_approval_evidence"].append(
+                {"asset": asset.id, "capability": asset.capability_id})
+        if cap is None or cap.status != "verified" or cap.expires <= stamp:
+            categories["capability_not_verified_or_expired"].append(
+                {"asset": asset.id, "capability": asset.capability_id,
+                 "status": getattr(cap, "status", None)})
+
+    seen: dict[str, list[str]] = {}
+    for aid, info in control.items():
+        if info["endpoint"]:
+            seen.setdefault(info["endpoint"], []).append(aid)
+    for endpoint, aids in seen.items():
+        if len(aids) > 1:
+            categories["duplicate_endpoint"].append(
+                {"endpoint": endpoint, "assets": sorted(aids)})
+
+    actual: dict[str, dict] = {}
+    for aid, target, fingerprint in store.db.execute(
+            "SELECT id,target,fingerprint FROM asset").fetchall():
+        endpoint, bad = _canonical_endpoint(target)
+        actual[aid] = {"asset": aid, "target": target, "endpoint": endpoint}
+        if bad:
+            categories["noncanonical_target"].append({"asset": aid, "target": target})
+        if len((fingerprint or "").replace(":", "").strip()) != 64:
+            categories["network_or_pin_denied"].append(
+                {"asset": aid, "reason": "fingerprint_missing"})
+        owner = control.get(aid)
+        if owner and owner["tenant_id"] is not None:
+            for (uid,) in store.db.execute(
+                    "SELECT user_id FROM access_grant WHERE asset_id=?", (aid,)).fetchall():
+                if users.get(uid) not in (None, owner["tenant_id"]):
+                    categories["cross_tenant_reference"].append(
+                        {"asset": aid, "user": uid})
+
+    control_endpoints = {info["endpoint"] for info in control.values()}
+    actual_endpoints = {info["endpoint"] for info in actual.values()}
+    for aid, info in control.items():
+        if info["endpoint"] not in actual_endpoints:
+            categories["db_asset_missing_target"].append(
+                {"asset": aid, "address": info["address"]})
+    for aid, info in actual.items():
+        if info["endpoint"] not in control_endpoints:
+            categories["target_without_asset"].append(
+                {"asset": aid, "target": info["target"]})
+
+    admissions: dict[str, DeviceAdmission] = {}
+    for row in db.scalars(select(DeviceAdmission).order_by(
+            DeviceAdmission.asset_id, DeviceAdmission.revision)).all():
+        admissions[row.asset_id] = row
+    connections: dict[str, AssetConnection] = {}
+    for row in db.scalars(select(AssetConnection).order_by(
+            AssetConnection.asset_id, AssetConnection.revision)).all():
+        connections[row.asset_id] = row
+    projections = {row.asset_id: row for row in db.scalars(select(PlaneProjection)).all()}
+    domains = {row.domain_id: row for row in db.scalars(select(ExecutionDomain)).all()}
+    for aid in control:
+        admission = admissions.get(aid)
+        if admission is None or admission.state == "pending":
+            categories["admission_pending"].append(
+                {"asset": aid, "state": getattr(admission, "state", None)})
+        conn = connections.get(aid)
+        projection = projections.get(aid)
+        if conn is not None and projection is not None:
+            desired_revision = max(int(conn.revision or 0),
+                                   int(projection.desired_revision or 0))
+            desired_digest = projection.desired_digest or conn.digest
+            if projection.applied_revision < desired_revision:
+                categories["projection_revision_behind"].append(
+                    {"asset": aid, "desired": desired_revision,
+                     "applied": projection.applied_revision})
+            elif projection.applied_revision and projection.applied_digest != desired_digest:
+                categories["projection_digest_mismatch"].append(
+                    {"asset": aid, "desired": desired_digest,
+                     "applied": projection.applied_digest})
+        domain = domains.get(projection.domain_id) if projection is not None else None
+        if projection is not None and domain is not None:
+            if projection.generation != domain.generation:
+                categories["domain_generation_mismatch"].append(
+                    {"asset": aid, "projection": projection.generation,
+                     "domain": domain.generation})
+            if projection.policy_fingerprint != domain.policy_fingerprint:
+                categories["domain_policy_mismatch"].append(
+                    {"asset": aid, "projection": projection.policy_fingerprint,
+                     "domain": domain.policy_fingerprint})
+
+    return {"clean": not any(categories.values()),
+            "assets": len(control), "categories": categories}
+
+
 def cmd_reconcile_data_plane(args):
     _, engine, factory, _ = _context(args)
     data_key = base64.b64decode(_required_env("KVMHUB_DATA_PLANE_KEY"), validate=True)
     if len(data_key) != 32:
         raise SystemExit("KVMHUB_DATA_PLANE_KEY must decode to 32 bytes")
+    if getattr(args, "migration_report", False):
+        store = Store(str(args.store), data_key)
+        try:
+            with transaction(factory) as db:
+                result = build_migration_report(db=db, store=store, now=time.time())
+        finally:
+            store.close()
+        print(json.dumps(result, ensure_ascii=False, indent=1))
+        engine.dispose()
+        return result
     stamp = time.time()
     expected: dict[str, set[str]] = {}
     with transaction(factory) as db:
@@ -647,6 +963,14 @@ def parser():
     p.add_argument("--actor", default="cli")
     sub = p.add_subparsers(dest="command", required=True)
 
+    q = sub.add_parser('attest-overlay-identity', help='bind measured identity to an approved device admission')
+    q.add_argument('--asset', required=True)
+    q.add_argument('--model-id', required=True, help='exact approved Capability row ID')
+    q.add_argument('--firmware', required=True)
+    q.add_argument('--evidence', required=True)
+    q.add_argument('--approver', required=True)
+    q.add_argument('--expires', type=float, required=True, help='evidence expiry, epoch seconds')
+    q.set_defaults(fn=cmd_attest_overlay_identity)
     sub.add_parser("init-db", help="create schema, RBAC, first admin, measured profiles").set_defaults(fn=cmd_init_db)
     q = sub.add_parser("create-user"); q.add_argument("--username", required=True); q.add_argument("--role", default="viewer"); q.add_argument("--display-name"); q.add_argument("--tenant", default="default"); q.set_defaults(fn=cmd_create_user)
     q = sub.add_parser("create-platform-admin", help="create the cross-tenant operator (tenant_id NULL)")
@@ -683,6 +1007,22 @@ def parser():
     q.add_argument("--greeting", help="measured RFB greeting, e.g. 'RFB 003.008'")
     q.set_defaults(fn=cmd_brand_onboard)
     q = sub.add_parser("approve-profile"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--renew", action="store_true", help="record a new review of an already-approved profile"); q.set_defaults(fn=cmd_approve_profile)
+    q = sub.add_parser("set-pipeline-identity",
+                       help="record the recipe/bundle an approved profile may run on the V1 video lane")
+    q.add_argument("--profile", required=True, help="vendor profile id")
+    q.add_argument("--capability", help="capability id that locks the bundle (optional)")
+    q.add_argument("--recipe-id", required=True)
+    q.add_argument("--recipe-revision", type=int, required=True)
+    q.add_argument("--schema", required=True, help="config schema version, e.g. v1")
+    q.add_argument("--bundle", help="locked client bundle revision, requires --capability")
+    q.add_argument("--evidence", required=True)
+    q.add_argument("--approver", required=True)
+    q.set_defaults(fn=cmd_set_pipeline_identity)
+    q = sub.add_parser("refresh-lane-contract",
+                       help="re-snapshot lane assets after the console wire contract changed in code")
+    q.add_argument("--asset", help="one asset id; omit to refresh every lane asset")
+    q.add_argument("--profile", help="limit to one vendor profile id")
+    q.set_defaults(fn=cmd_refresh_lane_contract)
     sub.add_parser("capabilities").set_defaults(fn=cmd_capabilities)
     q = sub.add_parser("approve-capability"); q.add_argument("--id", required=True); q.add_argument("--approver", required=True); q.add_argument("--evidence", required=True); q.add_argument("--review-days", type=int, default=180); q.add_argument("--valid-days", type=int, default=365); q.set_defaults(fn=cmd_approve_capability)
     q = sub.add_parser("detect"); q.add_argument("--inventory", required=True); q.add_argument("--make-draft", action="store_true"); q.add_argument("--greeting", help="RFB greeting measured by a probe, e.g. 'RFB 055.008'"); q.set_defaults(fn=cmd_detect)
@@ -730,6 +1070,8 @@ def parser():
                        help="read-only per-user grant drift check before enabling strict grants")
     q.add_argument("--store", required=True,
                    help="data-plane store DSN: sqlite path or mysql://user:password@host:3306/db")
+    q.add_argument("--migration-report", action="store_true",
+                   help="emit the read-only P0 approval/target inventory instead of grant drift")
     q.set_defaults(fn=cmd_reconcile_data_plane)
     q = sub.add_parser("register-worker", help="register/refresh a Worker in the shared roster")
     q.add_argument("--worker-id", required=True)

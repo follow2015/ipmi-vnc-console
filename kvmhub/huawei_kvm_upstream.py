@@ -32,6 +32,17 @@ def valid_pin(pin: str) -> bool:
     return len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)
 
 
+def normalise_pin(value: str) -> str:
+    return str(value or "").strip().lower().replace(":", "")
+
+
+def resolve_huawei_pin(info: dict, env_pin: str) -> str:
+    asset_pin = normalise_pin(info.get("fingerprint"))
+    if asset_pin:
+        return asset_pin if valid_pin(asset_pin) else ""
+    return normalise_pin(env_pin)
+
+
 def tls_der_matches_pin(der: bytes | None, pin: str) -> bool:
     if not der or not valid_pin(pin):
         return False

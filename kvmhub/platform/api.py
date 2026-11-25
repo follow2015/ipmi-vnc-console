@@ -20,13 +20,18 @@ from .models import (Asset, Capability, Credential, ROLE_ADMIN, Tenant, User,
 from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
-from . import (bmc_probe, bmc_reset, connection, governance, public_ip,
-               services, text_input, vendor_registry)
+from . import (bmc_probe, bmc_reset, connection, connection_config, governance,
+               public_ip, services, text_input, vendor_registry)
 from .bus import AssemblyBus, BusError
 from .contracts import CONTRACT_RESPONSES, contract_components, response_schema
 
 MAX_BODY = 65536
 logger = logging.getLogger("kvmhub.platform.api")
+
+
+def _tenant_admission_status(status: dict) -> dict:
+    return {key: value for key, value in status.items()
+            if key not in ("desired", "applied")}
 
 
 async def _drop_user_sessions(state: State, user_id: str) -> None:
@@ -57,9 +62,27 @@ def _build_plane(cfg: Settings, state: State):
                      passthrough_targets=targets, strict_grants=cfg.strict_grants,
                      bmc_allowed_networks=networks)
 
+    authority = None
+    authority_host = ""
+    if cfg.authority_url:
+        from urllib.parse import urlparse
+
+        from ..admission_runtime import AuthorityClient
+
+        authority_host = urlparse(cfg.authority_url).netloc
+        authority = AuthorityClient(
+            cfg.authority_url, ca=cfg.authority_ca, cert=cfg.authority_cert,
+            key=cfg.authority_key, public_key=private.public_key(),
+            principal=cfg.authority_cert_cn or "kvmhub-authority-client")
+
     return ConsolePlane(store_factory=connect, private_key=private,
                         bus=AssemblyBus(state),
-                        accept_template=cfg.worker_url_template or None, port=WORKER_PORT)
+                        accept_template=cfg.worker_url_template or None, port=WORKER_PORT,
+                        authority=authority, authority_host=authority_host,
+                        permit_public_key=private.public_key(),
+                        managed_domains=tuple(
+                            item.strip() for item in cfg.managed_domains.split(",")
+                            if item.strip()))
 
 
 class Platform:
@@ -515,6 +538,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 extra = by_id.get(row["id"])
                 if extra and "grant_expires" in extra:
                     row["grant_expires"] = extra["grant_expires"]
+                row["admission"] = _tenant_admission_status(
+                    connection_config.device_admission_status(db, asset_id=row["id"]))
         occupancy = platform.plane.asset_occupancy(
             [row["id"] for row in rows], auth["user_id"], manage=scope == "all") if platform.plane else {}
         with transaction(platform.factory) as db:
@@ -527,6 +552,19 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             row["occupancy"] = value
             row["occupancy_available"] = platform.plane is not None
         return rows
+
+    @app.get("/api/v2/assets/{asset_id}/admission")
+    async def asset_admission_status(asset_id: str, request: Request):
+        auth = await current(request, permission="asset.read")
+        with transaction(platform.factory) as db:
+            is_admin = ROLE_ADMIN in (auth.get("roles") or [])
+            visible = (services.all_assets(db, auth["user_id"], tenant_id=auth["tenant_id"])
+                       if is_admin else
+                       services.assets_for_user(db, auth["user_id"], tenant_id=auth["tenant_id"]))
+            if asset_id not in {row["id"] for row in visible}:
+                raise services.PlatformError("asset_not_found", "资产不存在", 404)
+            return _tenant_admission_status(
+                connection_config.device_admission_status(db, asset_id=asset_id))
 
     @app.post("/api/v2/assets")
     async def upsert_asset(request: Request):
@@ -637,6 +675,62 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                               .where(Credential.tenant_id == auth["tenant_id"])
                               .order_by(Credential.created)).all()
             return [row.public() for row in rows]
+
+    @app.get('/api/v2/profile-overlays')
+    async def list_profile_overlays(request: Request):
+        auth = await current(request, permission='profile.overlay.write')
+        from . import overlays
+        from .models import ProfileOverlay, ProfileOverlayRevision
+        with transaction(platform.factory) as db:
+            return [overlays.public(row, db.get(ProfileOverlayRevision,
+                     (row.id, row.current_revision))) for row in db.scalars(
+                         select(ProfileOverlay).where(ProfileOverlay.tenant_id == auth['tenant_id'])
+                         .order_by(ProfileOverlay.id)).all()]
+
+    @app.put('/api/v2/profile-overlays/{profile_id}')
+    async def save_profile_overlay(profile_id: str, request: Request):
+        auth = await current(request, mutate=True, permission='profile.overlay.write')
+        body = await _json(request)
+        if set(body) != {'expected_revision', 'subset'}:
+            raise services.PlatformError('invalid_request', '需要 expected_revision 与 subset')
+        from . import overlays
+        with transaction(platform.factory) as db:
+            return overlays.save(db, tenant_id=auth['tenant_id'], user_id=auth['user_id'],
+                profile_id=profile_id, payload=body['subset'], expected_revision=body['expected_revision'])
+
+    @app.post('/api/v2/profile-overlays/{overlay_id}/disable')
+    async def disable_profile_overlay(overlay_id: str, request: Request):
+        auth = await current(request, mutate=True, permission='profile.overlay.write')
+        body = await _json(request)
+        if set(body) != {'expected_revision'}:
+            raise services.PlatformError('invalid_request', '需要 expected_revision')
+        from . import overlays
+        with transaction(platform.factory) as db:
+            return overlays.change_state(db, overlay_id=overlay_id, state='disabled',
+                expected_revision=body['expected_revision'], user_id=auth['user_id'],
+                tenant_id=auth['tenant_id'])
+
+    @app.put('/api/v2/assets/{asset_id}/profile-overlay')
+    async def bind_profile_overlay(asset_id: str, request: Request):
+        auth = await current(request, mutate=True, permission='profile.overlay.write')
+        body = await _json(request)
+        if set(body) != {'overlay_id', 'revision'}:
+            raise services.PlatformError('invalid_request', '需要 overlay_id 与 revision')
+        from . import overlays
+        with transaction(platform.factory) as db:
+            return overlays.bind(db, asset_id=asset_id, overlay_id=body['overlay_id'],
+                revision=body['revision'], user_id=auth['user_id'], tenant_id=auth['tenant_id'])
+
+    @app.post('/api/v2/platform/profile-overlays/{overlay_id}/withdraw')
+    async def withdraw_profile_overlay(overlay_id: str, request: Request):
+        auth = await current_platform(request, mutate=True, permission='platform.asset.admit')
+        body = await _json(request)
+        if set(body) != {'expected_revision'}:
+            raise services.PlatformError('invalid_request', '需要 expected_revision')
+        from . import overlays
+        with transaction(platform.factory) as db:
+            return overlays.change_state(db, overlay_id=overlay_id, state='withdrawn',
+                expected_revision=body['expected_revision'], user_id=auth['user_id'], platform=True)
 
     @app.post("/api/v2/credentials")
     async def create_credential(request: Request):
@@ -1101,6 +1195,14 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                             asset, db, show_ipmi=True).items() if key != "credential_id"},
                      "tenant_code": codes.get(asset.tenant_id)}
                     for asset in db.scalars(query).all()]
+
+    @app.get("/api/v2/platform/assets/{asset_id}/admission")
+    async def platform_asset_admission_status(asset_id: str, request: Request):
+        await current_platform(request, permission="platform.asset.read")
+        with transaction(platform.factory) as db:
+            if db.get(Asset, asset_id) is None:
+                raise services.PlatformError("asset_not_found", "资产不存在", 404)
+            return connection_config.device_admission_status(db, asset_id=asset_id)
 
     @app.post("/api/v2/platform/assets")
     async def platform_create_asset(request: Request):

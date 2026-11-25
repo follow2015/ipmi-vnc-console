@@ -6,12 +6,13 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from .driver_specs import DRIVERS
 from .common import Problem
 
 
 class MockAdapter:
     adapter_id = "mock-v1"
-    connection_limit = 4
+    connection_limit = DRIVERS[adapter_id].connection_limit
 
     def __init__(self, info):
         target = urlsplit(info["target"])

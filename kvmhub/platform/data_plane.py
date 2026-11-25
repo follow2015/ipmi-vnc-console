@@ -4,10 +4,9 @@ from __future__ import annotations
 import re
 
 from .. import capability as poc_capability
-from ..common import (ATEN_JAVA_ADAPTER_ID, HUAWEI_IBMC_KVM_GATEWAY_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                      IDRAC8_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID,
-                      PASSTHROUGH_ADAPTER_ID, Problem)
+from ..common import Problem
 from ..rfb_protocol import PROTOCOLS
+from ..driver_specs import DRIVERS, REAL_ADAPTER_IDS
 
 DEFAULT_ASSET_PATHS = (
     "/novnc/include/*.js",
@@ -100,9 +99,7 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
     data_plane = assembly.get("data_plane") or {}
     entry = data_plane.get("capability_entry") or {}
     plan = assembly.get("plan") or {}
-    allowed_adapters = (PASSTHROUGH_ADAPTER_ID, IDRAC8_ADAPTER_ID,
-                        IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID,
-                        HUAWEI_IBMC_KVM_GATEWAY_ID, ATEN_JAVA_ADAPTER_ID)
+    allowed_adapters = REAL_ADAPTER_IDS
     if data_plane.get("adapter") not in (None, *allowed_adapters):
         raise Problem("invalid_target_policy", 502)
     if entry.get("adapter") and entry["adapter"] not in allowed_adapters:
@@ -116,7 +113,7 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
         raise Problem("invalid_target_policy", 502)
     message_profile = str(plan.get("message_profile") or "").strip()
     adapter = data_plane.get("adapter") or entry.get("adapter") or ""
-    if (adapter not in (IDRAC_VNC_ADAPTER_ID, HUAWEI_IBMC_VNC_ADAPTER_ID)
+    if ((DRIVERS.get(adapter) is None or DRIVERS[adapter].vendor_layout_check)
             and rfb_version and message_profile):
         expected = MESSAGE_PROFILE_BY_VERSION.get(rfb_version)
         if expected and expected != message_profile:
@@ -150,5 +147,11 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
         "assembly_id": assembly.get("assembly_id"),
         "assembly_profile": (assembly.get("profile") or {}).get("code"),
         "display_address": assembly.get("display_address"),
+        "video_lane": assembly.get('lane') or '',
+        "video_binding": assembly.get('binding') or '',
+        "video_contract": (assembly.get('client_contract')
+                           or (assembly.get('pipeline_versions') or {}).get('protocol_contract', '')),
+        "video_bundle": (assembly.get('client_bundle')
+                         or (assembly.get('pipeline_versions') or {}).get('bundle_revision', '')),
     })
     return result

@@ -4,12 +4,14 @@ from __future__ import annotations
 import os
 from urllib.parse import urlsplit
 
+from ..driver_specs import DRIVERS
 from ..common import (HUAWEI_IBMC_VNC_ADAPTER_ID, Problem,
                       bmc_allowed_networks_from_env, require_controlled_host)
+from ..huawei_kvm_upstream import normalise_pin, resolve_huawei_pin
+from ..rfb_tcp_upstream import RfbTcpConfig, RfbTcpUpstream
 from ..passthrough import RfbPassthroughSession
-from ..rfb_tcp_upstream import (BROWSER_RFB_VERSION, RfbTcpConfig, RfbTcpUpstream,
-                                StandardRfbBrowserHandshake)
-from .idrac8 import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
+from ..client_assets import ASSET_DIR, ASSET_PATH, KNOWN_ASSETS
+from .rfb_tcp_family import RfbTcpFamilyAdapter
 
 HUAWEI_VNC_PORT = 5900
 PIN_ENV = "KVMHUB_HUAWEI_VNC_PIN"
@@ -19,11 +21,12 @@ def huawei_vnc_pin_from_env() -> str:
     return os.environ.get(PIN_ENV, "").strip().lower().replace(":", "")
 
 
-class HuaweiIbmcVncAdapter:
+
+class HuaweiIbmcVncAdapter(RfbTcpFamilyAdapter):
     adapter_id = HUAWEI_IBMC_VNC_ADAPTER_ID
-    connection_limit = 1
-    supports_upstream_recovery = False
-    login_budget = 28.0
+    connection_limit = DRIVERS[adapter_id].connection_limit
+    supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
+    login_budget = DRIVERS[adapter_id].login_budget
 
     def __init__(self, info: dict, *, networks=None, pin: str | None = None) -> None:
         target = urlsplit(info["target"])
@@ -37,7 +40,14 @@ class HuaweiIbmcVncAdapter:
             bmc_allowed_networks_from_env() if networks is None else networks,
             adapter_id=self.adapter_id,
         )
-        expected_pin = pin if pin is not None else huawei_vnc_pin_from_env()
+        if pin is None:
+            asset_pin = normalise_pin(info.get("fingerprint"))
+            if asset_pin and (len(asset_pin) != 64
+                              or any(c not in "0123456789abcdef" for c in asset_pin)):
+                raise Problem("bmc_cert_pin_invalid", 400)
+            expected_pin = resolve_huawei_pin(info, huawei_vnc_pin_from_env())
+        else:
+            expected_pin = normalise_pin(pin)
         if len(expected_pin) != 64 or any(c not in "0123456789abcdef" for c in expected_pin):
             raise Problem("bmc_cert_pin_unconfigured", 503)
         self.target = info["target"]
@@ -55,42 +65,3 @@ class HuaweiIbmcVncAdapter:
             tls_enabled=True, tls_cert_sha256=self.pin))
         self.upstream = upstream
         await upstream.connect()
-
-    async def connect(self, offered: list[str]) -> RfbPassthroughSession:
-        if "binary" not in offered:
-            raise Problem("subprotocol_required", 400)
-        if self.session is not None and not self.session.closed:
-            raise Problem("connection_limit")
-        if self.upstream is None or not self.upstream.server_init_raw:
-            raise Problem("upstream_handshake_failed", 502)
-        handshake = StandardRfbBrowserHandshake(
-            self.upstream.server_init_raw,
-            version=(BROWSER_RFB_VERSION + "\n").encode("ascii"))
-        session = RfbPassthroughSession(self.upstream, handshake)
-        await session.start()
-        self.session = session
-        return session
-
-    async def fetch_asset(self, path: str) -> tuple[str, bytes]:
-        match = ASSET_PATH.fullmatch(path or "")
-        if match is None:
-            raise Problem("route_denied", 404)
-        name = match.group(1)
-        if not name.endswith(".js"):
-            name += ".js"
-        if name not in KNOWN_ASSETS:
-            raise Problem("route_denied", 404)
-        target = ASSET_DIR / name
-        if not target.is_file():
-            raise Problem("route_denied", 404)
-        return "application/javascript", target.read_bytes()
-
-    async def close(self) -> bool:
-        if self.session is not None:
-            await self.session.close()
-            self.session = None
-        if self.upstream is None:
-            return False
-        upstream, self.upstream = self.upstream, None
-        await upstream.close()
-        return True

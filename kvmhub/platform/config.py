@@ -75,6 +75,13 @@ class Settings:
     iframe_mode: str = "off"
     strict_grants: bool = False
     integration_trusted_proxies: str = ""
+    authority_url: str = ""
+    authority_ca: str = ""
+    authority_cert: str = ""
+    authority_key: str = ""
+    authority_cert_cn: str = ""
+    platform_cert_cn: str = ""
+    managed_domains: str = ""
 
     @property
     def is_prod(self) -> bool:
@@ -118,6 +125,28 @@ class Settings:
             for item in self.integration_trusted_proxies.split(","):
                 if item.strip():
                     ipaddress.ip_network(item.strip(), strict=False)
+        managed_domains = tuple(item.strip() for item in self.managed_domains.split(",")
+                                if item.strip())
+        if managed_domains and not self.authority_url:
+            raise ValueError("KVMHUB_MANAGED_DOMAINS requires KVMHUB_AUTHORITY_URL; "
+                             "managed domains must never fall back to the legacy chain")
+        if self.authority_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.authority_url)
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise ValueError("KVMHUB_AUTHORITY_URL must be an https URL with a host")
+            missing = [name for name, value in (
+                ("KVMHUB_AUTHORITY_CA", self.authority_ca),
+                ("KVMHUB_AUTHORITY_CERT", self.authority_cert),
+                ("KVMHUB_AUTHORITY_KEY", self.authority_key),
+            ) if not value]
+            if missing:
+                raise ValueError("managed admission needs " + ", ".join(missing))
+            for name, path in (("KVMHUB_AUTHORITY_CA", self.authority_ca),
+                               ("KVMHUB_AUTHORITY_CERT", self.authority_cert),
+                               ("KVMHUB_AUTHORITY_KEY", self.authority_key)):
+                if not Path(path).is_file():
+                    raise ValueError(f"{name} does not point to a file")
         if self.is_prod and not self.bmc_allowed_networks:
             raise ValueError("KVMHUB_BMC_ALLOWED_NETWORKS must be configured in production")
         if self.bmc_allowed_networks:
@@ -165,6 +194,13 @@ def settings(env_path: str | os.PathLike[str] | None = None) -> Settings:
         iframe_mode=os.getenv("KVMHUB_IFRAME_MODE", "off").strip().lower(),
         strict_grants=_bool("KVMHUB_STRICT_GRANTS", False),
         integration_trusted_proxies=os.getenv("KVMHUB_TRUSTED_PROXIES", "").strip(),
+        authority_url=os.getenv("KVMHUB_AUTHORITY_URL", "").strip(),
+        authority_ca=os.getenv("KVMHUB_AUTHORITY_CA", "").strip(),
+        authority_cert=os.getenv("KVMHUB_AUTHORITY_CERT", "").strip(),
+        authority_key=os.getenv("KVMHUB_AUTHORITY_KEY", "").strip(),
+        authority_cert_cn=os.getenv("KVMHUB_AUTHORITY_CERT_CN", "").strip(),
+        platform_cert_cn=os.getenv("KVMHUB_PLATFORM_CERT_CN", "").strip(),
+        managed_domains=os.getenv("KVMHUB_MANAGED_DOMAINS", "").strip(),
     )
     cfg.validate()
     return cfg

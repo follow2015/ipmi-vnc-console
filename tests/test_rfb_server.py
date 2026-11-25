@@ -49,32 +49,3 @@ def test_frame_update_preserves_pixel_order():
 def test_frame_update_rejects_wrong_pixel_count():
     with pytest.raises(ValueError, match="pixel_count_mismatch"):
         rfb_server.build_raw_framebuffer_update([0], 4, 4)
-
-
-def test_offline_video_pipeline_from_vids_chunks_to_rfb():
-    import struct as _struct
-
-    from kvmhub.idrac8_dvc import DvcDecompressor, VidsFrameAssembler
-
-    def vids(flags: int, payload: bytes) -> bytes:
-        total = 20 + len(payload)
-        return (b"VIDS" + b"\x00\x81" + _struct.pack(">H", total)
-                + b"\xde\xad\xbe\xef" + _struct.pack(">HH", 2, 4)
-                + bytes([flags, 0, 0, 0]) + payload)
-
-    def raw(value: int) -> bytes:
-        return bytes([0x80 | ((value >> 8) & 0x7F), value & 0xFF])
-
-    stream = (raw(0x001F) + raw(0x03E0) + raw(0x7C00) + raw(0x0000)
-              + bytes([0x40 | 0x04]))
-    assembler = VidsFrameAssembler()
-    assert assembler.feed(vids(0x05, stream[:4])) is None
-    assert assembler.feed(vids(0x04, stream[4:8])) is None
-    complete = assembler.feed(vids(0x06, stream[8:]))
-    assert complete is not None
-
-    pixels = DvcDecompressor(4, 2, color_depth=15).uncompress(complete.payload)
-    messages = rfb_server.build_raw_framebuffer_update(pixels, 4, 2, rows_per_rect=1)
-    assert len(messages) == 2
-    assert messages[0][16:] == messages[1][16:]
-    assert len(messages[0]) == 16 + 4 * 1 * 3

@@ -19,6 +19,7 @@ from kvmhub.common import WORKER_PORT, Problem, digest, issue, server_tls
 from kvmhub.mock_bmc import create_mock
 from kvmhub import worker as worker_module
 from kvmhub.recovery import RecoveryPolicy
+from kvmhub.video.client_v2 import client_build
 from kvmhub.worker import (GATEWAY_KEY, MAX_TRACES, SESSION_KEY, Gateway, ManagerRejected,
                            Runtime, create_worker, wire_recovery)
 from tools.bootstrap import generate
@@ -840,7 +841,11 @@ async def test_limits_endpoint_tells_the_page_why_it_cannot_connect(identities):
             async with browser.get(server.make_url("/_platform/limits"), headers=headers) as response:
                 assert response.status == 200
                 body = await response.json()
-    assert body == {"limit": 4, "connections": 3, "opening": 0, "closing": False}
+    assert body == {"limit": 4, "connections": 3, "opening": 0, "closing": False,
+                    "lane": None, "recipe_id": None, "recipe_revision": None,
+                    "protocol_contract": "console-rfb/1",
+                    "bundle_revision": client_build(), "schema_version": "v1",
+                    "transcode_capacity": 0, "transcode_occupied": 0, "deny_reason": None}
     assert "/_platform/limits" in worker_module.REAL_CONSOLE_JS
 
 
@@ -1023,7 +1028,12 @@ async def test_only_an_adapter_that_can_rebuild_gets_the_policy(identities):
     _, cfg = identities
     policy = Gateway(cfg).recovery
     passthrough = object.__new__(PassthroughAdapter)
-    assert wire_recovery(passthrough, policy).recovery is policy
+    hook = object()
+    wired = wire_recovery(passthrough, policy, before_connect=hook,
+                          require_before_connect=True)
+    assert wired.recovery is policy
+    assert wired.recovery_before_connect is hook
+    assert wired.recovery_requires_permit is True
     synthetic = MockAdapter({"target": "https://127.0.0.1:443", "fingerprint": "00" * 32,
                              "adapter": "mock-v1"})
     try:
@@ -1073,7 +1083,12 @@ async def test_only_an_adapter_that_can_rebuild_gets_the_policy(identities):
     _, cfg = identities
     policy = Gateway(cfg).recovery
     passthrough = object.__new__(PassthroughAdapter)
-    assert wire_recovery(passthrough, policy).recovery is policy
+    hook = object()
+    wired = wire_recovery(passthrough, policy, before_connect=hook,
+                          require_before_connect=True)
+    assert wired.recovery is policy
+    assert wired.recovery_before_connect is hook
+    assert wired.recovery_requires_permit is True
     synthetic = MockAdapter({"target": "https://127.0.0.1:443", "fingerprint": "00" * 32,
                              "adapter": "mock-v1"})
     try:

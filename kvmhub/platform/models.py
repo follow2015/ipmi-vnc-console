@@ -35,7 +35,7 @@ PERMISSIONS = (
     "asset.read", "asset.write", "console.open", "console.close",
     "credential.write", "vendor.read", "vendor.approve",
     "user.read", "user.write", "grant.write", "audit.read",
-    "session.read", "session.revoke",
+    "session.read", "session.revoke", "profile.overlay.write",
 )
 ROLE_PERMISSIONS = {
     ROLE_ADMIN: PERMISSIONS,
@@ -49,6 +49,7 @@ PLATFORM_PERMISSIONS = (
     "platform.user.read", "platform.user.write",
     "platform.session.read", "platform.session.revoke",
     "platform.audit.read", "platform.asset.read", "platform.asset.write",
+    "platform.asset.admit",
     "platform.worker.read", "platform.worker.manage",
     "platform.vendor.read",
 )
@@ -184,6 +185,9 @@ class VendorProfile(Base):
     approved_at: Mapped[float] = mapped_column(Float, default=0.0)
     review_due: Mapped[float] = mapped_column(Float, default=0.0)
     revision: Mapped[int] = mapped_column(Integer, default=0)
+    recipe_id: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    recipe_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    config_schema_version: Mapped[str] = mapped_column(String(32), default="v1", nullable=False)
     created: Mapped[float] = mapped_column(Float, nullable=False)
 
     def public(self) -> dict:
@@ -202,7 +206,10 @@ class VendorProfile(Base):
                 "priority": self.priority, "status": self.status,
                 "evidence": self.evidence, "approver": self.approver,
                 "approved_at": self.approved_at, "review_due": self.review_due,
-                "revision": self.revision}
+                "revision": self.revision,
+                "recipe_id": self.recipe_id,
+                "recipe_revision": self.recipe_revision,
+                "config_schema_version": self.config_schema_version}
 
 
 class Capability(Base):
@@ -229,6 +236,7 @@ class Capability(Base):
     review_due: Mapped[float] = mapped_column(Float, default=0.0)
     status_reason: Mapped[str] = mapped_column(Text, default="")
     revision: Mapped[int] = mapped_column(Integer, default=0)
+    bundle_revision: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     created: Mapped[float] = mapped_column(Float, nullable=False)
 
 
@@ -240,6 +248,7 @@ class Credential(Base):
     username_cipher: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     password_cipher: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     key_version: Mapped[int] = mapped_column(Integer, default=1)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
     created_by: Mapped[str] = mapped_column(String(128), default="")
     created: Mapped[float] = mapped_column(Float, nullable=False)
     rotated_at: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -268,6 +277,7 @@ class Asset(Base):
     vnc_username_cipher: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     vnc_password_cipher: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     vnc_key_version: Mapped[int] = mapped_column(Integer, default=1)
+    vnc_secret_revision: Mapped[int] = mapped_column(Integer, default=1)
     created: Mapped[float] = mapped_column(Float, nullable=False)
     updated: Mapped[float] = mapped_column(Float, nullable=False)
     __table_args__ = (Index("ix_kvm_asset_tenant_address", "tenant_id", "address"),)
@@ -415,3 +425,130 @@ class ServiceToken(Base):
                 "expires": self.expires, "created": self.created,
                 "revoked": self.revoked, "last_used": self.last_used,
                 "created_by": self.created_by}
+
+
+
+class ProfileOverlay(Base):
+    __tablename__ = "kvm_profile_overlay"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    base_profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    current_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'base_profile_id', name='uq_kvm_overlay_tenant_base'),
+        Index('ix_kvm_overlay_tenant_state_base', 'tenant_id', 'state', 'base_profile_id'),
+    )
+
+
+class ProfileOverlayRevision(Base):
+    __tablename__ = "kvm_profile_overlay_revision"
+    overlay_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    base_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    subset_json: Mapped[str] = mapped_column(Text, nullable=False)
+    base_versions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+
+
+class AssetOverlayBinding(Base):
+    __tablename__ = "kvm_asset_overlay_binding"
+    asset_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    overlay_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class DeviceIdentityEvidence(Base):
+    __tablename__ = "kvm_device_identity_evidence"
+    asset_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    admission_revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    identity_digest: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    firmware: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    attested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+
+
+class DeviceAdmission(Base):
+    __tablename__ = "kvm_device_admission"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    identity_digest: Mapped[str] = mapped_column(String(128), default="")
+    domain_id: Mapped[str] = mapped_column(String(64), default="")
+    approver: Mapped[str] = mapped_column(String(128), default="")
+    evidence: Mapped[str] = mapped_column(Text, default="")
+    review_due: Mapped[float] = mapped_column(Float, default=0.0)
+    expires: Mapped[float] = mapped_column(Float, default=0.0)
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("asset_id", "revision", name="uq_kvm_device_admission_revision"),
+    )
+
+
+class AssetConnection(Base):
+    __tablename__ = "kvm_asset_connection"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    endpoint_json: Mapped[str] = mapped_column(Text, default="[]")
+    adapter: Mapped[str] = mapped_column(String(128), default="")
+    identity_policy: Mapped[str] = mapped_column(Text, default="{}")
+    source_versions_json: Mapped[str] = mapped_column(Text, default="{}")
+    secret_ref: Mapped[str] = mapped_column(String(128), default="")
+    secret_source: Mapped[str] = mapped_column(String(32), default="")
+    secret_revision: Mapped[int] = mapped_column(Integer, default=0)
+    schema: Mapped[str] = mapped_column(String(32), default="v2")
+    digest: Mapped[str] = mapped_column(String(128), default="")
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("asset_id", "revision", name="uq_kvm_asset_connection_revision"),
+    )
+
+
+class PlaneOutbox(Base):
+    __tablename__ = "kvm_plane_outbox"
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    lease_owner: Mapped[str] = mapped_column(String(128), default="")
+    lease_until: Mapped[float] = mapped_column(Float, default=0.0)
+    next_attempt: Mapped[float] = mapped_column(Float, default=0.0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PlaneProjection(Base):
+    __tablename__ = "kvm_plane_projection"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    domain_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    desired_revision: Mapped[int] = mapped_column(Integer, default=0)
+    desired_digest: Mapped[str] = mapped_column(String(128), default="")
+    applied_revision: Mapped[int] = mapped_column(Integer, default=0)
+    applied_digest: Mapped[str] = mapped_column(String(128), default="")
+    generation: Mapped[str] = mapped_column(String(64), default="")
+    policy_fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    error: Mapped[str] = mapped_column(Text, default="")
+    ack_at: Mapped[float] = mapped_column(Float, default=0.0)
+    __table_args__ = (
+        UniqueConstraint("asset_id", "domain_id", name="uq_kvm_plane_projection_target"),
+    )
+
+
+class ExecutionDomain(Base):
+    __tablename__ = "kvm_execution_domain"
+    domain_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    endpoint: Mapped[str] = mapped_column(String(256), default="")
+    supported_schema: Mapped[str] = mapped_column(Text, default="[]")
+    policy_fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    generation: Mapped[str] = mapped_column(String(64), default="")
+    health: Mapped[str] = mapped_column(String(32), default="unknown")

@@ -1,6 +1,7 @@
 """Cross-process hand-off between the control plane and the PoC data plane."""
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -14,6 +15,25 @@ ROUTE_PREFIX = "kvmhub:route:"
 DEFAULT_CAPACITY = 4
 DEFAULT_WORKER_TTL = 45
 ASSEMBLY_TTL = 120
+TRANSCODE_LANE = 'transcode-v1'
+LANE_VERSION_KEYS = ('recipe_id', 'recipe_revision', 'protocol_contract', 'schema_version')
+DEFAULT_PIPELINE_SCHEMA = 'v1'
+
+
+def pipeline_identity(environ=None) -> dict:
+    env = os.environ if environ is None else environ
+
+    def read(name):
+        return str(env.get(name) or '').strip()
+
+    from ..video.client_v2 import client_build, protocol_contract
+
+    return {'lane': read('KVMHUB_WORKER_LANE'),
+            'recipe_id': read('KVMHUB_RECIPE_ID'),
+            'recipe_revision': read('KVMHUB_RECIPE_REVISION'),
+            'protocol_contract': protocol_contract(),
+            'schema_version': read('KVMHUB_PIPELINE_SCHEMA') or DEFAULT_PIPELINE_SCHEMA,
+            'bundle_revision': read('KVMHUB_BUNDLE_REVISION') or client_build()}
 
 
 class BusError(ValueError):
@@ -145,24 +165,102 @@ class AssemblyBus:
         prefix = f"{LOAD_PREFIX}{worker_id}:"
         return [key[len(prefix):] for key in await self.state.keys(prefix)]
 
-    async def choose_worker(self) -> dict:
+
+    @staticmethod
+    def _worker_transcode_budgets(row: dict) -> dict | None:
+        metadata = row.get("metadata") or {}
+        if metadata.get("lane") != TRANSCODE_LANE:
+            return None
+        try:
+            result = {"capacity": int(metadata["transcode_capacity"]),
+                      "cpu_budget": float(metadata["cpu_budget"]),
+                      "mem_budget": float(metadata["mem_budget"]),
+                      "cpu_need": float(metadata["session_cpu"]),
+                      "mem_need": float(metadata["session_mem"])}
+        except (KeyError, TypeError, ValueError):
+            return None
+        if min(result.values()) <= 0:
+            return None
+        return result
+
+    async def reserve_worker_resources(self, worker_id: str, sid: str, *, ttl: int,
+                                       row: dict | None = None) -> bool:
+        if row is None:
+            row = (await self.workers()).get(worker_id)
+        budgets = self._worker_transcode_budgets(row) if row else None
+        if budgets is None:
+            return False
+        return await self.state.reserve_worker_resources(
+            worker_id, sid, ttl=ttl, **budgets)
+
+    async def release_worker_resources(self, worker_id: str, sid: str) -> None:
+        await self.state.release_worker_resources(worker_id, sid)
+
+    async def worker_resources(self, worker_id: str) -> dict:
+        return await self.state.worker_resources(worker_id)
+
+    async def choose_worker(self, requirements: dict | None = None) -> dict:
+        req = requirements or {}
+        lane = req.get("lane") or None
+        versions = req.get("versions") or {}
+        if not isinstance(versions, dict):
+            raise BusError("invalid_request", "Worker 版本需求不合法")
+        max_age = req.get("max_worker_age")
         roster = await self.workers()
         if not roster:
             raise BusError("no_worker_available", "没有已注册的 Worker，控制台未下发")
         candidates = []
+        version_gap = False
+        capacity_gap = False
         for worker_id, row in roster.items():
             if row.get("draining"):
                 continue
+            metadata = row.get("metadata") or {}
+            if lane and metadata.get("lane") != lane:
+                version_gap = True
+                continue
+            if any(metadata.get(key) != value for key, value in versions.items()):
+                version_gap = True
+                continue
+            if max_age is not None:
+                try:
+                    if self._clock() - float(row.get("registered_at", 0)) > float(max_age):
+                        capacity_gap = True
+                        continue
+                except (TypeError, ValueError):
+                    capacity_gap = True
+                    continue
             try:
                 capacity = int(row.get("capacity", DEFAULT_CAPACITY))
             except (TypeError, ValueError):
+                capacity_gap = True
                 continue
             if capacity < 1:
+                capacity_gap = True
                 continue
             load = await self.worker_load(worker_id)
-            if load < capacity:
-                candidates.append((load / capacity, load, worker_id, row))
+            if load >= capacity:
+                capacity_gap = True
+                continue
+            score = load / capacity
+            if lane == TRANSCODE_LANE:
+                budgets = self._worker_transcode_budgets(row)
+                if budgets is None:
+                    version_gap = True
+                    continue
+                used = await self.worker_resources(worker_id)
+                if (used["count"] >= budgets["capacity"]
+                        or used["cpu"] + budgets["cpu_need"] > budgets["cpu_budget"]
+                        or used["mem"] + budgets["mem_need"] > budgets["mem_budget"]):
+                    capacity_gap = True
+                    continue
+                score = max(score, used["count"] / budgets["capacity"],
+                            used["cpu"] / budgets["cpu_budget"],
+                            used["mem"] / budgets["mem_budget"])
+            candidates.append((score, load, worker_id, row))
         if not candidates:
-            raise BusError("worker_capacity_exhausted", "所有 Worker 的会话容量已满")
+            code = ("pipeline_version_unavailable"
+                    if version_gap and not capacity_gap else "worker_capacity_exhausted")
+            raise BusError(code, "没有匹配版本或容量的 Worker，控制台未下发")
         _, _, worker_id, row = min(candidates, key=lambda item: (item[0], item[1], item[2]))
         return {**row, "worker_id": worker_id, "load": await self.worker_load(worker_id)}

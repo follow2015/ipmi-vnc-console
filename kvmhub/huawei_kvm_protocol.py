@@ -230,7 +230,8 @@ def _paste_jpeg(blob: bytes | None, out: bytearray, count: int, cols: int,
 
 class HuaweiFrameDecoder:
 
-    def __init__(self) -> None:
+    def __init__(self, *, observations=None) -> None:
+        self.observations = observations
         self.width = 0
         self.height = 0
         self.quant = 0
@@ -241,6 +242,8 @@ class HuaweiFrameDecoder:
         self.failed_blocks = 0
 
     def reset(self, width: int, height: int) -> None:
+        if self.observations is not None:
+            self.observations.geometry_changes += 1
         self.width = width
         self.height = height
         self.canvas = bytearray(width * height * 3)
@@ -272,6 +275,9 @@ class HuaweiFrameDecoder:
                jpeg_header: bytes) -> bytes:
         if (width, height) != (self.width, self.height):
             self.reset(width, height)
+        if self.observations is not None:
+            self.observations.source_updates += 1
+            self.observations.source_bytes += len(stream)
         self.quant = quant
         out = self.canvas
         cols = (width + BLOCK - 1) // BLOCK
@@ -279,10 +285,18 @@ class HuaweiFrameDecoder:
         i = 0
         while i < len(stream):
             kind = (stream[i] & 0xE0) >> 5
+            if self.observations is not None:
+                self.observations.kind_counts[kind] += 1
+                if kind not in (2, 3, 4, 5, 6):
+                    self.observations.unknown_blocks += 1
             if kind in (2, 3):
                 if i + 3 > len(stream):
+                    if self.observations is not None:
+                        self.observations.truncated_blocks += 1
                     break
                 length = (stream[i + 1] << 8) | stream[i + 2]
+                if self.observations is not None and i + 3 + length > len(stream):
+                    self.observations.truncated_blocks += 1
                 blob = bytes(jpeg_header) + stream[i + 3:i + 3 + length] + b"\xff\xd9"
                 tile = _decode_jpeg_block(blob)
                 if tile is not None:
@@ -295,10 +309,14 @@ class HuaweiFrameDecoder:
             elif kind == 4:
                 i += 1
             elif kind == 5:
+                if self.observations is not None and not self.blocks.get(count - cols):
+                    self.observations.missing_copy_sources += 1
                 self._paste_tile(self.blocks.get(count - cols), out, count,
                                  cols, width, height)
                 i += 1
             elif kind == 6:
+                if self.observations is not None and not self.blocks.get(count - 1):
+                    self.observations.missing_copy_sources += 1
                 self._paste_tile(self.blocks.get(count - 1), out, count,
                                  cols, width, height)
                 i += 1

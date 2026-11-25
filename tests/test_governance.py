@@ -174,6 +174,28 @@ def test_capability_state(status, expires, review_due, expected):
 
 
 
+@pytest.mark.parametrize("status,review_due,expected", [
+    ("approved", 0, None),
+    ("approved", NOW, "profile_review_overdue"),
+    ("approved", NOW + 1, None),
+    ("draft", None, "profile_not_approved"),
+    ("suspended", NOW + 86400, "profile_not_approved"),
+])
+def test_profile_refusal(status, review_due, expected):
+    assert governance.profile_refusal(status, review_due, NOW) == expected
+
+
+@pytest.mark.parametrize("status,expires,expected", [
+    ("verified", 0, "capability_expired"),
+    ("verified", NOW, "capability_expired"),
+    ("verified", NOW + 1, None),
+    ("draft", NOW + 86400, "capability_not_verified"),
+])
+def test_capability_refusal_ignores_review_due(status, expires, expected):
+    assert governance.capability_refusal(status, expires, NOW) == expected
+
+
+
 def test_workbench_lists_every_profile_and_never_approves(rig):
     csrf = login(rig.client, "platform")
     response = rig.client.get("/api/v2/platform/vendor-profiles",
