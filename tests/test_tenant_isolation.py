@@ -539,7 +539,7 @@ def test_migration_reports_its_head_and_downgrade_is_reversible(tmp_path):
     _legacy_db(db_path)
     assert _alembic(db_path, "upgrade", "head").returncode == 0
     head = _alembic(db_path, "current")
-    assert "0016_profile_overlay (head)" in head.stdout + head.stderr
+    assert "0017_clock_watermark (head)" in head.stdout + head.stderr
     down = _alembic(db_path, "downgrade", "0001_baseline")
     assert down.returncode == 0, down.stdout + down.stderr
     with sqlite3.connect(db_path) as conn:

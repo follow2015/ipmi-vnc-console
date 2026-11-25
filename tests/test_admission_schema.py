@@ -45,7 +45,8 @@ def test_alembic_head_creates_admission_tables(tmp_path):
     with engine.begin() as conn:
         for table in ADMISSION_TABLES | {
                 'kvm_profile_overlay', 'kvm_profile_overlay_revision',
-                'kvm_asset_overlay_binding', 'kvm_device_identity_evidence'}:
+                'kvm_asset_overlay_binding', 'kvm_device_identity_evidence',
+                'kvm_clock_watermark'}:
             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {table}")
         conn.exec_driver_sql("ALTER TABLE kvm_credential DROP COLUMN revision")
         conn.exec_driver_sql("ALTER TABLE kvm_asset DROP COLUMN vnc_secret_revision")
@@ -65,7 +66,7 @@ def test_alembic_head_creates_admission_tables(tmp_path):
         assert ADMISSION_TABLES <= tables
         assert "kvm_asset" in tables
         assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-            "0016_profile_overlay")
+            "0017_clock_watermark")
 
     down = _alembic(db_path, "downgrade", "0012_asset_vnc_secret")
     assert down.returncode == 0, down.stdout + down.stderr

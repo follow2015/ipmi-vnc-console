@@ -87,6 +87,7 @@ def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
              now: float | None = None,
              tenant_id: str = DEFAULT_TENANT_ID) -> dict:
     stamp = time.time() if now is None else now
+    services.observe_clock(session, now=stamp, actor=actor, reason="console_open")
     tenant = session.get(Tenant, tenant_id)
     if tenant is None or tenant.status != TENANT_ACTIVE:
         raise ConnectionRefused("tenant_suspended", "租户已停用，无法开启新的控制台")

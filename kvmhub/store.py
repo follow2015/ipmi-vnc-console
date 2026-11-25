@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
-from .operation_permit import verify_operation_permit
+from .operation_permit import CLOCK_SKEW, verify_operation_permit
 from .driver_specs import DRIVERS, REAL_ADAPTER_IDS
 from .common import (PASSTHROUGH_ADAPTER_ID, Problem,
                      bmc_allowed_networks_from_env, parse_controlled_networks)
@@ -733,7 +733,7 @@ class Store:
         checks = {"op": operation, "sid": sid}
         checks.update(expected or {})
         claims = verify_operation_permit(public_key, permit, expected=checks, now=stamp)
-        if claims["exp"] <= stamp or claims["lna"] and claims["lna"] <= stamp:
+        if claims["lna"] and claims["lna"] + CLOCK_SKEW < stamp:
             raise Problem("operation_permit_invalid", 401)
         if not binding or len(binding) != 64:
             raise Problem("operation_permit_invalid", 401)

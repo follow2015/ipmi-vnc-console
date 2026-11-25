@@ -11,6 +11,8 @@ from .standard_rfb import StandardRfbFamily
 
 _ROOT = 'kvmhub/transcode'
 
+#: Only these families exist. Adding a file at runtime cannot register a plugin;
+#: a new family requires a source change, a locked digest and a release.
 PLUGINS = MappingProxyType({
     spec.family: spec for spec in (
         PluginSpec('huawei-kvm-v1', '1.0.0', 'kvmhub.transcode.huawei',
@@ -34,11 +36,13 @@ _FACTORIES = MappingProxyType({
 
 
 def verify(root) -> None:
+    """Verify every locked plugin source digest before any plugin is built."""
     for spec in PLUGINS.values():
         spec.check_source(root)
 
 
 def select(family, observation=None):
+    """Resolve a family from an explicit approval; never from observation alone."""
     spec = PLUGINS.get(family)
     if spec is None or spec.api_version != API_VERSION:
         raise Problem('transcode_family_unsupported', 503)
@@ -50,6 +54,7 @@ def select(family, observation=None):
 
 
 def build(family, root, observation=None):
+    """Build an instance after digest verification; registry selection is mandatory."""
     spec = select(family, observation)
     factory = _FACTORIES[family]
     if not getattr(factory, 'available', True):

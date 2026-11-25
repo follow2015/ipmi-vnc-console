@@ -29,6 +29,7 @@ class PluginSpec:
     detects: str = ""
 
     def check_source(self, root) -> None:
+        """Verify the locked source digest; a mismatch refuses registration."""
         from pathlib import Path
         payload = (Path(root) / self.source).read_bytes()
         if hashlib.sha256(payload).hexdigest() != self.sha256:
@@ -36,7 +37,10 @@ class PluginSpec:
 
 
 class FamilyDecoder:
+    """Session-scoped decoder. Subclasses must not share mutable state."""
 
+    #: A family can be detected and listed without being buildable. AST2100
+    #: deliberately opts out until its bitstream self-containment is proven.
     available = True
 
     def init(self, width: int, height: int, header: bytes = b'') -> int:

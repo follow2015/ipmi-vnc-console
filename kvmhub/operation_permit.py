@@ -16,12 +16,20 @@ PERMIT_CLAIMS = frozenset({
     "dom", "wid", "iid", "cr", "ar", "dgs", "gen", "lna", "schema",
 })
 TRUSTED_KEY_IDS = ("local-v1",)
-CLOCK_SKEW = 2.0
-MAX_WINDOW = 5.0
+
+CLOCK_SKEW = 5.0
+
+MAX_WINDOW = 15.0
 
 
 def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def clock_drift(claims: dict, stamp: float) -> float:
+    late = stamp - (claims["exp"] + CLOCK_SKEW)
+    early = (claims["iat"] - CLOCK_SKEW) - stamp
+    return max(late, early, 0.0)
 
 
 def issue_operation_permit(private_key, *, operation: str, sid: str, asset_id: str,
@@ -57,6 +65,14 @@ def issue_operation_permit(private_key, *, operation: str, sid: str, asset_id: s
     return jwt.encode(claims, private_key, algorithm="EdDSA", headers={"kid": key_id})
 
 
+class _ClockSkew(Exception):
+
+    def __init__(self, drift: float, claims: dict):
+        self.drift = drift
+        self.claims = claims
+        super().__init__("clock_skew")
+
+
 def verify_operation_permit(public_key, token: str, *, now: float | None = None,
                             expected: dict | None = None,
                             trusted_key_ids=TRUSTED_KEY_IDS) -> dict:
@@ -84,14 +100,22 @@ def verify_operation_permit(public_key, token: str, *, now: float | None = None,
         if not _number(claims["lna"]) or claims["lna"] < 0:
             raise ValueError()
         if not (claims["exp"] >= claims["iat"] > 0
-                and claims["exp"] - claims["iat"] <= int(MAX_WINDOW + CLOCK_SKEW)
-                and claims["iat"] <= stamp + CLOCK_SKEW
-                and claims["exp"] >= stamp - CLOCK_SKEW):
+                and claims["exp"] - claims["iat"] <= int(MAX_WINDOW + CLOCK_SKEW)):
             raise ValueError()
+        drift = clock_drift(claims, stamp)
+        if drift:
+            raise _ClockSkew(drift, claims)
         for key, value in (expected or {}).items():
             if key not in claims or claims[key] != value:
                 raise ValueError()
         return claims
+    except _ClockSkew as exc:
+        raise Problem("clock_skew", 401, detail={
+            "drift_seconds": round(exc.drift, 3),
+            "tolerance_seconds": CLOCK_SKEW,
+            "iat": exc.claims["iat"], "exp": exc.claims["exp"],
+            "host_now": round(stamp, 3),
+        }) from None
     except jwt.ExpiredSignatureError:
         raise Problem("operation_permit_invalid", 401) from None
     except (jwt.PyJWTError, ValueError, TypeError, KeyError):

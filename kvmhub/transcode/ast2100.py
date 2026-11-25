@@ -1,4 +1,9 @@
-"""AST2100 family: detectable but not transcodable yet."""
+"""AST2100 family: detectable but not transcodable yet.
+
+The source bitstream's self-containment has never been proven, and no decoder
+exists in the platform. `detect` may identify the family from an observation;
+`build` always refuses so no session can pretend the plugin is usable.
+"""
 from ..common import Problem
 from .contract import FamilyDecoder
 

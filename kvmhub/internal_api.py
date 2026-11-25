@@ -126,8 +126,10 @@ def create_app(cfg, store: Store, *, expected_host: str | None = None,
         try:
             response = await handler(request)
         except Problem as exc:
-            return _json(trace, {"error": exc.code,
-                                 "message": user_message(exc.code)}, exc.status)
+            body = {"error": exc.code, "message": user_message(exc.code)}
+            if exc.detail:
+                body["detail"] = exc.detail
+            return _json(trace, body, exc.status)
         except web.HTTPException as exc:
             return _json(trace, {"error": "unknown_operation" if exc.status == 404 else "invalid_request",
                                  "message": None}, exc.status)

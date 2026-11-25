@@ -552,3 +552,11 @@ class ExecutionDomain(Base):
     policy_fingerprint: Mapped[str] = mapped_column(String(128), default="")
     generation: Mapped[str] = mapped_column(String(64), default="")
     health: Mapped[str] = mapped_column(String(32), default="unknown")
+
+
+class ClockWatermark(Base):
+    __tablename__ = "kvm_clock_watermark"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    high_water: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    observed: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    regressions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

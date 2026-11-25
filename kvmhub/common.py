@@ -173,6 +173,7 @@ ERROR_STATUS = {
     "target_network_denied": 403, "projection_schema_unsupported": 409,
     "admission_service_unavailable": 503, "operation_permit_invalid": 401,
     "operation_permit_replayed": 409,
+    "clock_skew": 401, "clock_regression": 409,
     "admission_certificate_missing": 403, "admission_certificate_mismatch": 403,
     "assembly_missing": 502,
     "asset_not_found": 404, "fingerprint_invalid": 400,
@@ -210,6 +211,8 @@ USER_MESSAGES = {
     "admission_service_unavailable": "准入服务暂不可用，请稍后重试。",
     "operation_permit_invalid": "操作凭证无效，请重新申请。",
     "operation_permit_replayed": "操作凭证已被使用，请重新申请。",
+    "clock_skew": "控制面与 Worker 的时钟偏差超出允许范围，操作凭证的时间窗口校验失败；请检查两端 NTP 同步。",
+    "clock_regression": "控制面时钟较历史高水位明显回退，已拒绝新的接入与会话；请检查主机时钟与 NTP 后重试。",
     "admission_certificate_missing": "准入服务客户端证书缺失。",
     "admission_certificate_mismatch": "准入服务客户端证书身份不匹配。",
 }
@@ -278,9 +281,11 @@ def end_reason_message(reason: str) -> str | None:
 
 
 class Problem(Exception):
-    def __init__(self, code: str, status: int | None = None):
+    def __init__(self, code: str, status: int | None = None, *,
+                 detail: dict | None = None):
         self.code = code
         self.status = status if status is not None else ERROR_STATUS.get(code, 409)
+        self.detail = detail or {}
         super().__init__(code)
 
 

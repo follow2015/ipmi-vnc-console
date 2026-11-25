@@ -17,9 +17,10 @@ from typing import Any
 from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.orm import Session
 
-from . import governance
+from . import clockguard, governance
 from .models import (AccessGrant, Asset, AssetGroup, AssetGroupMember, AuditLog,
-                     Capability, Credential, DEFAULT_TENANT_CODE, DEFAULT_TENANT_ID,
+                     Capability, ClockWatermark, Credential, DEFAULT_TENANT_CODE,
+                     DEFAULT_TENANT_ID,
                      Permission, GrantSource, Role, RolePermission,
                      ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER, ROLE_PLATFORM_ADMIN,
                      TENANT_ACTIVE, TENANT_MODE_CONSUMER, TENANT_MODE_MANAGER,
@@ -64,6 +65,39 @@ def audit(session: Session, actor: str, action: str, *, asset_id: str | None = N
                          tenant_id=tenant_id, actor=actor, actor_type=actor_type,
                          actor_tenant=actor_tenant, action=action, asset_id=asset_id,
                          detail=json_field(detail or {})))
+
+
+def observe_clock(session: Session, *, now: float | None = None,
+                  actor: str = "platform", reason: str = "",
+                  trace: str = "") -> dict:
+    stamp = time.time() if now is None else now
+    row = session.get(ClockWatermark, clockguard.WATERMARK_ID)
+    if row is None:
+        session.add(ClockWatermark(id=clockguard.WATERMARK_ID, high_water=stamp,
+                                   observed=stamp, regressions=0))
+        session.flush()
+        return {"high_water": stamp, "behind": 0.0, "regressed": False}
+    verdict = clockguard.evaluate(float(row.high_water or 0.0), stamp)
+    if verdict["regressed"]:
+        behind = verdict["behind"]
+        row.regressions = int(row.regressions or 0) + 1
+        audit(session, actor, "clock_regression", trace=trace, now=stamp,
+              detail={"behind_seconds": round(behind, 3),
+                      "high_water": round(verdict["high_water"], 3),
+                      "observed": round(stamp, 3),
+                      "tolerance_seconds": verdict["tolerance"],
+                      "reason": reason})
+        session.commit()
+        logger.error("control-plane clock regressed by %.0f s (high-water %.0f, now %.0f)",
+                     behind, verdict["high_water"], stamp)
+        raise PlatformError(
+            "clock_regression",
+            f"控制面时钟比历史高水位回退约 {behind:.0f} 秒，已拒绝新的接入与会话；"
+            f"请检查主机时钟与 NTP 同步后重试", 409)
+    row.high_water = clockguard.advance(row.high_water, stamp)
+    row.observed = stamp
+    return {"high_water": float(row.high_water), "behind": verdict["behind"],
+            "regressed": False}
 
 
 def authenticate(session: Session, username: str, password: str,
@@ -419,6 +453,8 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
                  tenant_id: str = DEFAULT_TENANT_ID) -> Asset:
     from . import public_ip as public_ip_module
     stamp = time.time() if now is None else now
+    observe_clock(session, now=stamp, actor=actor, reason="asset_attach",
+                  trace="")
     if not name or not address:
         raise PlatformError("invalid_asset", "资产名称与地址不能为空")
     _assert_owned_refs(session, tenant_id, credential=credential_id,

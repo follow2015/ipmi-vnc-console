@@ -1,4 +1,9 @@
-"""Standard RFB family plugin: server frames -> bounded framebuffer ops."""
+"""Standard RFB family plugin: server frames -> bounded framebuffer ops.
+
+Only the encodings the platform's northbound encoder can re-emit are accepted:
+Raw, CopyRect and Tight fill/basic-filter-0. Anything else rejects the whole
+update; a standard RFB source is never forwarded verbatim by this platform.
+"""
 import struct
 import zlib
 
@@ -36,13 +41,13 @@ def _pixel_format(header: bytes) -> None:
 
 
 def _tight_payload_length(control: int, rect: Rect) -> int | None:
-    if control & 0x80:
+    if control & 0x80:  # fill: control + three colour bytes
         return 3
-    if control & 0x40:
+    if control & 0x40:  # JPEG subencoding: not re-emittable without re-encode
         raise ValueError('transcode_family_encoding_unsupported')
     filter_id = control & 0x0F
-    if filter_id == 0:
-        return None
+    if filter_id == 0:  # Copy: compress length + RGB bytes
+        return None  # payload is self-delimiting via compact length
     raise ValueError('transcode_family_encoding_unsupported')
 
 
@@ -84,12 +89,16 @@ class StandardRfbFamily(FamilyDecoder):
             while self._consume(operations):
                 pass
         except (ValueError, zlib.error):
+            # A malformed message invalidates the whole feed: no half-applied
+            # rectangle may survive, and the framing state must not keep the
+            # rejected bytes for the next update.
             self.buf.clear()
             raise
         self.seq += 1
         return Decoded(Update(1, self.seq, tuple(operations)))
 
     def _consume(self, operations) -> bool:
+        """Consume one complete server message; False means need more bytes."""
         buf = self.buf
         if not buf:
             return False
