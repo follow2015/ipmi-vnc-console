@@ -98,6 +98,20 @@ def check_error_codes() -> list[str]:
             or Problem(code).status != status]
 
 
+def check_transcode_digests(root: Path) -> list[str]:
+    import hashlib
+    from kvmhub.transcode.registry import PLUGINS
+    problems = []
+    for name, spec in PLUGINS.items():
+        path = root / spec.source
+        if not path.exists():
+            problems.append(f"{name}: source file missing")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != spec.sha256:
+            problems.append(f"{name}: source digest drift "
+                            "(run tools/transcode_digest.py --write in the same commit)")
+    return problems
+
+
 def check_lockfile(root: Path) -> list[str]:
     root = Path(root)
     lock, project = root / "requirements.lock", root / "pyproject.toml"
@@ -187,6 +201,7 @@ def main() -> int:
         "plaintext credentials in docs": check_document_plaintext_secrets(ROOT),
         "unstable error codes": check_error_codes(),
         "lockfile pin drift": check_lockfile(ROOT),
+        "transcode source digest drift": check_transcode_digests(ROOT),
         "tests importing absent modules": check_test_imports(ROOT),
         "tests that pytest cannot collect": check_collection(ROOT),
     }
@@ -197,7 +212,8 @@ def main() -> int:
             print(f"GATE FAIL: {label}: {items}", file=sys.stderr)
     if not failed:
         print("GATE OK: ignore rules, tracked secrets, doc plaintext credentials, "
-              "error codes, lockfile pins, test imports and test collection are clean")
+              "error codes, lockfile pins, transcode digests, test imports and "
+              "test collection are clean")
     return 1 if failed else 0
 
 

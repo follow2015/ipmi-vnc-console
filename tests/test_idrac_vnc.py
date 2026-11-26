@@ -71,6 +71,7 @@ def test_standard_browser_handshake_is_credential_free():
     assert out == b"\x00\x00\x00\x00"
     out, trailing = hs.feed(b"\x00" + b"\x02\x00\x00\x09\x00\x00")
     assert hs.completed is True
+    assert hs.shared is False
     assert out == server_init
     assert trailing == b"\x02\x00\x00\x09\x00\x00"
 
@@ -113,6 +114,9 @@ def test_novnc_text_frames_complete_handshake_then_input_stays_binary():
         init = await s.__anext__()
         assert init.data == server_init
         assert hs.completed
+        shape = s.as_dict()
+        assert shape["shared"] is True
+        assert shape["handshake_completed"] is True
         await s.send_str("x")
         assert s.error == "unexpected_text_frame"
 
@@ -126,6 +130,51 @@ def test_browser_handshake_rejects_wrong_security_type():
     hs.feed(b"RFB 003.008\n")
     with pytest.raises(ValueError):
         hs.feed(b"\x02")
+
+
+def test_idrac_pins_raw_first_before_the_browser_list_reaches_the_bmc():
+    from kvmhub.passthrough import RfbPassthroughSession
+    from kvmhub.rfb_upstream import set_encodings
+
+    server_init = (struct.pack(">HH", 800, 600) + bytes(16)
+                   + struct.pack(">I", 0))
+
+    class _Upstream:
+        def __init__(self):
+            self.sent: list[bytes] = []
+
+        async def relay(self, on_bytes):
+            await asyncio.Event().wait()
+
+        async def send_raw(self, data):
+            self.sent.append(bytes(data))
+
+        async def close(self):
+            return True
+
+    async def scenario(pinned):
+        up = _Upstream()
+        session = RfbPassthroughSession(
+            up, StandardRfbBrowserHandshake(server_init),
+            client_encodings=pinned)
+        await session.start()
+        await anext(session)
+        await session.send_bytes(b"RFB 003.008\n")
+        await anext(session)
+        await session.send_bytes(b"\x01")
+        await anext(session)
+        await session.send_bytes(b"\x01")
+        await anext(session)
+        browser = set_encodings([1, 50, 7, -260, 16, 21, 5, 2, 6, 0, -223, -308])
+        await session.send_bytes(browser)
+        await session.close()
+        return up.sent
+
+    assert IdracVncAdapter.client_encodings == (0, 1)
+    pinned = asyncio.run(scenario(IdracVncAdapter.client_encodings))
+    assert pinned == [set_encodings((0, 1))]
+    assert asyncio.run(scenario(None)) == [
+        set_encodings([1, 50, 7, -260, 16, 21, 5, 2, 6, 0, -223, -308])]
 
 
 

@@ -15,6 +15,7 @@ from sqlalchemy import select, text
 from ..common import (INTERNAL_PORT, TRACE_ID, Problem, certificate_common_name,
                       peer_certificate, user_message)
 from ..operation_permit import OPERATIONS, issue_operation_permit
+from . import services
 from .db import transaction
 from .models import (AccessGrant, Asset, AssetConnection, Capability,
                      DeviceAdmission, ExecutionDomain, PlaneProjection, Tenant, User)
@@ -101,6 +102,13 @@ def authorize(db, *, principal: str, operation: str, sid: str, asset_id: str,
     stamp = time.time() if now is None else float(now)
     if operation not in OPERATIONS:
         raise Problem("operation_permit_invalid", 400)
+    try:
+        services.observe_clock(db, now=stamp, actor=principal,
+                               reason=f"authorize:{operation}")
+    except services.PlatformError as exc:
+        if exc.code != "clock_regression":
+            raise
+        raise Problem("clock_regression", 409) from None
     asset = db.get(Asset, asset_id)
     if asset is None or asset.tenant_id != tenant_id:
         raise Problem("device_not_admitted", 403)

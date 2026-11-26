@@ -249,9 +249,11 @@ class RfbPassthroughSession:
                  recovery: RecoveryPolicy | None = None,
                  before_connect=None,
                  require_before_connect: bool = False,
-                 input_shaping: InputShapingConfig | None = None) -> None:
+                 input_shaping: InputShapingConfig | None = None,
+                 client_encodings: tuple[int, ...] | None = None) -> None:
         self.upstream = upstream
         self.handshake = handshake
+        self._client_encodings = client_encodings
         self.recovery: RecoveryState | None = (
             RecoveryState(recovery, before_connect=before_connect,
                           require_before_connect=require_before_connect)
@@ -354,11 +356,20 @@ class RfbPassthroughSession:
             if self.recovery is not None and self.recovery.state == "recovering":
                 self._hold_during_recovery(payload)
                 return
+            payload = self._rewrite_encodings(payload)
             await self.upstream.send_raw(payload)
             if self.recovery is not None and payload[0] in (
                     CLIENT_MSG_SET_PIXEL_FORMAT, CLIENT_MSG_SET_ENCODINGS):
                 self._client_settings.pop(payload[0], None)
                 self._client_settings[payload[0]] = bytes(payload)
+
+    def _rewrite_encodings(self, payload: bytes) -> bytes:
+        if not self._client_encodings or not payload or payload[0] != CLIENT_MSG_SET_ENCODINGS:
+            return payload
+        try:
+            return set_encodings(self._client_encodings)
+        except Exception:  # pragma: no cover - a fixed tuple cannot be invalid
+            return payload
 
     RECOVERY_INPUT_LIMIT = 64
 

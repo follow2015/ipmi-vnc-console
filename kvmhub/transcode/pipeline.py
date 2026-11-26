@@ -37,10 +37,10 @@ async def open_pipeline(family, width, height, header=b'', *, root=None,
         before_resync=before_resync, require_resync_permit=before_resync is not None)
     session = VideoSession(decoder=decoder, tight=tight)
     plugin.init(width, height, header)
-    decoder.start()
+    await decoder.astart()
     # The named family must reach the child; a plain RESET would silently
     # build the legacy Huawei decoder and make a plugin pipeline lie about
-    # which protocol it decodes.
-    decoder.reset(width, height, header, family=family)
+    # which protocol it decodes. Both pipe reads run off the event loop.
+    await decoder.areset(width, height, header, family=family)
     session._bind_framebuffer(width, height, decoder.epoch)
     return session

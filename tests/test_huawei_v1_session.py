@@ -1,6 +1,7 @@
 """Real isolated decoder through the opt-in RFB bridge; synthetic upstream only."""
 import asyncio
 import struct
+import time
 
 import pytest
 
@@ -262,14 +263,92 @@ def test_standard_client_raw_rgbx_matches_negotiated_channel_order():
     assert list(encode_snapshot(snapshot, tight=False, rgbx=True))[0][16:] == b'\xdc\x1e\x0a\0'
 
 
-def test_input_rate_budget_ends_input_without_losing_release_state(monkeypatch):
+def test_input_burst_is_dropped_not_fatal_and_releases_still_pass(monkeypatch):
     async def run():
         session, source, blocks = await connected(monkeypatch)
         try:
+            session._input_window = time.monotonic()
             session._input_count = 240
-            with pytest.raises(VideoProtocolError, match='input_rate_budget'):
-                await session.send_bytes(struct.pack('>BBHI', 4, 1, 0, ord('a')))
+            await session.send_bytes(struct.pack('>BBHI', 4, 1, 0, ord('a')))
+            assert session.dropped_inputs == 1
             assert source.inputs == []
+            assert session.error is None and not session.closed
+            await session.send_bytes(struct.pack('>BBHI', 4, 0, 0, ord('a')))
+            assert source.inputs
+        finally:
+            await session.close()
+    asyncio.run(run())
+
+
+def test_sustained_flood_disconnects_after_three_real_windows(monkeypatch):
+    async def run():
+        session, source, blocks = await connected(monkeypatch)
+        base = time.monotonic()
+        clock = [base]
+        session._clock = lambda: clock[0]
+        session._input_window = base
+        try:
+            with pytest.raises(VideoProtocolError, match='input_rate_budget'):
+                for second in range(1, 8):
+                    clock[0] = base + second
+                    for _ in range(245):
+                        await session.send_bytes(struct.pack('>BBHI', 4, 1, 0, ord('a')))
+            assert session.dropped_inputs >= 3
+        finally:
+            await session.close()
+    asyncio.run(run())
+
+
+def test_pointer_release_passes_while_throttled(monkeypatch):
+    async def run():
+        session, source, blocks = await connected(monkeypatch)
+        try:
+            await session.send_bytes(struct.pack('>BBHH', 5, 1, 10, 10))
+            await session.send_bytes(struct.pack('>BBHH', 5, 0, 10, 10))
+            assert session._last_pointer_mask == 0
+            before = len(source.inputs)
+
+            session._input_window = time.monotonic()
+            session._input_count = 240
+            await session.send_bytes(struct.pack('>BBHH', 5, 0, 11, 11))
+            assert len(source.inputs) == before
+
+            session._input_window = time.monotonic()
+            session._input_count = 0
+            await session.send_bytes(struct.pack('>BBHH', 5, 1, 12, 12))
+            pressed = len(source.inputs)
+            assert pressed > before
+            session._input_window = time.monotonic()
+            session._input_count = 240
+            await session.send_bytes(struct.pack('>BBHH', 5, 0, 13, 13))
+            assert len(source.inputs) > pressed
+            assert session._last_pointer_mask == 0
+        finally:
+            await session.close()
+    asyncio.run(run())
+
+
+def test_quant_change_resyncs_instead_of_closing_the_console(monkeypatch):
+    async def run():
+        session, source, blocks = await connected(monkeypatch)
+        try:
+            calls = []
+            original = session.video.resync
+
+            async def spy(width, height, header=b''):
+                calls.append((width, height, header))
+                return await original(width, height, header)
+
+            session.video.resync = spy
+            await source.queue.put((blocks, 64, 64, 1))
+            await source.queue.put((blocks, 64, 64, 2))
+            for _ in range(100):
+                if session.header_changes:
+                    break
+                await asyncio.sleep(0.02)
+            assert session.header_changes == 1
+            assert len(calls) == 1 and calls[0][:2] == (64, 64)
+            assert session.error is None and not session.closed
         finally:
             await session.close()
     asyncio.run(run())

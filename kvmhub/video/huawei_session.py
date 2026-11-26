@@ -23,7 +23,7 @@ class HuaweiV1RfbSession:
     protocol = 'binary'
 
     def __init__(self, upstream, width, height, *, before_resync, read_only=False,
-                 decoder=None):
+                 decoder=None, clock=time.monotonic):
         if before_resync is None:
             raise VideoProtocolError('video_resync_permit_missing')
         self.upstream, self.width, self.height = upstream, width, height
@@ -46,8 +46,14 @@ class HuaweiV1RfbSession:
         self._keys = set()
         self._pointer = None
         self._quant = None
-        self._input_window = time.monotonic()
+        self._clock = clock
+        self._input_window = self._clock()
         self._input_count = 0
+        self.dropped_inputs = 0
+        self._input_exceeded_since = None
+        self._window_had_excess = False
+        self._last_pointer_mask = 0
+        self.header_changes = 0
         self.frames = self.server_bytes = self.client_bytes = 0
         self.error = None
         self.release_failed = False
@@ -62,7 +68,7 @@ class HuaweiV1RfbSession:
 
     async def start(self):
         try:
-            self.video.decoder.start()
+            await self.video.decoder.astart()
             self._control.put_nowait(self.handshake.start())
         except BaseException:
             self.video.close()
@@ -133,12 +139,24 @@ class HuaweiV1RfbSession:
                 self.video.request(CLIENT, rect, incremental=bool(message[1]))
             self._wake.set()
         elif not self.read_only:
-            now = time.monotonic()
+            now = self._clock()
             if now - self._input_window >= 1:
+                if not self._window_had_excess:
+                    self._input_exceeded_since = None
+                self._window_had_excess = False
                 self._input_window, self._input_count = now, 0
             self._input_count += 1
             if self._input_count > 240:
-                raise VideoProtocolError('video_input_rate_budget')
+                self._window_had_excess = True
+                self.dropped_inputs += 1
+                if self._input_exceeded_since is None:
+                    self._input_exceeded_since = now
+                elif now - self._input_exceeded_since > 3.0:
+                    raise VideoProtocolError('video_input_rate_budget')
+                release = ((kind == 4 and message[1] == 0)
+                           or (kind == 5 and message[1] == 0 and self._last_pointer_mask))
+                if not release:
+                    return
             if kind == 4:
                 if message[1] not in (0, 1) or message[2:4] != b'\0\0':
                     raise VideoProtocolError('video_key_invalid')
@@ -154,6 +172,7 @@ class HuaweiV1RfbSession:
                 if x >= self.width or y >= self.height or message[1] & ~7:
                     raise VideoProtocolError('video_pointer_invalid')
                 self._pointer = (x, y)
+                self._last_pointer_mask = message[1]
             await self._input(message)
 
     async def _input(self, message):
@@ -182,7 +201,9 @@ class HuaweiV1RfbSession:
                         self.video.request(CLIENT, rect, incremental=incremental)
                     self._requests.clear()
                 elif quant != self._quant:
-                    raise VideoProtocolError('video_source_header_changed')
+                    await self.video.resync(width, height, jpeg_header(quant))
+                    self._quant = quant
+                    self.header_changes += 1
                 await self.video.feed(blocks)
                 self.frames += 1
                 self._wake.set()

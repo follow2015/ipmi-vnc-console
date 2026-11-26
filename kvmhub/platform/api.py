@@ -11,12 +11,13 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
+from ..common import Problem, user_message
 from .config import Settings, settings as load_settings
 from .db import init_schema, make_engine, seed_roles, session_factory, transaction
-from .models import (Asset, Capability, Credential, ROLE_ADMIN, Tenant, User,
-                     VendorProfile, parse_json)
+from .models import (Asset, Capability, Credential, ProbeCandidate, ROLE_ADMIN,
+                     Tenant, User, VendorProfile, parse_json)
 from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
@@ -198,6 +199,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
     app = FastAPI(title="KVM Hub 控制面", version="2.0.0", lifespan=lifespan)
     app.state.platform = platform
     app.state.probe_semaphore = asyncio.Semaphore(4)
+    app.state.probe_tasks = {}
 
     @app.exception_handler(services.PlatformError)
     async def on_error(request: Request, exc: services.PlatformError):
@@ -205,6 +207,15 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 "trace_id": request.state.trace}
         if exc.retryable:
             body["retryable"] = True
+        return JSONResponse(body, status_code=exc.status)
+
+    @app.exception_handler(Problem)
+    async def on_problem(request: Request, exc: Problem):
+        body = {"error": exc.code,
+                "message": user_message(exc.code) or exc.code,
+                "trace_id": request.state.trace}
+        if exc.detail:
+            body["detail"] = exc.detail
         return JSONResponse(body, status_code=exc.status)
 
     @app.middleware("http")
@@ -598,45 +609,36 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 "primary_ip": "", "additional_ips": "", "public_ips": [],
                 "created": 0, "updated": 0}
 
-    @app.post("/api/v2/assets/probe")
-    async def probe_asset(request: Request):
-        auth = await current(request, mutate=True, permission="asset.write")
-        body = await _json(request)
-        address = str(body.get("address", "")).strip()
-        credential_id = str(body.get("credential_id", "")).strip()
-        if not address or not credential_id:
-            raise services.PlatformError("invalid_request", "需要 BMC 地址和凭据")
-        try:
-            port = int(body.get("port", 443) or 443)
-        except (TypeError, ValueError):
-            raise services.PlatformError("invalid_request", "端口必须是整数") from None
+    async def _measure_identity(auth: dict, *, address: str, credential_id: str,
+                                port: int, public_ips, trace: str,
+                                acquire_timeout: float = 2.0, on_step=None) -> dict:
         with transaction(platform.factory) as db:
             secret = services.read_credential(
                 db, platform.cipher, credential_id, tenant_id=auth["tenant_id"])
-        semaphore = request.app.state.probe_semaphore
+        semaphore = app.state.probe_semaphore
         try:
-            await asyncio.wait_for(semaphore.acquire(), timeout=2.0)
+            await asyncio.wait_for(semaphore.acquire(), timeout=acquire_timeout)
         except TimeoutError:
             raise services.PlatformError(
                 "probe_busy", "探测请求过多，请稍后重试", 429, retryable=True) from None
         try:
+            probe_kwargs = {"on_step": on_step} if on_step is not None else {}
             measured = await asyncio.to_thread(
                 bmc_probe.probe, address, secret["username"], secret["password"],
-                port=port, allowed_networks=platform.cfg.bmc_allowed_networks)
+                port=port, allowed_networks=platform.cfg.bmc_allowed_networks,
+                require_networks=platform.cfg.is_prod, **probe_kwargs)
         except bmc_probe.ProbeError as exc:
             safe_address = address.encode("unicode_escape").decode("ascii")[:256]
             logger.warning("asset_probe_failed address=%s code=%s retryable=%s trace=%s",
-                           safe_address, exc.code, exc.retryable, request.state.trace)
+                           safe_address, exc.code, exc.retryable, trace)
             with transaction(platform.factory) as db:
                 services.audit(
                     db, auth["username"], "asset_probe_failed", tenant_id=auth["tenant_id"],
                     detail={"address": address, "error": exc.code,
-                            "retryable": exc.retryable}, trace=request.state.trace)
+                            "retryable": exc.retryable}, trace=trace)
             raise services.PlatformError(
                 "asset_probe_failed", "BMC 探测失败，请核对地址、凭据与网络", 502,
                 retryable=exc.retryable) from None
-        except Exception:
-            raise
         finally:
             semaphore.release()
         detection = vendor_registry.detect_from_redfish(measured["inventory"])
@@ -649,17 +651,315 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                         "model": detection.get("model", ""),
                         "fingerprint_prefix": measured["fingerprint"][:12],
                         "profile_id": profile.id if profile else None,
-                        "auth_mode": measured["redfish_auth"]},
-                trace=request.state.trace)
+                        "auth_mode": measured["redfish_auth"]}, trace=trace)
         note = ("已匹配已批准品牌，可自动关联"
                 if profile else "未匹配到已批准品牌；未完成适配的型号请走新品牌适配流程")
-        return {"address": address, "public_ips": public_ip.normalize_public_ips(
-                    body.get("public_ips")),
+        return {"address": address, "public_ips": public_ip.normalize_public_ips(public_ips),
                 "certificate_sha256": measured["fingerprint"],
                 "redfish_auth": measured["redfish_auth"], "detection": detection,
                 "matched": match.profile is not None, "usable": match.usable,
                 "reason": match.reason, "profile_id": profile.id if profile else None,
                 "profile_code": profile.code if profile else "", "note": note}
+
+    @app.post("/api/v2/assets/probe")
+    async def probe_asset(request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        address = str(body.get("address", "")).strip()
+        credential_id = str(body.get("credential_id", "")).strip()
+        if not address or not credential_id:
+            raise services.PlatformError("invalid_request", "需要 BMC 地址和凭据")
+        try:
+            port = int(body.get("port", 443) or 443)
+        except (TypeError, ValueError):
+            raise services.PlatformError("invalid_request", "端口必须是整数") from None
+        return await _measure_identity(
+            auth, address=address, credential_id=credential_id, port=port,
+            public_ips=body.get("public_ips"), trace=request.state.trace)
+
+    @app.post("/api/v2/assets/probe/batch")
+    async def probe_assets_batch(request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        ids = body.get("asset_ids")
+        if not isinstance(ids, list) or not ids:
+            raise services.PlatformError("invalid_request", "asset_ids 必须是非空数组", 400)
+        wanted = list(dict.fromkeys(str(aid) for aid in ids))
+        if len(wanted) > 100:
+            raise services.PlatformError("probe_batch_too_large", "单次最多探测 100 台", 400)
+        try:
+            port = int(body.get("port", 443) or 443)
+        except (TypeError, ValueError):
+            raise services.PlatformError("invalid_request", "端口必须是整数", 400) from None
+        with transaction(platform.factory) as db:
+            rows = db.execute(select(Asset.id, Asset.address, Asset.credential_id).where(
+                Asset.id.in_(wanted), Asset.tenant_id == auth["tenant_id"])).all()
+        by_id = {row[0]: (row[1], row[2]) for row in rows}
+        missing = [aid for aid in wanted if aid not in by_id]
+
+        async def measure(asset_id: str) -> dict:
+            address, credential_id = by_id[asset_id]
+            if not credential_id:
+                return {"asset_id": asset_id, "address": address, "ok": False,
+                        "error": {"code": "credential_missing",
+                                  "message": "该资产未绑定 BMC 凭据", "retryable": False}}
+            for attempt in range(2):
+                try:
+                    result = await _measure_identity(
+                        auth, address=address, credential_id=credential_id, port=port,
+                        public_ips=[], trace=request.state.trace, acquire_timeout=10.0)
+                    return {"asset_id": asset_id, "address": address, "ok": True,
+                            "result": result}
+                except services.PlatformError as exc:
+                    if exc.retryable and attempt == 0:
+                        continue
+                    return {"asset_id": asset_id, "address": address, "ok": False,
+                            "error": {"code": exc.code, "message": exc.message,
+                                      "retryable": bool(exc.retryable)}}
+                except Exception:
+                    return {"asset_id": asset_id, "address": address, "ok": False,
+                            "error": {"code": "probe_unexpected",
+                                      "message": "探测出现未预期错误", "retryable": True}}
+            return {"asset_id": asset_id, "address": address, "ok": False,
+                    "error": {"code": "probe_unexpected",
+                              "message": "探测出现未预期错误", "retryable": True}}
+
+        items = list(await asyncio.gather(*(measure(aid) for aid in wanted if aid in by_id)))
+        with transaction(platform.factory) as db:
+            services.audit(
+                db, auth["username"], "asset_probe_batch", tenant_id=auth["tenant_id"],
+                detail={"total": len(wanted), "ok": sum(1 for item in items if item["ok"]),
+                        "missing": missing}, trace=request.state.trace)
+        return {"total": len(wanted), "items": items, "missing": missing}
+
+    def _write_probe_candidate(auth: dict, asset_id: str, result: dict,
+                               trace: str) -> bool:
+        now = time.time()
+        with transaction(platform.factory) as db:
+            asset = db.get(Asset, asset_id)
+            if asset is None or asset.tenant_id != auth["tenant_id"]:
+                return False
+            detection = result.get("detection") or {}
+            profile = (db.get(VendorProfile, result["profile_id"])
+                       if result.get("profile_id") else None)
+            changed = (detection.get("vendor", "") != asset.vendor
+                       or detection.get("model", "") != asset.model
+                       or detection.get("firmware", "") != asset.firmware
+                       or (result.get("profile_id") or None) != asset.profile_id)
+            if not changed:
+                return False
+            db.execute(update(ProbeCandidate).where(
+                ProbeCandidate.asset_id == asset_id,
+                ProbeCandidate.state == "pending").values(
+                    state="superseded", resolved=now, resolved_by="new-probe"))
+            db.add(ProbeCandidate(
+                id=uuid.uuid4().hex, asset_id=asset_id, tenant_id=asset.tenant_id,
+                state="pending", vendor=detection.get("vendor", ""),
+                model=detection.get("model", ""), firmware=detection.get("firmware", ""),
+                profile_id=result.get("profile_id") or None,
+                capability_id=profile.default_capability_id if profile else None,
+                fingerprint=result.get("certificate_sha256", ""),
+                reason=result.get("reason", ""), created=now))
+            services.audit(db, auth["username"], "probe_candidate_created",
+                           tenant_id=auth["tenant_id"], asset_id=asset_id,
+                           detail={"profile_id": result.get("profile_id")}, trace=trace)
+            return True
+
+    @app.post("/api/v2/assets/probe/batch/async")
+    async def probe_assets_batch_async(request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        ids = body.get("asset_ids")
+        if not isinstance(ids, list) or not ids:
+            raise services.PlatformError("invalid_request", "asset_ids 必须是非空数组", 400)
+        wanted = list(dict.fromkeys(str(aid) for aid in ids))
+        if len(wanted) > 100:
+            raise services.PlatformError("probe_batch_too_large", "单次最多探测 100 台", 400)
+        try:
+            port = int(body.get("port", 443) or 443)
+        except (TypeError, ValueError):
+            raise services.PlatformError("invalid_request", "端口必须是整数", 400) from None
+        with transaction(platform.factory) as db:
+            rows = db.execute(select(Asset.id, Asset.address, Asset.credential_id).where(
+                Asset.id.in_(wanted), Asset.tenant_id == auth["tenant_id"])).all()
+        by_id = {row[0]: (row[1], row[2]) for row in rows}
+        trace = request.state.trace
+        task_id = uuid.uuid4().hex
+        task = {"task_id": task_id, "state": "running", "total": len(wanted),
+                "completed": 0, "created": time.time(), "tenant_id": auth["tenant_id"],
+                "items": [{"asset_id": aid, "address": by_id.get(aid, (aid, ""))[0],
+                           "step": "queued", "ok": None, "error": None, "result": None}
+                          for aid in wanted]}
+        app.state.probe_tasks[task_id] = task
+
+        async def run():
+            async def one(item):
+                aid = item["asset_id"]
+                if aid not in by_id or not by_id[aid][1]:
+                    item["step"] = "failed"
+                    item["ok"] = False
+                    item["error"] = {"code": "credential_missing",
+                                     "message": "资产不存在或未绑定 BMC 凭据",
+                                     "retryable": False}
+                    task["completed"] += 1
+                    return
+                address, credential_id = by_id[aid]
+
+                def step(name):
+                    item["step"] = name
+
+                for attempt in range(2):
+                    try:
+                        item["step"] = "connecting"
+                        result = await _measure_identity(
+                            auth, address=address, credential_id=credential_id,
+                            port=port, public_ips=[], trace=trace,
+                            acquire_timeout=10.0, on_step=step)
+                        item["step"] = "identify"
+                        candidates = await asyncio.to_thread(
+                            _write_probe_candidate, auth, aid, result, trace)
+                        item["candidate_created"] = candidates
+                        item["step"] = "done"
+                        item["ok"] = True
+                        item["result"] = result
+                        break
+                    except services.PlatformError as exc:
+                        if exc.retryable and attempt == 0:
+                            continue
+                        item["step"] = "failed"
+                        item["ok"] = False
+                        item["error"] = {"code": exc.code, "message": exc.message,
+                                         "retryable": bool(exc.retryable)}
+                        break
+                    except Exception:
+                        item["step"] = "failed"
+                        item["ok"] = False
+                        item["error"] = {"code": "probe_unexpected",
+                                         "message": "探测出现未预期错误", "retryable": True}
+                        break
+                task["completed"] += 1
+
+            try:
+                await asyncio.gather(*(one(item) for item in task["items"]))
+                task["state"] = "done"
+            except Exception:
+                task["state"] = "failed"
+            finally:
+                cutoff = time.time() - 3600
+                for key, value in list(app.state.probe_tasks.items()):
+                    if value["created"] < cutoff and value["state"] != "running":
+                        app.state.probe_tasks.pop(key, None)
+
+        asyncio.create_task(run())
+        return {"task_id": task_id, "total": len(wanted)}
+
+    @app.get("/api/v2/assets/probe/tasks/{task_id}")
+    async def probe_task_status(task_id: str, request: Request):
+        auth = await current(request, permission="asset.write")
+        cutoff = time.time() - 3600
+        for key, value in list(app.state.probe_tasks.items()):
+            if value["created"] < cutoff and value["state"] != "running":
+                app.state.probe_tasks.pop(key, None)
+        task = app.state.probe_tasks.get(task_id)
+        if task is None or task["tenant_id"] != auth["tenant_id"]:
+            raise services.PlatformError(
+                "probe_task_not_found",
+                "探测任务已结束或控制面重启过；请重新发起批量探测", 404)
+        return task
+
+    @app.get("/api/v2/assets/probe/candidates")
+    async def probe_candidates(request: Request, asset_id: str = ""):
+        auth = await current(request, permission="asset.write")
+        with transaction(platform.factory) as db:
+            query = (select(ProbeCandidate, Asset.name, Asset.vendor,
+                            Asset.model, Asset.firmware)
+                     .join(Asset, Asset.id == ProbeCandidate.asset_id)
+                     .where(ProbeCandidate.tenant_id == auth["tenant_id"],
+                            ProbeCandidate.state == "pending"))
+            if asset_id:
+                query = query.where(ProbeCandidate.asset_id == asset_id)
+            rows = db.execute(query.order_by(ProbeCandidate.created.desc())).all()
+            return [{"id": row.id, "asset_id": row.asset_id, "asset_name": name,
+                     "state": row.state, "vendor": row.vendor, "model": row.model,
+                     "firmware": row.firmware, "profile_id": row.profile_id,
+                     "capability_id": row.capability_id, "fingerprint": row.fingerprint,
+                     "reason": row.reason, "created": row.created,
+                     "current_vendor": current_vendor, "current_model": current_model,
+                     "current_firmware": current_firmware}
+                    for row, name, current_vendor, current_model, current_firmware in rows]
+
+    @app.post("/api/v2/assets/probe/candidates/approve")
+    async def approve_probe_candidates(request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        body = await _json(request)
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not ids:
+            raise services.PlatformError("invalid_request", "ids 必须是非空数组", 400)
+        wanted = list(dict.fromkeys(str(aid) for aid in ids))
+        adopt = bool(body.get("adopt_fingerprint"))
+        approved, failed = [], []
+        trace = request.state.trace
+        with transaction(platform.factory) as db:
+            rows = db.scalars(select(ProbeCandidate).where(
+                ProbeCandidate.id.in_(wanted),
+                ProbeCandidate.tenant_id == auth["tenant_id"],
+                ProbeCandidate.state == "pending")).all()
+            by_id = {row.id: row for row in rows}
+            for cid in wanted:
+                row = by_id.get(cid)
+                if row is None:
+                    failed.append({"id": cid, "reason": "candidate_not_found"})
+                    continue
+                asset = db.get(Asset, row.asset_id)
+                if asset is None or asset.tenant_id != auth["tenant_id"]:
+                    failed.append({"id": cid, "reason": "asset_not_found"})
+                    continue
+                stamp = time.time()
+                try:
+                    services.upsert_asset(
+                        db, name=asset.name, address=asset.address,
+                        vendor=row.vendor, model=row.model, firmware=row.firmware,
+                        fingerprint=row.fingerprint if adopt else (asset.fingerprint or ""),
+                        credential_id=asset.credential_id,
+                        profile_id=row.profile_id, capability_id=row.capability_id,
+                        licence=asset.licence or "", notes=asset.notes or "",
+                        public_ips=None, actor=auth["username"], asset_id=asset.id,
+                        tenant_id=auth["tenant_id"], now=stamp)
+                except services.PlatformError as exc:
+                    if exc.code == "clock_regression":
+                        raise
+                    failed.append({"id": cid, "reason": exc.code})
+                    continue
+                row.state = "approved"
+                row.resolved = stamp
+                row.resolved_by = auth["username"]
+                db.execute(update(ProbeCandidate).where(
+                    ProbeCandidate.asset_id == row.asset_id,
+                    ProbeCandidate.state == "pending",
+                    ProbeCandidate.id != row.id).values(
+                        state="superseded", resolved=stamp, resolved_by=auth["username"]))
+                approved.append(row.asset_id)
+            services.audit(db, auth["username"], "probe_candidate_approved",
+                           tenant_id=auth["tenant_id"],
+                           detail={"approved": approved, "failed": failed,
+                                   "adopt_fingerprint": adopt}, trace=trace)
+        return {"approved": len(approved), "failed": failed,
+                "note": "身份变更已提交；设备进入待准入，重新批准后才能连接"}
+
+    @app.post("/api/v2/assets/probe/candidates/{candidate_id}/reject")
+    async def reject_probe_candidate(candidate_id: str, request: Request):
+        auth = await current(request, mutate=True, permission="asset.write")
+        with transaction(platform.factory) as db:
+            row = db.get(ProbeCandidate, candidate_id)
+            if row is None or row.tenant_id != auth["tenant_id"] or row.state != "pending":
+                raise services.PlatformError("candidate_not_found", "候选变更不存在", 404)
+            row.state = "rejected"
+            row.resolved = time.time()
+            row.resolved_by = auth["username"]
+            services.audit(db, auth["username"], "probe_candidate_rejected",
+                           tenant_id=auth["tenant_id"], asset_id=row.asset_id,
+                           trace=request.state.trace)
+        return {"ok": True}
 
     @app.get("/api/v2/asset-onboarding")
     async def asset_onboarding(request: Request):
@@ -757,6 +1057,130 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 actor_user_id=auth["user_id"] if platform.cfg.strict_grants else None,
                 plane=plane)
         return {"ok": True}
+
+    @app.post("/api/v2/grants/renew")
+    async def renew_grants(request: Request):
+        auth = await current(request, mutate=True, permission="grant.write")
+        body = await _json(request)
+        user_id = str(body.get("user_id") or auth["user_id"])
+        asset_ids = body.get("asset_ids")
+        if not isinstance(asset_ids, list):
+            raise services.PlatformError("invalid_request", "asset_ids 必须是数组", 400)
+        ttl = body.get("ttl_seconds")
+        absolute = body.get("expires")
+        if (ttl is None) == (absolute is None):
+            raise services.PlatformError(
+                "invalid_request", "ttl_seconds 与 expires 必须且只能提供一个", 400)
+        now = time.time()
+        seconds = None
+        deadline = None
+        if ttl is not None:
+            try:
+                seconds = int(ttl)
+            except (TypeError, ValueError):
+                raise services.PlatformError("invalid_request", "ttl_seconds 必须是整数秒", 400) from None
+            if seconds < 60 or seconds > 10 * 366 * 86400:
+                raise services.PlatformError("grant_expiry_invalid", "续期时长须在 1 分钟到 10 年之间", 400)
+        else:
+            try:
+                deadline = float(absolute)
+            except (TypeError, ValueError):
+                raise services.PlatformError("invalid_request", "expires 必须是 Unix 时间戳", 400) from None
+            if deadline > now + 10 * 366 * 86400:
+                raise services.PlatformError("grant_expiry_invalid", "到期时间不能超过 10 年后", 400)
+        with transaction(platform.factory) as db:
+            return services.renew_grants(
+                db, user_id=user_id, asset_ids=[str(aid) for aid in asset_ids],
+                expires=deadline, extend_seconds=seconds, actor=auth["username"],
+                tenant_id=auth["tenant_id"], plane=platform.plane, now=now,
+                actor_user_id=auth["user_id"] if platform.cfg.strict_grants else None)
+
+    @app.post("/api/v2/grants/batch")
+    async def grants_batch(request: Request):
+        auth = await current(request, mutate=True, permission="grant.write")
+        body = await _json(request)
+        action = str(body.get("action") or "")
+        user_id = str(body.get("user_id") or auth["user_id"])
+        now = time.time()
+        ttl = body.get("ttl_seconds")
+        absolute = body.get("expires")
+        if ttl is not None:
+            try:
+                ttl_seconds = int(ttl)
+            except (TypeError, ValueError):
+                raise services.PlatformError("invalid_request", "ttl_seconds 必须是整数秒", 400) from None
+        else:
+            ttl_seconds = None
+        if ttl_seconds is not None and not 60 <= ttl_seconds <= 10 * 366 * 86400:
+            raise services.PlatformError("grant_expiry_invalid", "续期时长须在 1 分钟到 10 年之间", 400)
+        if absolute is not None:
+            try:
+                absolute = float(absolute)
+            except (TypeError, ValueError):
+                raise services.PlatformError("invalid_request", "expires 必须是 Unix 时间戳", 400) from None
+        if action in ("grant", "group_sync") and absolute is not None:
+            ttl_seconds = max(60, int(absolute - now))
+        if action == "group_sync":
+            group_id = str(body.get("group_id") or "")
+            if not group_id:
+                raise services.PlatformError("invalid_request", "group_sync 需要 group_id", 400)
+            with transaction(platform.factory) as db:
+                out = services.grant_group(
+                    db, group_id=group_id, user_id=user_id, actor=auth["username"],
+                    tenant_id=auth["tenant_id"], plane=platform.plane,
+                    ttl_seconds=ttl_seconds or 86400 * 30, now=now,
+                    actor_user_id=auth["user_id"] if platform.cfg.strict_grants else None)
+            return {"action": action, "user_id": user_id, "total": 1,
+                    "changed": out["granted"], "items": [],
+                    "note": f"组授权完成：新增 {out['granted']} 条，撤销 {out['revoked_stale']} 条"}
+        if action not in ("grant", "renew", "revoke"):
+            raise services.PlatformError("invalid_request", "action 必须是 grant/renew/revoke/group_sync", 400)
+        ids = body.get("asset_ids")
+        if not isinstance(ids, list) or not ids:
+            raise services.PlatformError("invalid_request", "asset_ids 必须是非空数组", 400)
+        asset_ids = list(dict.fromkeys(str(aid) for aid in ids))
+        if len(asset_ids) > 500:
+            raise services.PlatformError("grant_batch_too_large", "单次最多处理 500 台", 400)
+        if action == "renew" and (ttl_seconds is None) == (absolute is None):
+            raise services.PlatformError("invalid_request", "续期需要 ttl_seconds 或 expires 之一", 400)
+        items = []
+        with transaction(platform.factory) as db:
+            if action == "renew":
+                out = services.renew_grants(
+                    db, user_id=user_id, asset_ids=asset_ids, actor=auth["username"],
+                    tenant_id=auth["tenant_id"], plane=platform.plane, now=now,
+                    extend_seconds=ttl_seconds, expires=absolute,
+                    actor_user_id=auth["user_id"] if platform.cfg.strict_grants else None)
+                missing = set(out["missing"])
+                for aid in asset_ids:
+                    items.append({"asset_id": aid,
+                                  "status": "missing" if aid in missing else "renewed",
+                                  "reason": "",
+                                  "expires": None if aid in missing else out["expires"]})
+            else:
+                for aid in asset_ids:
+                    try:
+                        if action == "grant":
+                            services.grant_asset(
+                                db, user_id=user_id, asset_id=aid, actor=auth["username"],
+                                tenant_id=auth["tenant_id"], plane=platform.plane, now=now,
+                                ttl_seconds=ttl_seconds or 86400 * 30,
+                                actor_user_id=auth["user_id"] if platform.cfg.strict_grants else None)
+                            items.append({"asset_id": aid, "status": "granted", "reason": "",
+                                          "expires": now + (ttl_seconds or 86400 * 30)})
+                        else:
+                            services.revoke_grant(
+                                db, user_id=user_id, asset_id=aid, actor=auth["username"],
+                                tenant_id=auth["tenant_id"], plane=platform.plane)
+                            items.append({"asset_id": aid, "status": "revoked", "reason": "",
+                                          "expires": None})
+                    except services.PlatformError as exc:
+                        items.append({"asset_id": aid, "status": "denied", "reason": exc.code,
+                                      "expires": None})
+        changed = sum(1 for item in items
+                      if item["status"] in ("granted", "renewed", "revoked"))
+        return {"action": action, "user_id": user_id, "total": len(asset_ids),
+                "changed": changed, "items": items, "note": ""}
 
     @app.get("/api/v2/asset-groups")
     async def list_groups(request: Request):

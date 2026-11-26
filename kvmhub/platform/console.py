@@ -195,8 +195,14 @@ class ConsolePlane:
                     digest=g0["digest"], generation=g0["generation"],
                     session_started_at=now,
                     hard_until=now + (hard_cap or 4 * 3600))
-                answer = await self.authority.authorize(
-                    host=self.authority_host, **request)
+                try:
+                    answer = await self.authority.authorize(
+                        host=self.authority_host, **request)
+                except Problem as exc:
+                    raise services.PlatformError(
+                        exc.code,
+                        common.user_message(exc.code) or f"准入被拒绝：{exc.code}",
+                        exc.status) from exc
                 permit, permit_claims = answer["permit"], answer["claims"]
             try:
                 row = store.allocate(

@@ -560,3 +560,21 @@ class ClockWatermark(Base):
     high_water: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     observed: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     regressions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ProbeCandidate(Base):
+    __tablename__ = "kvm_probe_candidate"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    vendor: Mapped[str] = mapped_column(String(128), default="")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    firmware: Mapped[str] = mapped_column(String(64), default="")
+    profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    capability_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    resolved: Mapped[float] = mapped_column(Float, default=0.0)
+    resolved_by: Mapped[str] = mapped_column(String(128), default="")

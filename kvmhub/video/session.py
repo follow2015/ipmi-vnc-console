@@ -64,7 +64,7 @@ class VideoSession:
 
     async def open(self, width, height, header=b''):
         if not self.decoder.running:
-            self.decoder.start()
+            await self.decoder.astart()
         epoch = await self.decoder.resync(width, height, header)
         self._reset_output()
         for stream in self.streams.values():
@@ -76,7 +76,7 @@ class VideoSession:
 
     async def resync(self, width, height, header=b''):
         if not self.decoder.running:
-            self.decoder.start()
+            await self.decoder.astart()
         epoch = await self.decoder.resync(width, height, header)
         self._reset_output(preserve_clients=True)
         for stream in self.streams.values():
@@ -127,7 +127,7 @@ class VideoSession:
     async def feed(self, stream_bytes):
         if self.framebuffer is None:
             raise VideoResyncRequired('video_session_not_open')
-        update = self.decoder.decode_update(stream_bytes)
+        update = await self.decoder.adecode_update(stream_bytes)
         if update.epoch != self.framebuffer.epoch:
             self.decoder.invalidate('video_epoch_mismatch')
             raise VideoProtocolError('video_epoch_mismatch')

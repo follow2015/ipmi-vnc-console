@@ -22,7 +22,8 @@ from kvmhub.platform.bus import AssemblyBus, BusError
 from kvmhub.platform.config import Settings
 from kvmhub.platform.console import ConsolePlane
 from kvmhub.platform.db import init_schema, seed_roles, session_factory, transaction
-from kvmhub.platform.models import DEFAULT_TENANT_ID, Capability, Tenant, VendorProfile
+from kvmhub.platform.models import (DEFAULT_TENANT_ID, AccessGrant, Asset, AuditLog,
+                                     Capability, ProbeCandidate, Tenant, VendorProfile)
 from kvmhub.platform.redis_state import MemoryState
 from kvmhub.platform.security import CredentialCipher
 from kvmhub.store import Store
@@ -254,6 +255,88 @@ def test_second_console_on_one_asset_is_refused_with_asset_busy(rig):
         second = c.post("/api/v2/consoles/open", json={"asset_id": rig.ids["asset"]},
                         headers=headers(csrf))
         assert second.status_code == 409 and second.json()["error"] == "asset_busy"
+
+
+def test_grant_renewal_updates_both_stores_and_reports_missing(rig):
+    with transaction(rig.platform.factory) as db:
+        orphan = services.upsert_asset(db, name="never-granted", address="192.0.2.99",
+                                       actor="test", tenant_id=DEFAULT_TENANT_ID)
+
+    def expiry(asset_id):
+        with transaction(rig.platform.factory) as db:
+            row = db.get(AccessGrant, (rig.ids["admin"], asset_id))
+            return row.expires if row else None
+
+    original = expiry(rig.ids["asset"])
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/grants/renew", json={
+            "user_id": rig.ids["admin"],
+            "asset_ids": [rig.ids["asset"], orphan.id, rig.ids["asset"]],
+            "ttl_seconds": 7 * 86400,
+        }, headers=headers(csrf))
+        assert r.status_code == 200, r.text
+        out = r.json()
+        assert out["renewed"] == 1, out
+        assert out["missing"] == [orphan.id], out
+        assert out["expires"] > original + 6 * 86400
+        assert expiry(rig.ids["asset"]) == out["expires"]
+        assert expiry(orphan.id) is None
+
+        absolute = time.time() + 30 * 86400
+        r2 = c.post("/api/v2/grants/renew", json={
+            "asset_ids": [rig.ids["asset"]], "expires": absolute,
+        }, headers=headers(csrf))
+        assert r2.status_code == 200, r2.text
+        assert abs(r2.json()["expires"] - absolute) < 1
+        assert "user_id" in r2.json()
+
+    store = rig.connect()
+    try:
+        row = store.db.execute(
+            "SELECT expires FROM access_grant WHERE user_id=? AND asset_id=?",
+            (rig.ids["admin"], rig.ids["asset"])).fetchone()
+        assert row is not None and abs(float(row[0]) - absolute) < 1
+    finally:
+        store.close()
+    with transaction(rig.platform.factory) as db:
+        audit = db.scalar(select(AuditLog).where(AuditLog.action == "grant_renewed"))
+        assert audit is not None and audit.action == "grant_renewed"
+        assert '"count": 1' in audit.detail or '"count":1' in audit.detail
+
+
+def test_grant_renewal_rejects_ambiguous_and_past_deadlines(rig):
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/grants/renew", json={
+            "asset_ids": [rig.ids["asset"]],
+            "ttl_seconds": 86400, "expires": time.time() + 86400,
+        }, headers=headers(csrf))
+        assert r.status_code == 400 and r.json()["error"] == "invalid_request"
+        r = c.post("/api/v2/grants/renew", json={
+            "asset_ids": [rig.ids["asset"]], "expires": time.time() - 10,
+        }, headers=headers(csrf))
+        assert r.status_code == 400 and r.json()["error"] == "grant_expiry_invalid"
+        r = c.post("/api/v2/grants/renew", json={
+            "asset_ids": [], "ttl_seconds": 86400,
+        }, headers=headers(csrf))
+        assert r.status_code == 400 and r.json()["error"] == "grant_target_missing"
+
+
+def test_an_internal_problem_keeps_the_json_error_shape(rig, monkeypatch):
+    async def refuse(*args, **kwargs):
+        raise Problem("device_not_admitted", 403)
+
+    monkeypatch.setattr(rig.plane, "open", refuse)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/consoles/open", json={"asset_id": rig.ids["asset"]},
+                   headers=headers(csrf))
+        assert r.status_code == 403, r.text
+        body = r.json()
+        assert body["error"] == "device_not_admitted"
+        assert body["message"] == "设备尚未准入或已被撤销，请联系管理员。"
+        assert len(body["trace_id"]) == 32
 
 
 def test_proxy_route_follows_ticket_worker_and_keeps_draining_sessions_routable(rig):
@@ -579,3 +662,233 @@ def test_absent_protocol_keeps_the_measured_default(rig):
          "adapter": PASSTHROUGH_ADAPTER_ID, "protocol_versions": (),
          "input_shaping": None, "logout_path": None}, rig.assembly)
     assert info["protocol"] == ""
+
+
+def test_batch_probe_is_read_only_and_reports_each_asset(rig, monkeypatch):
+    from kvmhub.platform import bmc_probe as probe_module
+
+    def fake_probe(host, username, password, *, port=443, allowed_networks=(),
+                   require_networks=False):
+        return {"fingerprint": "ab" * 32,
+                "inventory": {"resources": {"Managers": [{
+                    "Manufacturer": "Supermicro (Inspur OEM)", "Model": "X10DRT-PS",
+                    "FirmwareVersion": "8.78"}]}},
+                "redfish_auth": "basic"}
+
+    monkeypatch.setattr(probe_module, "probe", fake_probe)
+    with transaction(rig.platform.factory) as db:
+        orphan = services.upsert_asset(db, name="unbound", address="192.0.2.98",
+                                       actor="test", tenant_id=DEFAULT_TENANT_ID)
+        before = db.get(Asset, rig.ids["asset"]).model
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/assets/probe/batch", json={
+            "asset_ids": [rig.ids["asset"], orphan.id, "no-such-id"],
+        }, headers=headers(csrf))
+        assert r.status_code == 200, r.text
+        out = r.json()
+        assert out["total"] == 3 and out["missing"] == ["no-such-id"], out
+        by_id = {item["asset_id"]: item for item in out["items"]}
+        assert by_id[rig.ids["asset"]]["ok"] is True
+        assert by_id[rig.ids["asset"]]["result"]["detection"]["model"] == "X10DRT-PS"
+        assert by_id[orphan.id]["error"]["code"] == "credential_missing"
+    with transaction(rig.platform.factory) as db:
+        assert db.get(Asset, rig.ids["asset"]).model == before
+        assert db.scalar(select(AuditLog).where(AuditLog.action == "asset_probe_batch")) is not None
+
+
+def test_unified_grant_batch_covers_grant_renew_and_revoke(rig):
+    with transaction(rig.platform.factory) as db:
+        target = services.upsert_asset(db, name="batch-target", address="192.0.2.97",
+                                       actor="test", tenant_id=DEFAULT_TENANT_ID)
+
+    def post(csrf, action, **extra):
+        return c.post("/api/v2/grants/batch", json={
+            "action": action, "user_id": rig.ids["admin"],
+            "asset_ids": [target.id], **extra}, headers=headers(csrf))
+
+    store = rig.connect()
+    try:
+        store.register_asset(asset_id=target.id, name="batch-target", vendor="",
+                             model="", firmware="", capability_id=rig.entry["id"],
+                             target=TARGET, fingerprint=FINGERPRINT, username="ADMIN",
+                             password=BMC_PASSWORD, user_id=rig.ids["admin"], actor="test")
+    finally:
+        store.close()
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = post(csrf, "grant", ttl_seconds=7 * 86400)
+        assert r.status_code == 200, r.text
+        assert r.json()["changed"] == 1 and r.json()["items"][0]["status"] == "granted"
+        with transaction(rig.platform.factory) as db:
+            first = db.get(AccessGrant, (rig.ids["admin"], target.id)).expires
+        r = post(csrf, "renew", ttl_seconds=3 * 86400)
+        assert r.status_code == 200, r.text
+        assert r.json()["items"][0]["status"] == "renewed"
+        with transaction(rig.platform.factory) as db:
+            assert db.get(AccessGrant, (rig.ids["admin"], target.id)).expires > first
+        r = post(csrf, "revoke")
+        assert r.status_code == 200, r.text
+        assert r.json()["items"][0]["status"] == "revoked"
+        r = post(csrf, "unknown")
+        assert r.status_code == 400 and r.json()["error"] == "invalid_request"
+
+    with transaction(rig.platform.factory) as db:
+        assert db.get(AccessGrant, (rig.ids["admin"], target.id)) is None
+    store = rig.connect()
+    try:
+        assert store.db.execute(
+            "SELECT 1 FROM access_grant WHERE user_id=? AND asset_id=?",
+            (rig.ids["admin"], target.id)).fetchone() is None
+    finally:
+        store.close()
+
+
+def test_unified_grant_batch_group_sync(rig):
+    with transaction(rig.platform.factory) as db:
+        group = services.create_asset_group(db, name="batch-group", actor="test",
+                                            tenant_id=DEFAULT_TENANT_ID)
+        services.set_group_members(db, group_id=group.id, asset_ids=[rig.ids["asset"]],
+                                   actor="test", tenant_id=DEFAULT_TENANT_ID)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/grants/batch", json={
+            "action": "group_sync", "group_id": group.id,
+            "user_id": rig.ids["admin"], "ttl_seconds": 14 * 86400,
+        }, headers=headers(csrf))
+        assert r.status_code == 200, r.text
+        assert r.json()["changed"] >= 1 and "组授权完成" in r.json()["note"]
+
+
+def test_async_probe_reports_steps_and_requires_approval_before_writing(rig, monkeypatch):
+    from kvmhub.platform import bmc_probe as probe_module
+    from kvmhub.platform.models import DeviceAdmission
+
+    seen = []
+
+    def fake_probe(host, username, password, *, port=443, allowed_networks=(),
+                   require_networks=False, on_step=None):
+        for stage in ("target", "certificate", "inventory"):
+            seen.append(stage)
+            if on_step:
+                on_step(stage)
+        return {"fingerprint": "cd" * 32,
+                "inventory": {"resources": {"Managers": [{
+                    "Manufacturer": "Supermicro (Inspur OEM)", "Model": "X11DPH-T",
+                    "FirmwareVersion": "8.80"}]}},
+                "redfish_auth": "basic"}
+
+    monkeypatch.setattr(probe_module, "probe", fake_probe)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        started = c.post("/api/v2/assets/probe/batch/async", json={
+            "asset_ids": [rig.ids["asset"]]}, headers=headers(csrf))
+        assert started.status_code == 200, started.text
+        task_id = started.json()["task_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            task = c.get(f"/api/v2/assets/probe/tasks/{task_id}",
+                         headers=headers(csrf)).json()
+            if task["state"] == "done":
+                break
+            time.sleep(0.02)
+        assert task["state"] == "done", task
+        assert (task["total"], task["completed"]) == (1, 1)
+        item = task["items"][0]
+        assert item["step"] == "done" and item["ok"] is True
+        assert item["candidate_created"] is True
+        assert seen == ["target", "certificate", "inventory"]
+        with transaction(rig.platform.factory) as db:
+            assert db.get(Asset, rig.ids["asset"]).model == "X10DRT-PS"
+        candidates = c.get("/api/v2/assets/probe/candidates",
+                           headers=headers(csrf)).json()
+        assert len(candidates) == 1 and candidates[0]["model"] == "X11DPH-T"
+        approved = c.post("/api/v2/assets/probe/candidates/approve", json={
+            "ids": [candidates[0]["id"]]}, headers=headers(csrf))
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["approved"] == 1
+        assert c.get("/api/v2/assets/probe/candidates",
+                     headers=headers(csrf)).json() == []
+
+    with transaction(rig.platform.factory) as db:
+        asset = db.get(Asset, rig.ids["asset"])
+        assert asset.model == "X11DPH-T"
+        assert asset.fingerprint == FINGERPRINT
+        admission = db.scalar(select(DeviceAdmission).where(
+            DeviceAdmission.asset_id == rig.ids["asset"]).order_by(
+                DeviceAdmission.revision.desc()).limit(1))
+        assert admission.state == "pending"
+
+
+def test_strict_grants_blocks_batch_renew_without_primary_grant(rig):
+    with transaction(rig.platform.factory) as db:
+        services.create_user(db, "admin2", ADMIN_PASSWORD, "admin", actor="test")
+    object.__setattr__(rig.platform.cfg, "strict_grants", True)
+    try:
+        with TestClient(rig.app, base_url=ORIGIN) as c:
+            csrf = login(c, "admin2", ADMIN_PASSWORD)
+            r = c.post("/api/v2/grants/renew", json={
+                "user_id": rig.ids["admin"], "asset_ids": [rig.ids["asset"]],
+                "ttl_seconds": 7 * 86400,
+            }, headers=headers(csrf))
+            assert r.status_code == 403, r.text
+            assert r.json()["error"] == "grantor_not_authorized"
+    finally:
+        object.__setattr__(rig.platform.cfg, "strict_grants", False)
+
+
+def test_candidate_approval_adopts_fingerprint_only_when_asked(rig):
+    with transaction(rig.platform.factory) as db:
+        db.add(ProbeCandidate(
+            id=uuid.uuid4().hex, asset_id=rig.ids["asset"],
+            tenant_id=DEFAULT_TENANT_ID, state="pending",
+            vendor="dell", model="X12DPH", firmware="3.01",
+            profile_id=None, capability_id=None, fingerprint="ef" * 32,
+            reason="operator verified out of band", created=time.time()))
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/assets/probe/candidates/approve", json={
+            "ids": [c.get("/api/v2/assets/probe/candidates",
+                          headers=headers(csrf)).json()[0]["id"]],
+            "adopt_fingerprint": True,
+        }, headers=headers(csrf))
+        assert r.status_code == 200, r.text
+    with transaction(rig.platform.factory) as db:
+        assert db.get(Asset, rig.ids["asset"]).fingerprint == "ef" * 32
+
+
+def test_strict_grants_blocks_batch_renew_without_primary_grant(rig):
+    with transaction(rig.platform.factory) as db:
+        services.create_user(db, "admin2", ADMIN_PASSWORD, "admin", actor="test")
+    object.__setattr__(rig.platform.cfg, "strict_grants", True)
+    try:
+        with TestClient(rig.app, base_url=ORIGIN) as c:
+            csrf = login(c, "admin2", ADMIN_PASSWORD)
+            r = c.post("/api/v2/grants/renew", json={
+                "user_id": rig.ids["admin"], "asset_ids": [rig.ids["asset"]],
+                "ttl_seconds": 7 * 86400,
+            }, headers=headers(csrf))
+            assert r.status_code == 403, r.text
+            assert r.json()["error"] == "grantor_not_authorized"
+    finally:
+        object.__setattr__(rig.platform.cfg, "strict_grants", False)
+
+
+def test_candidate_approval_adopts_fingerprint_only_when_asked(rig):
+    with transaction(rig.platform.factory) as db:
+        db.add(ProbeCandidate(
+            id=uuid.uuid4().hex, asset_id=rig.ids["asset"],
+            tenant_id=DEFAULT_TENANT_ID, state="pending",
+            vendor="dell", model="X12DPH", firmware="3.01",
+            profile_id=None, capability_id=None, fingerprint="ef" * 32,
+            reason="operator verified out of band", created=time.time()))
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        r = c.post("/api/v2/assets/probe/candidates/approve", json={
+            "ids": [c.get("/api/v2/assets/probe/candidates",
+                          headers=headers(csrf)).json()[0]["id"]],
+            "adopt_fingerprint": True,
+        }, headers=headers(csrf))
+        assert r.status_code == 200, r.text
+    with transaction(rig.platform.factory) as db:
+        assert db.get(Asset, rig.ids["asset"]).fingerprint == "ef" * 32

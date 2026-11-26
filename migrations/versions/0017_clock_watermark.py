@@ -17,6 +17,9 @@ def upgrade() -> None:
         sa.Column("high_water", sa.Float(precision=53), nullable=False),
         sa.Column("observed", sa.Float(precision=53), nullable=False),
         sa.Column("regressions", sa.Integer(), nullable=False))
+    op.execute(sa.text(
+        "INSERT INTO kvm_clock_watermark (id,high_water,observed,regressions) "
+        "VALUES ('platform',0,0,0)"))
 
 
 def downgrade() -> None:

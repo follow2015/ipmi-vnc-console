@@ -11247,7 +11247,6 @@ var PAGES = {
 };
 var pause$1 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var pretty = (token) => NAMES[token] || (/^f\d+$/.test(token) ? token.toUpperCase() : token);
-var statusName = (token) => /^[a-z]$/.test(token) ? token.toUpperCase() : pretty(token);
 function createSoftKey({ body, tabs, status, getClient }) {
 	let table = null;
 	let latched = /* @__PURE__ */ new Set();
@@ -11267,7 +11266,7 @@ function createSoftKey({ body, tabs, status, getClient }) {
 	function live() {
 		return !busy && !!table && !!getClient();
 	}
-	async function chord(tokens, label) {
+	async function chord(tokens) {
 		const client = getClient();
 		if (!table || !client) {
 			setStatus("键位表或控制台尚未就绪，按键未发送");
@@ -11284,15 +11283,13 @@ function createSoftKey({ body, tabs, status, getClient }) {
 		} finally {
 			for (const key of keys.slice().reverse()) client.sendKey(key, null, false);
 		}
-		setStatus(`已发送 ${label || tokens.map(statusName).join("+")}`);
+		setStatus("");
 		return true;
 	}
 	function paintMods() {
 		body.querySelectorAll("button[data-mod]").forEach((button) => {
 			button.classList.toggle("on", latched.has(button.dataset.v2Key));
 		});
-		const down = [...latched].map(statusName);
-		setStatus(down.length ? `已按住 ${down.join(" + ")} · 再点一个键生效` : "按键通过标准 RFB KeyEvent 发送");
 	}
 	function release() {
 		latched = /* @__PURE__ */ new Set();
@@ -11313,7 +11310,7 @@ function createSoftKey({ body, tabs, status, getClient }) {
 				paintMods();
 				return;
 			}
-			if (await chord([...latched, token])) setStatus(`已发送 ${[...latched, token].map(statusName).join("+")}`);
+			await chord([...latched, token]);
 		});
 		return el;
 	}
@@ -11359,13 +11356,13 @@ function createSoftKey({ body, tabs, status, getClient }) {
 				el.className = "v2-sk";
 				el.dataset.v2Macro = String(index);
 				el.textContent = macro.label;
-				el.addEventListener("click", () => chord(macro.keys, macro.label));
+				el.addEventListener("click", () => chord(macro.keys));
 				macros.append(el);
 			});
 		}
 		setPage(page);
 		sync();
-		setStatus("键位表已加载；修饰键点亮后点字符发送组合键");
+		setStatus("");
 	}
 	tabs.addEventListener("click", (event) => {
 		const tab = event.target.closest("[data-v2page]");
@@ -11457,6 +11454,55 @@ function connect() {
 		}
 	});
 }
+var skToggle = document.getElementById("v2-sk-toggle");
+var skPanel = document.getElementById("v2-sk-panel");
+var skHead = document.getElementById("v2-sk-head");
+var skDrag = null;
+function pinPanel(left, top) {
+	skPanel.style.left = `${Math.round(left)}px`;
+	skPanel.style.top = `${Math.round(top)}px`;
+	skPanel.style.right = "auto";
+	skPanel.style.bottom = "auto";
+}
+function clampPanel() {
+	if (!skPanel.hasAttribute("open")) return;
+	const rect = skPanel.getBoundingClientRect();
+	const left = Math.min(Math.max(0, rect.left), Math.max(0, window.innerWidth - rect.width));
+	const top = Math.min(Math.max(0, rect.top), Math.max(0, window.innerHeight - rect.height));
+	if (Math.abs(left - rect.left) > .5 || Math.abs(top - rect.top) > .5) pinPanel(left, top);
+}
+skToggle.addEventListener("click", () => {
+	if (skPanel.hasAttribute("open")) skPanel.removeAttribute("open");
+	else {
+		skPanel.setAttribute("open", "");
+		clampPanel();
+	}
+});
+skHead.addEventListener("pointerdown", (event) => {
+	if (event.pointerType === "mouse" && event.button !== 0) return;
+	const rect = skPanel.getBoundingClientRect();
+	skDrag = {
+		id: event.pointerId,
+		dx: event.clientX - rect.left,
+		dy: event.clientY - rect.top
+	};
+	skHead.setPointerCapture(event.pointerId);
+	skPanel.classList.add("dragging");
+	event.preventDefault();
+});
+skHead.addEventListener("pointermove", (event) => {
+	if (!skDrag || skDrag.id !== event.pointerId) return;
+	pinPanel(Math.min(Math.max(0, event.clientX - skDrag.dx), Math.max(0, window.innerWidth - skPanel.offsetWidth)), Math.min(Math.max(0, event.clientY - skDrag.dy), Math.max(0, window.innerHeight - skPanel.offsetHeight)));
+});
+function endDrag(event) {
+	if (!skDrag || skDrag.id !== event.pointerId) return;
+	skDrag = null;
+	skPanel.classList.remove("dragging");
+	if (skHead.hasPointerCapture(event.pointerId)) skHead.releasePointerCapture(event.pointerId);
+}
+skHead.addEventListener("pointerup", endDrag);
+skHead.addEventListener("pointercancel", endDrag);
+window.addEventListener("resize", clampPanel);
 document.getElementById("v2-fit").addEventListener("change", (event) => {
 	if (rfb) rfb.scaleViewport = event.target.checked;
 });

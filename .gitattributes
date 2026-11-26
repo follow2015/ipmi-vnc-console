@@ -1,0 +1,18 @@
+# Verified assets must be byte-exact on every platform.
+#
+# ``kvmhub/video/client_v2.verify_bundle()`` compares each file's SHA-256 with
+# the pinned manifest, and that digest *is* the client build identity. A Windows
+# checkout with core.autocrlf=true rewrites LF to CRLF, which changes both the
+# byte count and the digest, so the bundle looks tampered with and every lane
+# session is refused with pipeline_version_unavailable. Checking these paths out
+# verbatim keeps the identity meaningful off Linux.
+kvmhub/static/novnc-v2/** -text
+frontend/vendor/** -text
+
+# Same rule, same failure mode: ``kvmhub/transcode/registry.PLUGINS`` locks the
+# SHA-256 of each plugin source, and ``PluginSpec.check_source()`` refuses the
+# family when the digest differs. With core.autocrlf=true a Windows checkout
+# rewrites these files to CRLF, so every transcode family refuses to build with
+# ``transcode_family_unsupported`` — on Windows only, and only after checkout,
+# which is exactly the "works on my machine" shape this file exists to prevent.
+kvmhub/transcode/*.py -text

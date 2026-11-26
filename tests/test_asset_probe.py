@@ -50,8 +50,9 @@ def world(tmp_path, monkeypatch):
     seen: list[tuple] = []
 
     def fake_probe(host, username, password, *, port=443, timeout=5,
-                   allowed_networks=()):
-        seen.append((host, username, password, port, timeout, allowed_networks))
+                   allowed_networks=(), require_networks=False):
+        seen.append((host, username, password, port, timeout, allowed_networks,
+                     require_networks))
         return {
             "fingerprint": "ab" * 32, "redfish_auth": "basic",
             "inventory": {"resources": {"Managers": [
@@ -79,6 +80,13 @@ def _post(world, **overrides):
     body = {"address": "192.0.2.234", "credential_id": ids["credential_id"]}
     body.update(overrides)
     return c.post("/api/v2/assets/probe", headers=_headers(world), json=body)
+
+
+def test_empty_management_cidrs_are_refused_when_required():
+    with pytest.raises(bmc_probe.ProbeError, match="probe_target_not_allowed"):
+        bmc_probe.validate_probe_target("192.0.2.234", allowed_networks=(),
+                                        require_networks=True)
+    assert bmc_probe.validate_probe_target("192.0.2.234")[0] == "192.0.2.234"
 
 
 def test_probe_fills_identity_and_matches_an_approved_brand(world):
@@ -245,7 +253,7 @@ def test_api_passes_controlled_networks_to_probe(world):
     object.__setattr__(platform.cfg, "bmc_allowed_networks",
                        "192.0.2.0/24,192.0.2.0/24")
     assert _post(world).status_code == 200
-    assert seen[-1][-1] == "192.0.2.0/24,192.0.2.0/24"
+    assert seen[-1][-2] == "192.0.2.0/24,192.0.2.0/24"
 
 
 def test_probe_refuses_target_outside_controlled_network():

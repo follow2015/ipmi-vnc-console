@@ -1,10 +1,13 @@
 """Opt-in V1 video runtime: isolated decoder process, strict IPC and budgets."""
+import asyncio
 import hmac
 import multiprocessing
 import os
 import secrets
 import struct
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from .framebuffer import MAX_PIXELS, MAX_RECTS, MAX_UPDATE_BYTES, geometry
@@ -211,6 +214,24 @@ def hard_cpu_limit_supported():
     return os.name == 'posix' and hasattr(__import__('resource'), 'RLIMIT_CPU')
 
 
+_io_pool: ThreadPoolExecutor | None = None
+_io_pool_lock = threading.Lock()
+
+
+def decoder_io_pool() -> ThreadPoolExecutor:
+    global _io_pool
+    with _io_pool_lock:
+        if _io_pool is None:
+            try:
+                configured = int(os.environ.get('KVMHUB_DECODE_IO_WORKERS', '0'))
+            except ValueError:
+                configured = 0
+            workers = configured if configured > 0 else min(32, max(4, os.cpu_count() or 4))
+            _io_pool = ThreadPoolExecutor(max_workers=workers,
+                                          thread_name_prefix='kvmhub-decode-io')
+        return _io_pool
+
+
 class ManagedDecoder:
 
     def __init__(self, *, nonce=None, budget=None, require_hard_cpu_limit=True,
@@ -227,6 +248,28 @@ class ManagedDecoder:
         self.needs_resync = True
         self.permit_pending = False
         self.last_error = ''
+        self._io_lock: asyncio.Lock | None = None
+
+    def _async_lock(self) -> asyncio.Lock:
+        if self._io_lock is None:
+            self._io_lock = asyncio.Lock()
+        return self._io_lock
+
+    async def _io(self, fn):
+        return await asyncio.get_running_loop().run_in_executor(decoder_io_pool(), fn)
+
+    async def astart(self):
+        async with self._async_lock():
+            return await self._io(self.start)
+
+    async def areset(self, width, height, header=b'', family=None):
+        async with self._async_lock():
+            return await self._io(
+                lambda: self.reset(width, height, header, family=family))
+
+    async def adecode_update(self, stream):
+        async with self._async_lock():
+            return await self._io(lambda: self.decode_update(stream))
 
     @property
     def running(self):
@@ -301,15 +344,17 @@ class ManagedDecoder:
         return text if text and set(text) <= allowed else ''
 
     async def resync(self, width, height, header=b'', family=None):
-        self._reap()
-        if self.permit_pending:
-            if self.before_resync is None:
-                raise VideoResyncRequired('video_resync_permit_missing')
-            await self.before_resync()
-            self.permit_pending = False
-        if not self.running:
-            self.start()
-        return self.reset(width, height, header, family=family)
+        async with self._async_lock():
+            self._reap()
+            if self.permit_pending:
+                if self.before_resync is None:
+                    raise VideoResyncRequired('video_resync_permit_missing')
+                await self.before_resync()
+                self.permit_pending = False
+            if not self.running:
+                await self._io(self.start)
+            return await self._io(
+                lambda: self.reset(width, height, header, family=family))
 
     def reset(self, width, height, header=b'', family=None):
         if self.permit_pending:

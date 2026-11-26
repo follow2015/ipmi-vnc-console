@@ -35,9 +35,18 @@ _FACTORIES = MappingProxyType({
 })
 
 
-def verify(root) -> None:
-    """Verify every locked plugin source digest before any plugin is built."""
-    for spec in PLUGINS.values():
+def verify(root, families=None) -> None:
+    """Check locked source digests.
+
+    With no argument this checks the whole manifest, which is what CI and the
+    release gate want. A build checks only the family it selected: a broken or
+    unavailable sibling family must not take down every other family at
+    runtime. These digests only catch accidental edits and release transforms;
+    they live in the same commit as the code, so they are not a supply-chain
+    control and must never be described as one.
+    """
+    specs = (PLUGINS[name] for name in families) if families is not None else PLUGINS.values()
+    for spec in specs:
         spec.check_source(root)
 
 
@@ -59,5 +68,8 @@ def build(family, root, observation=None):
     factory = _FACTORIES[family]
     if not getattr(factory, 'available', True):
         raise Problem('transcode_family_unsupported', 503)
-    verify(root)
+    # Only this family's bytes matter to this build. Verifying every plugin
+    # here used to let an unavailable, unrelated family (ast2100-x10) refuse
+    # the standard RFB path with a 503.
+    spec.check_source(root)
     return factory()

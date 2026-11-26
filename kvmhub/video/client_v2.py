@@ -6,7 +6,7 @@ from pathlib import Path
 from ..common import Problem
 
 ROOT = Path(__file__).resolve().parents[1] / 'static' / 'novnc-v2'
-MANIFEST_SHA256 = 'f2162d3208a95f3a19c847a8e6c2c008b5d06b1bb3b656404f151bbd0556d902'
+MANIFEST_SHA256 = '295e9241bfffb2e7f8ac40807ee34dcc7625209f21d2b3f8f06dff609ad4d1fe'
 CLIENT_VERSION = '1.7.0'
 PROTOCOL_CONTRACT = 'console-rfb/1'
 
@@ -68,7 +68,13 @@ HTML = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 html,body{margin:0;height:100%;background:#171b22;color:#eee;font:14px sans-serif}
 body{display:flex;flex-direction:column}header{display:flex;gap:12px;align-items:center;padding:12px;flex-wrap:wrap}
 #v2-screen{flex:1;min-height:0;overflow:auto}button{padding:8px}label{white-space:nowrap}
-details{padding:8px;background:#242a35}textarea{width:98%;max-height:22vh}
+#v2-sk-toggle{position:fixed;right:16px;bottom:16px;z-index:30;padding:10px 14px;border-radius:22px;background:#2b5a86;border-color:#4d8fd0;color:#fff;box-shadow:0 4px 14px #0009}
+#v2-sk-panel{position:fixed;right:16px;bottom:66px;z-index:29;width:min(760px,calc(100vw - 32px));max-height:calc(100vh - 120px);overflow:auto;padding:10px;background:#242a35;border:1px solid #3c4e68;border-radius:10px;box-shadow:0 10px 30px #000b}
+#v2-sk-panel:not([open]){display:none}textarea{width:98%;max-height:22vh}
+#v2-sk-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:-2px -2px 6px;padding:6px 4px;border-bottom:1px solid #3c4e68;cursor:move;touch-action:none;user-select:none;color:#93a8c4;font-size:12px}
+#v2-sk-head b{color:#eaf1fb;font-size:13px;pointer-events:none}
+#v2-sk-head span{opacity:.75;pointer-events:none}
+#v2-sk-panel.dragging{user-select:none;box-shadow:0 14px 36px #000d}
 #v2-sk-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
 #v2-sk-tabs button{padding:6px 14px;font-size:12px;border-radius:6px;background:#132039;border-color:#2c4266;color:#93a8c4}
 #v2-sk-tabs button.on{background:#2b5a86;border-color:#4d8fd0;color:#fff}
@@ -88,13 +94,15 @@ details{padding:8px;background:#242a35}textarea{width:98%;max-height:22vh}
 .v2-sk[data-level=known_broken]{border-color:#b05148;color:#ffc9c4}
 .v2-sk:disabled{opacity:.4;cursor:not-allowed}
 #v2-sk-status,#v2-input-status{font-size:12px;color:#8fb6e8;margin-top:6px;min-height:1.4em}
+#v2-sk-status:empty{display:none}
 #v2-danger{margin-top:6px;padding:6px 8px;border:1px solid #a33;border-radius:6px;background:#2a0f12;color:#ff9d9d;font:12px/1.5 ui-monospace,Consolas,monospace}
 #v2-danger:empty{display:none}
 </style><header><b id="v2-title">控制台</b><span id="v2-status">正在连接</span>
 <label><input id="v2-fit" type="checkbox" checked>适配画面</label>
 <button id="v2-cad">Ctrl+Alt+Delete</button><button id="v2-escape">Escape</button>
-<button id="v2-close">结束会话</button></header><div id="v2-screen"></div>
-<details id="v2-input"><summary>软键盘与长命令输入</summary>
+<button id="v2-close">结束会话</button><button id="v2-sk-toggle" type="button">⌨ 软键盘</button></header><div id="v2-screen"></div>
+<section id="v2-sk-panel" aria-label="软键盘与长命令输入">
+<header id="v2-sk-head" aria-label="拖动软键盘"><b>软键盘</b><span>按住拖动</span></header>
 <div id="v2-sk-tabs">
 <button type="button" class="on" data-v2page="chars">字符</button>
 <button type="button" data-v2page="symbols">符号</button>
@@ -107,9 +115,9 @@ details{padding:8px;background:#242a35}textarea{width:98%;max-height:22vh}
 <div class="v2-skpage" data-v2page="symbols"></div>
 <div class="v2-skpage" data-v2page="func"></div>
 <div class="v2-skpage" data-v2page="nav"></div>
-</div></div><div id="v2-sk-status">正在加载键位表</div>
+</div></div><div id="v2-sk-status"></div>
 <textarea id="v2-text" rows="3" maxlength="512" aria-label="长命令" placeholder="文本按字符转换为按键；换行会发送回车"></textarea>
 <button id="v2-text-send" disabled>发送文本</button><button id="v2-cancel">停止发送</button>
 <label><input id="v2-gap" type="number" value="55" min="10" max="500"> ms/键</label>
-<span id="v2-input-status">正在加载键位表</span><div id="v2-danger"></div></details>
+<span id="v2-input-status">正在加载键位表</span><div id="v2-danger"></div></section>
 <script type="module" src="_platform/client-v2/viewer.js"></script></html>'''

@@ -16,7 +16,9 @@ class RfbTcpFamilyAdapter:
         handshake = StandardRfbBrowserHandshake(
             self.upstream.server_init_raw,
             version=(BROWSER_RFB_VERSION + "\n").encode("ascii"))
-        session = RfbPassthroughSession(self.upstream, handshake)
+        session = RfbPassthroughSession(
+            self.upstream, handshake,
+            client_encodings=getattr(self, "client_encodings", None))
         await session.start()
         self.session = session
         return session

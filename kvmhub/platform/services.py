@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy import and_, delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from . import clockguard, governance
@@ -28,6 +28,7 @@ from .models import (AccessGrant, Asset, AssetGroup, AssetGroupMember, AuditLog,
                      Tenant, User, UserRole, VendorProfile, json_field, parse_json,
                      roles_for_tenant_mode)
 from .security import (CredentialCipher, hash_password, verify_password)
+from ..common import user_message
 from ..sql_backend import open_store, parse_store_dsn
 
 logger = logging.getLogger(__name__)
@@ -73,31 +74,67 @@ def observe_clock(session: Session, *, now: float | None = None,
     stamp = time.time() if now is None else now
     row = session.get(ClockWatermark, clockguard.WATERMARK_ID)
     if row is None:
-        session.add(ClockWatermark(id=clockguard.WATERMARK_ID, high_water=stamp,
-                                   observed=stamp, regressions=0))
-        session.flush()
-        return {"high_water": stamp, "behind": 0.0, "regressed": False}
+        verb = ("INSERT IGNORE" if session.get_bind().dialect.name == "mysql"
+                else "INSERT OR IGNORE")
+        session.execute(
+            text(f"{verb} INTO kvm_clock_watermark (id,high_water,observed,regressions) "
+                 "VALUES (:id,:stamp,:stamp,0)"),
+            {"id": clockguard.WATERMARK_ID, "stamp": stamp})
+        row = session.get(ClockWatermark, clockguard.WATERMARK_ID)
     verdict = clockguard.evaluate(float(row.high_water or 0.0), stamp)
     if verdict["regressed"]:
         behind = verdict["behind"]
-        row.regressions = int(row.regressions or 0) + 1
-        audit(session, actor, "clock_regression", trace=trace, now=stamp,
-              detail={"behind_seconds": round(behind, 3),
-                      "high_water": round(verdict["high_water"], 3),
-                      "observed": round(stamp, 3),
-                      "tolerance_seconds": verdict["tolerance"],
-                      "reason": reason})
-        session.commit()
+        session.rollback()
+        with Session(session.get_bind()) as audit_session:
+            audit_row = audit_session.get(ClockWatermark, clockguard.WATERMARK_ID)
+            if audit_row is None:
+                audit_session.add(ClockWatermark(
+                    id=clockguard.WATERMARK_ID, high_water=verdict["high_water"],
+                    observed=stamp, regressions=1))
+            else:
+                audit_row.regressions = int(audit_row.regressions or 0) + 1
+            audit(audit_session, actor, "clock_regression", trace=trace, now=stamp,
+                  detail={"behind_seconds": round(behind, 3),
+                          "high_water": round(verdict["high_water"], 3),
+                          "observed": round(stamp, 3),
+                          "tolerance_seconds": verdict["tolerance"],
+                          "reason": reason})
+            audit_session.commit()
         logger.error("control-plane clock regressed by %.0f s (high-water %.0f, now %.0f)",
                      behind, verdict["high_water"], stamp)
         raise PlatformError(
             "clock_regression",
-            f"控制面时钟比历史高水位回退约 {behind:.0f} 秒，已拒绝新的接入与会话；"
-            f"请检查主机时钟与 NTP 同步后重试", 409)
+            f"{user_message('clock_regression')} 实测回退约 {behind:.0f} 秒", 409)
+    if verdict["suspicious_forward"]:
+        logger.warning(
+            "control-plane clock jumped forward by %.0f s (floor %.0f, now %.0f); "
+            "watermark unchanged, verify NTP or run clock-reset --confirm",
+            verdict["forward"], verdict["high_water"], stamp)
+        row.observed = stamp
+        return {"high_water": float(row.high_water), "behind": 0.0,
+                "regressed": False, "suspicious_forward": True,
+                "forward": verdict["forward"]}
     row.high_water = clockguard.advance(row.high_water, stamp)
     row.observed = stamp
     return {"high_water": float(row.high_water), "behind": verdict["behind"],
-            "regressed": False}
+            "regressed": False, "suspicious_forward": False,
+            "forward": verdict["forward"]}
+
+
+def reset_clock_watermark(session: Session, *, now: float | None = None,
+                          actor: str = "platform", trace: str = "") -> dict:
+    stamp = time.time() if now is None else now
+    row = session.get(ClockWatermark, clockguard.WATERMARK_ID)
+    if row is None:
+        row = ClockWatermark(id=clockguard.WATERMARK_ID, high_water=stamp,
+                             observed=stamp, regressions=0)
+        session.add(row)
+    previous = float(row.high_water or 0.0)
+    row.high_water = stamp
+    row.observed = stamp
+    audit(session, actor, "clock_watermark_reset", trace=trace, now=stamp,
+          detail={"previous": previous, "new": stamp})
+    return {"previous": previous, "high_water": stamp}
 
 
 def authenticate(session: Session, username: str, password: str,
@@ -746,6 +783,8 @@ def assign_asset(session: Session, *, address: str, tenant_id: str | None, actor
             plane.bump_subject_epoch(uid, trace="")
     session.execute(delete(AccessGrant).where(AccessGrant.asset_id == asset.id))
     session.execute(delete(GrantSource).where(GrantSource.asset_id == asset.id))
+    session.execute(delete(AssetGroupMember).where(
+        AssetGroupMember.asset_id == asset.id))
     if old_grantees:
         audit(session, actor, "asset_grants_cleared", asset_id=asset.id, tenant_id=target,
               detail={"from": origin_code, "users": old_grantees}, now=stamp)
@@ -832,9 +871,79 @@ def grant_asset(session: Session, *, user_id: str, asset_id: str, actor: str,
     session.commit()
 
 
+def renew_grants(session: Session, *, user_id: str, asset_ids: list[str],
+                 actor: str, tenant_id: str = DEFAULT_TENANT_ID,
+                 expires: float | None = None, extend_seconds: int | None = None,
+                 actor_user_id: str | None = None, plane: Any | None = None,
+                 now: float | None = None) -> dict:
+    stamp = time.time() if now is None else now
+    if (expires is None) == (extend_seconds is None):
+        raise PlatformError("invalid_request", "expires 与 extend_seconds 必须且只能提供一个", 400)
+    if extend_seconds is not None:
+        extra = int(extend_seconds)
+        if extra < 60 or extra > 10 * 366 * 86400:
+            raise PlatformError("grant_expiry_invalid", "续期时长须在 1 分钟到 10 年之间", 400)
+    if expires is not None:
+        deadline = float(expires)
+        if deadline <= stamp:
+            raise PlatformError("grant_expiry_invalid", "到期时间必须晚于当前时间", 400)
+        if deadline > stamp + 10 * 366 * 86400:
+            raise PlatformError("grant_expiry_invalid", "到期时间不能超过 10 年后", 400)
+    ids = list(dict.fromkeys(str(aid) for aid in asset_ids))
+    if not ids:
+        raise PlatformError("grant_target_missing", "请至少选择一台资产", 400)
+    if len(ids) > MAX_GROUP_EXPANSION:
+        raise PlatformError("grant_batch_too_large", "单次最多续期 500 台资产", 400)
+    user = session.get(User, user_id)
+    if user is None or user.tenant_id != tenant_id:
+        raise PlatformError("grant_target_missing", "用户不存在或不属于本租户", 404)
+    owned = set(session.scalars(select(Asset.id).where(
+        Asset.id.in_(ids), Asset.tenant_id == tenant_id)).all())
+    if len(owned) != len(ids):
+        raise PlatformError("grant_asset_foreign", "只能续期本租户资产的授权", 403)
+    rows = session.scalars(select(AccessGrant).where(
+        AccessGrant.user_id == user_id, AccessGrant.tenant_id == tenant_id,
+        AccessGrant.asset_id.in_(ids))).all()
+    by_asset = {row.asset_id: row for row in rows}
+    renewed = [aid for aid in ids if aid in by_asset]
+    missing = [aid for aid in ids if aid not in by_asset]
+    if actor_user_id is not None:
+        for aid in renewed:
+            _assert_grantor_authorized(session, actor_user_id=actor_user_id,
+                                       asset_id=aid, tenant_id=tenant_id, stamp=stamp)
+    if extend_seconds is not None:
+        targets = {aid: max(stamp, float(by_asset[aid].expires or 0)) + extra
+                   for aid in renewed}
+        result_expires = min(targets.values()) if targets else stamp + extra
+    else:
+        targets = {aid: deadline for aid in renewed}
+        result_expires = deadline
+    if any(target > stamp + 10 * 366 * 86400 for target in targets.values()):
+        raise PlatformError("grant_expiry_invalid", "续期后的到期时间不能超过 10 年后", 400)
+    if plane is not None:
+        for aid in renewed:
+            plane.write_grant(user_id, aid, targets[aid], trace="")
+    for aid in renewed:
+        by_asset[aid].expires = targets[aid]
+    audit(session, actor, "grant_renewed", tenant_id=tenant_id,
+          detail={"user_id": user_id, "asset_ids": renewed, "missing": missing,
+                  "expires": result_expires, "count": len(renewed),
+                  "mode": "extend" if extend_seconds is not None else "set",
+                  "extend_seconds": extra if extend_seconds is not None else None},
+          now=stamp)
+    session.commit()
+    return {"user_id": user_id, "expires": result_expires, "renewed": len(renewed),
+            "missing": missing, "asset_ids": renewed}
+
+
 def revoke_grant(session: Session, *, user_id: str, asset_id: str, actor: str,
                  tenant_id: str = DEFAULT_TENANT_ID,
                  plane: Any | None = None) -> None:
+    user = session.get(User, user_id)
+    asset = session.get(Asset, asset_id)
+    if (user is None or user.tenant_id != tenant_id
+            or asset is None or asset.tenant_id != tenant_id):
+        raise PlatformError("grant_target_missing", "用户或资产不存在", 404)
     if plane is not None:
         plane.delete_grant(user_id, asset_id, trace="")
         plane.bump_subject_epoch(user_id, trace="")
@@ -925,6 +1034,7 @@ def delete_asset_group(session: Session, *, group_id: str, actor: str,
 def grant_group(session: Session, *, group_id: str, user_id: str, actor: str,
                 tenant_id: str, plane: Any | None = None,
                 ttl_seconds: int = 86400 * 30,
+                actor_user_id: str | None = None,
                 now: float | None = None) -> dict:
     stamp = time.time() if now is None else now
     group = _group_in_tenant(session, group_id, tenant_id)
@@ -936,6 +1046,15 @@ def grant_group(session: Session, *, group_id: str, user_id: str, actor: str,
     if len(member_ids) > MAX_GROUP_EXPANSION:
         raise PlatformError("group_expansion_too_large",
                             f"单次展开不能超过 {MAX_GROUP_EXPANSION} 台资产", 413)
+    owned = set(session.scalars(select(Asset.id).where(
+        Asset.id.in_(member_ids), Asset.tenant_id == tenant_id)).all())
+    if len(owned) != len(member_ids):
+        raise PlatformError("group_asset_foreign",
+                            "资产组成员已不属于本租户，请先重建资产组", 403)
+    if actor_user_id is not None:
+        for aid in member_ids:
+            _assert_grantor_authorized(session, actor_user_id=actor_user_id,
+                                       asset_id=aid, tenant_id=tenant_id, stamp=stamp)
 
     stale = [row[0] for row in session.execute(
         select(GrantSource.asset_id).where(GrantSource.user_id == user_id,

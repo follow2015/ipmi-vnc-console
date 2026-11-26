@@ -1,6 +1,5 @@
 """Pinned standard noVNC bundle selection and fixed-resource boundary."""
 import hashlib
-from pathlib import Path
 import shutil
 
 import pytest
@@ -19,13 +18,34 @@ def test_fixed_bundle_manifest_includes_licenses_and_identity():
     assert client_v2.MANIFEST_SHA256 not in client_v2.protocol_contract()
 
 
-def test_html_exposes_a_full_v2_softkey():
+def test_html_exposes_a_floating_v2_softkey():
     html = client_v2.HTML
-    for token in ('id="v2-keybed"', 'id="v2-sk-status"',
+    for token in ('id="v2-sk-toggle"', 'id="v2-sk-panel"',
+                  'id="v2-keybed"', 'id="v2-sk-status"',
                   'data-v2page="chars"', 'data-v2page="symbols"',
                   'data-v2page="func"', 'data-v2page="nav"',
                   'data-v2page="macros"'):
         assert token in html
+    assert '<details id="v2-input"' not in html
+
+
+def test_softkey_floats_over_the_viewport_without_squeezing_the_screen():
+    html = client_v2.HTML
+    assert '#v2-sk-panel{' in html and 'position:fixed' in html
+    assert 'id="v2-screen"' in html
+
+
+def test_softkey_panel_has_a_drag_handle():
+    html = client_v2.HTML
+    assert 'id="v2-sk-head"' in html
+    assert '#v2-sk-head{' in html and 'cursor:move' in html
+    assert 'touch-action:none' in html
+
+
+def test_normal_key_sends_show_no_status_message():
+    html = client_v2.HTML
+    assert '#v2-sk-status:empty{display:none}' in html
+    assert '按键通过标准 RFB KeyEvent 发送' not in html
 
 
 def test_contract_pins_the_wire_profile_the_server_emits():

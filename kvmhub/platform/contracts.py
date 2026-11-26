@@ -49,6 +49,85 @@ class PlatformGrantResult(Contract):
     asset_id: str
 
 
+class GrantRenewResult(Contract):
+    user_id: str
+    expires: float
+    renewed: int
+    asset_ids: list[str]
+    missing: list[str]
+
+
+class ProbeBatchAccepted(Contract):
+    task_id: str
+    total: int
+
+
+class ProbeTaskError(Contract):
+    code: str
+    message: str
+    retryable: bool = False
+
+
+class ProbeTaskItem(Contract):
+    asset_id: str
+    address: str
+    step: str
+    ok: bool | None = None
+    error: ProbeTaskError | None = None
+    result: AssetProbeResult | None = None
+    candidate_created: bool = False
+
+
+class ProbeBatchTask(Contract):
+    task_id: str
+    state: str
+    total: int
+    completed: int
+    created: float
+    tenant_id: str | None = None
+    items: list[ProbeTaskItem]
+
+
+class ProbeCandidateView(Contract):
+    id: str
+    asset_id: str
+    asset_name: str
+    state: str
+    vendor: str
+    model: str
+    firmware: str
+    profile_id: str | None = None
+    capability_id: str | None = None
+    fingerprint: str
+    reason: str
+    created: float
+    current_vendor: str = ""
+    current_model: str = ""
+    current_firmware: str = ""
+
+
+class ProbeCandidateApproval(Contract):
+    approved: int
+    failed: list[dict[str, str]]
+    note: str
+
+
+class GrantBatchItem(Contract):
+    asset_id: str
+    status: str
+    reason: str = ""
+    expires: float | None = None
+
+
+class GrantBatchResult(Contract):
+    action: str
+    user_id: str
+    total: int
+    changed: int
+    items: list[GrantBatchItem]
+    note: str = ""
+
+
 class AssetResetResult(Contract):
     ok: bool
     asset_id: str
@@ -345,6 +424,26 @@ class AssetProbeResult(Contract):
     note: str = ""
 
 
+class AssetProbeBatchError(Contract):
+    code: str
+    message: str
+    retryable: bool = False
+
+
+class AssetProbeBatchItem(Contract):
+    asset_id: str
+    address: str
+    ok: bool
+    result: AssetProbeResult | None = None
+    error: AssetProbeBatchError | None = None
+
+
+class AssetProbeBatchResult(Contract):
+    total: int
+    items: list[AssetProbeBatchItem]
+    missing: list[str]
+
+
 class ConnectionPlan(Contract):
     rfb_version: str
     message_profile: str
@@ -584,10 +683,18 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/assets/{asset_id}/admission": {"get": "DeviceAdmissionStatus"},
     "/api/v2/asset-onboarding": {"get": "AssetOnboarding"},
     "/api/v2/assets/probe": {"post": "AssetProbeResult"},
+    "/api/v2/assets/probe/batch": {"post": "AssetProbeBatchResult"},
+    "/api/v2/assets/probe/batch/async": {"post": "ProbeBatchAccepted"},
+    "/api/v2/assets/probe/tasks/{task_id}": {"get": "ProbeBatchTask"},
+    "/api/v2/assets/probe/candidates": {"get": "list:ProbeCandidateView"},
+    "/api/v2/assets/probe/candidates/approve": {"post": "ProbeCandidateApproval"},
+    "/api/v2/assets/probe/candidates/{candidate_id}/reject": {"post": "OkResult"},
     "/api/v2/public-ips": {"get": "list:PublicIpMapping"},
     "/api/v2/public-ips/{asset_id}": {"put": "PublicIpMapping"},
     "/api/v2/credentials": {"get": "list:CredentialCreated", "post": "CredentialCreated"},
     "/api/v2/grants": {"post": "OkResult"},
+    "/api/v2/grants/renew": {"post": "GrantRenewResult"},
+    "/api/v2/grants/batch": {"post": "GrantBatchResult"},
     "/api/v2/asset-groups": {"get": "list:AssetGroup", "post": "AssetGroup"},
     "/api/v2/asset-groups/{group_id}": {"delete": "OkResult"},
     "/api/v2/asset-groups/{group_id}/members": {"put": "GroupMembers"},

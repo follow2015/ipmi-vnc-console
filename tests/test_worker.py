@@ -1120,3 +1120,25 @@ async def test_stats_shows_a_rebuild_in_flight(identities):
                 session = (await response.json())["session"]
     assert session["state"] == "recovering"
     assert session["recoveries"] == 1 and session["dropped_input"] == 3
+
+
+def test_clock_skew_survives_the_manager_hop_with_its_diagnostics():
+    from kvmhub.admission_runtime import TRUSTED_AUTHORITY_CODES
+
+    assert "clock_skew" in TRUSTED_AUTHORITY_CODES
+    refused = worker_module.ManagerRejected(
+        "clock_skew", 401, detail={"drift_seconds": 7.4})
+    assert refused.code == "clock_skew"
+    assert refused.detail["drift_seconds"] == 7.4
+    assert refused.permanent and refused.status == 401
+
+
+def test_clock_skew_survives_the_manager_hop_with_its_diagnostics():
+    from kvmhub.admission_runtime import TRUSTED_AUTHORITY_CODES
+
+    assert "clock_skew" in TRUSTED_AUTHORITY_CODES
+    refused = worker_module.ManagerRejected(
+        "clock_skew", 401, detail={"drift_seconds": 7.4})
+    assert refused.code == "clock_skew"
+    assert refused.detail["drift_seconds"] == 7.4
+    assert refused.permanent and refused.status == 401

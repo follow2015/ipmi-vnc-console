@@ -86,6 +86,14 @@ def test_skew_tolerance_covers_a_few_seconds_not_a_few_minutes():
     assert exc.value.code == "clock_skew"
 
 
+def test_binding_failure_wins_over_clock_skew():
+    stale = permit(now=NOW - 60)
+    with pytest.raises(Problem) as exc:
+        verify_operation_permit(KEY.public_key(), stale, now=NOW,
+                                expected={"sid": "somebody-else"})
+    assert exc.value.code == "operation_permit_invalid"
+
+
 def test_permit_claiming_a_wider_window_is_tampering_not_skew():
     long_window = jwt.decode(permit(), KEY.public_key(), algorithms=["EdDSA"],
                              audience=OPERATION_AUDIENCE, issuer=ISSUER,

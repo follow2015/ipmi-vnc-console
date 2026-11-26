@@ -59,8 +59,8 @@ def connection_limit(adapter) -> int:
 
 class ManagerRejected(Problem):
 
-    def __init__(self, code: str, upstream_status: int):
-        super().__init__(code)
+    def __init__(self, code: str, upstream_status: int, *, detail: dict | None = None):
+        super().__init__(code, detail=detail)
         self.upstream_status = upstream_status
 
     @property
@@ -1960,12 +1960,16 @@ class Gateway:
             if response.status != 200:
                 code = {403: "worker_request_rejected", 409: "ticket_consumed_or_expired",
                         410: "session_revoked"}.get(response.status, "manager_unavailable")
+                detail = None
                 with contextlib.suppress(Exception):
                     body = await response.json(content_type=None)
                     if isinstance(body, dict) and body.get("error") in (
                             SESSION_END_CODES | TRUSTED_AUTHORITY_CODES):
                         code = body["error"]
-                raise ManagerRejected(code, response.status)
+                        forwarded = body.get("detail")
+                        if isinstance(forwarded, dict):
+                            detail = forwarded
+                raise ManagerRejected(code, response.status, detail=detail)
             try:
                 return await response.json()
             except (ValueError, aiohttp.ContentTypeError) as exc:

@@ -18,6 +18,7 @@ TRUSTED_AUTHORITY_CODES = frozenset({
     "execution_domain_unavailable", "target_network_denied",
     "projection_schema_unsupported", "admission_service_unavailable",
     "operation_permit_invalid", "operation_permit_replayed",
+    "clock_skew",
 })
 
 BINDING_FIELDS = (
@@ -74,7 +75,9 @@ class AuthorityClient:
                         body = await response.json(content_type=None)
                         code = str(body.get("error") or "")
                         if code in TRUSTED_AUTHORITY_CODES:
-                            raise Problem(code, response.status)
+                            detail = body.get("detail")
+                            raise Problem(code, response.status,
+                                          detail=detail if isinstance(detail, dict) else None)
                         raise Problem("admission_service_unavailable", 503)
                     result = await response.json(content_type=None)
                     if not isinstance(result, dict) or not isinstance(result.get("permit"), str):

@@ -411,6 +411,7 @@ class StandardRfbBrowserHandshake:
         self._buf = bytearray()
         self.stage = "version"
         self.completed = False
+        self.shared: bool | None = None
 
     def start(self) -> bytes:
         if self.stage != "version":
@@ -451,6 +452,7 @@ class StandardRfbBrowserHandshake:
                 if shared not in (0, 1):
                     raise ValueError("invalid_client_init")
                 del self._buf[:1]
+                self.shared = bool(shared)
                 out += self._server_init
                 self.completed = True
                 self.stage = "relay"

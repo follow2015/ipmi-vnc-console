@@ -19,7 +19,7 @@ TRUSTED_KEY_IDS = ("local-v1",)
 
 CLOCK_SKEW = 5.0
 
-MAX_WINDOW = 15.0
+MAX_WINDOW = 5.0
 
 
 def _number(value) -> bool:
@@ -102,12 +102,12 @@ def verify_operation_permit(public_key, token: str, *, now: float | None = None,
         if not (claims["exp"] >= claims["iat"] > 0
                 and claims["exp"] - claims["iat"] <= int(MAX_WINDOW + CLOCK_SKEW)):
             raise ValueError()
-        drift = clock_drift(claims, stamp)
-        if drift:
-            raise _ClockSkew(drift, claims)
         for key, value in (expected or {}).items():
             if key not in claims or claims[key] != value:
                 raise ValueError()
+        drift = clock_drift(claims, stamp)
+        if drift:
+            raise _ClockSkew(drift, claims)
         return claims
     except _ClockSkew as exc:
         raise Problem("clock_skew", 401, detail={

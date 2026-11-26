@@ -20,6 +20,7 @@ class IdracVncAdapter(RfbTcpFamilyAdapter):
     connection_limit = DRIVERS[adapter_id].connection_limit
     supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
     login_budget = DRIVERS[adapter_id].login_budget
+    client_encodings = (0, 1)
 
     def __init__(self, info: dict, *, networks=None) -> None:
         target = urlsplit(info["target"])

@@ -27,13 +27,13 @@ from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,  # no
                                 init_schema, make_engine, seed_roles,
                                 session_factory, transaction)
 from kvmhub.platform.models import (AccessGrant, Asset as PlatformAsset,  # noqa: E402
-                                    AssetConnection, DeviceAdmission,
+                                    AssetConnection, ClockWatermark, DeviceAdmission,
                                     ExecutionDomain, PlaneProjection,
                                     PROFILE_APPROVED, ROLE_ADMIN, Capability,
                                     Credential, Role, User, UserRole, VendorProfile)
 from kvmhub.platform.security import CredentialCipher  # noqa: E402
-from kvmhub.platform import (brand_onboarding, connection, governance,  # noqa: E402
-                             services, vendor_registry)
+from kvmhub.platform import (brand_onboarding, clockguard, connection,  # noqa: E402
+                             governance, services, vendor_registry)
 from kvmhub.platform.bus import AssemblyBus  # noqa: E402
 from kvmhub.platform.redis_state import SESSION_PREFIX, create_state  # noqa: E402
 from kvmhub.store import TENANT_GRANT, Store  # noqa: E402
@@ -647,6 +647,26 @@ def cmd_rebuild_quota_usage(args):
     print(json.dumps(result, ensure_ascii=False, indent=1))
 
 
+def cmd_clock_reset(args):
+    if not args.confirm:
+        raise SystemExit("clock-reset requires --confirm; verify NTP on this host first")
+    target = args.to if args.to is not None else time.time()
+    if abs(target - time.time()) > 86400:
+        raise SystemExit("refusing a reset more than a day away from the host clock")
+    _, engine, factory, _ = _context(args)
+    with transaction(factory) as db:
+        row = db.get(ClockWatermark, clockguard.WATERMARK_ID)
+        floor = float(row.high_water or 0.0) if row else 0.0
+        if floor and target - floor > clockguard.FORWARD_JUMP_LIMIT and not args.ack_forward_jump:
+            raise SystemExit(
+                "this looks like a forward-jump recovery: verify NTP again and "
+                "re-run with --ack-forward-jump")
+        result = services.reset_clock_watermark(
+            db, now=target, actor=args.actor, trace="clock-reset-cli")
+    engine.dispose()
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+
+
 def cmd_sync_data_plane(args):
     if not args.evidence or not Path(args.evidence).exists():
         raise SystemExit("--evidence must point at an existing measured evidence file")
@@ -1031,6 +1051,14 @@ def parser():
     q.set_defaults(fn=cmd_rebind_asset)
     q = sub.add_parser("users"); q.add_argument("--tenant", help="filter by tenant code"); q.set_defaults(fn=cmd_users)
     q = sub.add_parser("audit"); q.add_argument("--limit", type=int, default=50); q.set_defaults(fn=cmd_audit)
+    q = sub.add_parser("clock-reset", help="audited recovery from a wrong clock watermark (out of band)")
+    q.add_argument("--confirm", action="store_true",
+                   help="required: NTP has been verified on this host")
+    q.add_argument("--ack-forward-jump", action="store_true",
+                   help="required when the new floor is far ahead of the stored one")
+    q.add_argument("--to", type=float, default=None, help="verified epoch seconds; default now")
+    q.add_argument("--actor", default="platform")
+    q.set_defaults(fn=cmd_clock_reset)
     q = sub.add_parser("create-service-token", help="issue a DCIM bearer token with a source-IP allowlist")
     q.add_argument("--tenant", required=True, help="tenant code the token is bound to")
     q.add_argument("--label", required=True, help="operator-facing name, unique per tenant")

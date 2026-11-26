@@ -182,6 +182,31 @@ async def _assert_no_residue(store, bus):
     assert (await bus.worker_resources("w1"))["count"] == 0
 
 
+def test_an_authority_refusal_becomes_a_platform_error_not_a_bare_problem(tmp_path):
+    bus = AssemblyBus(MemoryState())
+    store, plane = _plane(tmp_path, bus)
+
+    class _Refusing:
+        async def authorize(self, *, host, **fields):
+            raise Problem("device_not_admitted", 403)
+
+    async def run():
+        await bus.register_worker("w1", instance_id="i1", capacity=4,
+                                  metadata={"address": "127.0.0.1", "port": 9443,
+                                            "lane": TRANSCODE_LANE, **IDENTITY,
+                                            **budgets()})
+        plane.authority = _Refusing()
+        with pytest.raises(services.PlatformError) as caught:
+            await plane.open(_assembly(), user_id="local-admin", concurrent_limit=1)
+        assert caught.value.code == "device_not_admitted"
+        assert caught.value.status == 403
+        assert caught.value.message != "device_not_admitted"
+        await _assert_no_residue(store, bus)
+
+    asyncio.run(run())
+    store.close()
+
+
 def test_refused_transcode_reservation_compensates_everything(tmp_path):
     bus = AssemblyBus(MemoryState())
     store, plane = _plane(tmp_path, bus)

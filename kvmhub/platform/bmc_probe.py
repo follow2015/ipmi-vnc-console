@@ -49,8 +49,11 @@ def _reject_unsafe_address(address: ipaddress.IPv4Address | ipaddress.IPv6Addres
         raise ProbeError("probe_target_not_allowed")
 
 
-def validate_probe_target(host: str, *, allowed_networks=()) -> tuple[str, str]:
+def validate_probe_target(host: str, *, allowed_networks=(),
+                          require_networks=False) -> tuple[str, str]:
     networks = parse_controlled_networks(allowed_networks)
+    if require_networks and not networks:
+        raise ProbeError("probe_target_not_allowed")
     try:
         name = validate_host(host)
     except RedfishError:
@@ -137,15 +140,22 @@ def read_inventory(connect_ip: str, sni_name: str, port: int, timeout: float,
 
 
 def probe(host: str, username: str, password: str, *, port: int = 443,
-          timeout: float = 8, allowed_networks=()) -> dict:
-    connect_ip, sni_name = validate_probe_target(host,
-                                                 allowed_networks=allowed_networks)
+          timeout: float = 8, allowed_networks=(), require_networks=False,
+          on_step=None) -> dict:
+    connect_ip, sni_name = validate_probe_target(
+        host, allowed_networks=allowed_networks, require_networks=require_networks)
     if port not in ALLOWED_PROBE_PORTS:
         raise ProbeError("invalid_probe_port")
     if not 0 < timeout <= 30:
         raise ProbeError("invalid_probe_timeout")
+    if on_step:
+        on_step("target")
     fingerprint = read_certificate_sha256(connect_ip, sni_name, port, timeout)
+    if on_step:
+        on_step("certificate")
     inventory, auth_mode = read_inventory(
         connect_ip, sni_name, port, timeout, fingerprint, username, password)
+    if on_step:
+        on_step("inventory")
     return {"fingerprint": fingerprint, "inventory": inventory,
             "redfish_auth": auth_mode}
