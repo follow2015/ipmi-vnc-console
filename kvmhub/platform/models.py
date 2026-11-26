@@ -578,3 +578,15 @@ class ProbeCandidate(Base):
     created: Mapped[float] = mapped_column(Float, nullable=False)
     resolved: Mapped[float] = mapped_column(Float, default=0.0)
     resolved_by: Mapped[str] = mapped_column(String(128), default="")
+
+
+class ProbeTask(Base):
+    __tablename__ = "kvm_probe_task"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    state: Mapped[str] = mapped_column(String(16), default="running")
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[int] = mapped_column(Integer, default=0)
+    created: Mapped[float] = mapped_column(Float, nullable=False)
+    updated: Mapped[float] = mapped_column(Float, default=0.0)
+    items_json: Mapped[str] = mapped_column(Text, default="[]")

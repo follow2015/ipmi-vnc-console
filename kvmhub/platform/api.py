@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -16,8 +17,8 @@ from sqlalchemy import func, select, update
 from ..common import Problem, user_message
 from .config import Settings, settings as load_settings
 from .db import init_schema, make_engine, seed_roles, session_factory, transaction
-from .models import (Asset, Capability, Credential, ProbeCandidate, ROLE_ADMIN,
-                     Tenant, User, VendorProfile, parse_json)
+from .models import (Asset, Capability, Credential, ProbeCandidate, ProbeTask,
+                     ROLE_ADMIN, Tenant, User, VendorProfile, parse_json)
 from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
@@ -765,6 +766,21 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                            detail={"profile_id": result.get("profile_id")}, trace=trace)
             return True
 
+    def _persist_probe_task(task: dict) -> None:
+        with transaction(platform.factory) as db:
+            row = db.get(ProbeTask, task["task_id"])
+            if row is None:
+                db.add(ProbeTask(
+                    id=task["task_id"], tenant_id=task["tenant_id"],
+                    state=task["state"], total=task["total"],
+                    completed=task["completed"], created=task["created"],
+                    updated=time.time(), items_json="[]"))
+                return
+            row.state = task["state"]
+            row.completed = task["completed"]
+            row.updated = time.time()
+            row.items_json = json.dumps(task["items"], ensure_ascii=False, default=str)
+
     @app.post("/api/v2/assets/probe/batch/async")
     async def probe_assets_batch_async(request: Request):
         auth = await current(request, mutate=True, permission="asset.write")
@@ -791,6 +807,12 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                            "step": "queued", "ok": None, "error": None, "result": None}
                           for aid in wanted]}
         app.state.probe_tasks[task_id] = task
+        await asyncio.to_thread(_persist_probe_task, task)
+        persist_lock = asyncio.Lock()
+
+        async def persist():
+            async with persist_lock:
+                await asyncio.to_thread(_persist_probe_task, task)
 
         async def run():
             async def one(item):
@@ -802,6 +824,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                                      "message": "资产不存在或未绑定 BMC 凭据",
                                      "retryable": False}
                     task["completed"] += 1
+                    await persist()
                     return
                 address, credential_id = by_id[aid]
 
@@ -838,6 +861,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                                          "message": "探测出现未预期错误", "retryable": True}
                         break
                 task["completed"] += 1
+                await persist()
 
             try:
                 await asyncio.gather(*(one(item) for item in task["items"]))
@@ -845,6 +869,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             except Exception:
                 task["state"] = "failed"
             finally:
+                await persist()
                 cutoff = time.time() - 3600
                 for key, value in list(app.state.probe_tasks.items()):
                     if value["created"] < cutoff and value["state"] != "running":
@@ -852,6 +877,28 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
 
         asyncio.create_task(run())
         return {"task_id": task_id, "total": len(wanted)}
+
+    @app.get("/api/v2/assets/probe/tasks")
+    async def probe_task_list(request: Request):
+        auth = await current(request, permission="asset.write")
+        with transaction(platform.factory) as db:
+            rows = db.scalars(select(ProbeTask).where(
+                ProbeTask.tenant_id == auth["tenant_id"]).order_by(
+                    ProbeTask.created.desc()).limit(20)).all()
+        out = []
+        for row in rows:
+            items = json.loads(row.items_json or "[]")
+            state = row.state
+            if state == "running" and row.id not in app.state.probe_tasks:
+                state = "lost"
+            out.append({
+                "task_id": row.id, "state": state, "total": row.total,
+                "completed": row.completed, "created": row.created,
+                "ok": sum(1 for item in items if item.get("ok") is True),
+                "failed": sum(1 for item in items if item.get("ok") is False),
+                "candidates": sum(1 for item in items if item.get("candidate_created")),
+            })
+        return out
 
     @app.get("/api/v2/assets/probe/tasks/{task_id}")
     async def probe_task_status(task_id: str, request: Request):
@@ -861,10 +908,20 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             if value["created"] < cutoff and value["state"] != "running":
                 app.state.probe_tasks.pop(key, None)
         task = app.state.probe_tasks.get(task_id)
-        if task is None or task["tenant_id"] != auth["tenant_id"]:
-            raise services.PlatformError(
-                "probe_task_not_found",
-                "探测任务已结束或控制面重启过；请重新发起批量探测", 404)
+        if task is not None and task["tenant_id"] != auth["tenant_id"]:
+            task = None
+        if task is None:
+            with transaction(platform.factory) as db:
+                row = db.get(ProbeTask, task_id)
+            if row is None or row.tenant_id != auth["tenant_id"]:
+                raise services.PlatformError(
+                    "probe_task_not_found", "找不到该探测任务", 404)
+            task = {"task_id": row.id,
+                    "state": "lost" if row.state == "running" else row.state,
+                    "total": row.total, "completed": row.completed,
+                    "created": row.created, "tenant_id": row.tenant_id,
+                    "items": json.loads(row.items_json or "[]"),
+                    "restored": True}
         return task
 
     @app.get("/api/v2/assets/probe/candidates")

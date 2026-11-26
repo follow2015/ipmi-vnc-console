@@ -86,6 +86,18 @@ class ProbeBatchTask(Contract):
     created: float
     tenant_id: str | None = None
     items: list[ProbeTaskItem]
+    restored: bool = False
+
+
+class ProbeTaskSummary(Contract):
+    task_id: str
+    state: str
+    total: int
+    completed: int
+    created: float
+    ok: int
+    failed: int
+    candidates: int
 
 
 class ProbeCandidateView(Contract):
@@ -685,6 +697,7 @@ CONTRACT_RESPONSES: dict[str, dict[str, str]] = {
     "/api/v2/assets/probe": {"post": "AssetProbeResult"},
     "/api/v2/assets/probe/batch": {"post": "AssetProbeBatchResult"},
     "/api/v2/assets/probe/batch/async": {"post": "ProbeBatchAccepted"},
+    "/api/v2/assets/probe/tasks": {"get": "list:ProbeTaskSummary"},
     "/api/v2/assets/probe/tasks/{task_id}": {"get": "ProbeBatchTask"},
     "/api/v2/assets/probe/candidates": {"get": "list:ProbeCandidateView"},
     "/api/v2/assets/probe/candidates/approve": {"post": "ProbeCandidateApproval"},

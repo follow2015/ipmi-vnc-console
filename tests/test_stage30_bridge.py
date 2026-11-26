@@ -892,3 +892,38 @@ def test_candidate_approval_adopts_fingerprint_only_when_asked(rig):
         assert r.status_code == 200, r.text
     with transaction(rig.platform.factory) as db:
         assert db.get(Asset, rig.ids["asset"]).fingerprint == "ef" * 32
+
+
+def test_probe_task_result_survives_a_restart_of_the_live_task(rig, monkeypatch):
+    from kvmhub.platform import bmc_probe as probe_module
+
+    def fake_probe(host, username, password, *, port=443, allowed_networks=(),
+                   require_networks=False, on_step=None):
+        return {"fingerprint": "ab" * 32,
+                "inventory": {"resources": {"Managers": [{
+                    "Manufacturer": "Supermicro (Inspur OEM)", "Model": "X12DPH-T",
+                    "FirmwareVersion": "3.01"}]}},
+                "redfish_auth": "basic"}
+
+    monkeypatch.setattr(probe_module, "probe", fake_probe)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        started = c.post("/api/v2/assets/probe/batch/async", json={
+            "asset_ids": [rig.ids["asset"]]}, headers=headers(csrf))
+        assert started.status_code == 200, started.text
+        task_id = started.json()["task_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            live = c.get(f"/api/v2/assets/probe/tasks/{task_id}",
+                         headers=headers(csrf)).json()
+            if live["state"] == "done":
+                break
+            time.sleep(0.02)
+        assert live["state"] == "done", live
+        rig.app.state.probe_tasks.pop(task_id, None)
+        restored = c.get(f"/api/v2/assets/probe/tasks/{task_id}",
+                         headers=headers(csrf)).json()
+        assert restored["restored"] is True
+        assert restored["items"][0]["address"] == live["items"][0]["address"]
+        rows = c.get("/api/v2/assets/probe/tasks", headers=headers(csrf)).json()
+        assert any(row["task_id"] == task_id and row["ok"] >= 0 for row in rows)
