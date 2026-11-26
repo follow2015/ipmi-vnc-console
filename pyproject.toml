@@ -15,7 +15,7 @@ dependencies = [
   "uvloop==0.23.0",
   # Optional out-of-band BMC reset (platform maintenance action). Imported
   # lazily in kvmhub/platform/bmc_reset.py so the app still imports without it.
-  "pyghmi==1.6.19", "python-dateutil==4.0.0",
+  "pyghmi==1.6.19", "python-ipmi==0.6.1", "python-dateutil==4.0.0",
   # JPEG block decoder for the Huawei iBMC 2198 KVM gateway video path.
   "Pillow==13.0.0",
 ]

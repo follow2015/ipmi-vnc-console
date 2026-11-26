@@ -42,7 +42,7 @@ from kvmhub.store import TENANT_GRANT, Store  # noqa: E402
 def _context(args):
     cfg = settings(args.env_file)
     engine = make_engine(cfg.db_url)
-    return cfg, engine, session_factory(engine), CredentialCipher(cfg.credential_key)
+    return cfg, engine, session_factory(engine), CredentialCipher(cfg.credential_key, previous_key=cfg.previous_credential_key)
 
 
 def _required_env(name: str) -> str:
@@ -667,6 +667,29 @@ def cmd_clock_reset(args):
     print(json.dumps(result, ensure_ascii=False, indent=1))
 
 
+def cmd_rotate_vnc_key(args):
+    if not args.confirm:
+        raise SystemExit("rotate-vnc-key requires --confirm")
+    raw = os.environ.get("KVMHUB_NEW_CREDENTIAL_KEY", "")
+    if not raw:
+        raise SystemExit("KVMHUB_NEW_CREDENTIAL_KEY must be set (secrets are never CLI args)")
+    try:
+        new_key = base64.b64decode(raw, validate=True)
+    except Exception:
+        raise SystemExit("KVMHUB_NEW_CREDENTIAL_KEY must be base64")
+    if len(new_key) != 32:
+        raise SystemExit("KVMHUB_NEW_CREDENTIAL_KEY must decode to 32 bytes")
+    cfg, engine, factory, cipher = _context(args)
+    new_cipher = CredentialCipher(new_key)
+    with transaction(factory) as db:
+        result = services.rotate_vnc_secret_key(db, cipher, new_cipher, actor=args.actor)
+    engine.dispose()
+    result["next"] = ("deploy the new key as KVMHUB_CREDENTIAL_KEY and the old one as "
+                      "KVMHUB_CREDENTIAL_KEY_PREVIOUS, then restart; remove the previous "
+                      "key only after no rows report the old version")
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+
+
 def cmd_sync_data_plane(args):
     if not args.evidence or not Path(args.evidence).exists():
         raise SystemExit("--evidence must point at an existing measured evidence file")
@@ -1051,6 +1074,10 @@ def parser():
     q.set_defaults(fn=cmd_rebind_asset)
     q = sub.add_parser("users"); q.add_argument("--tenant", help="filter by tenant code"); q.set_defaults(fn=cmd_users)
     q = sub.add_parser("audit"); q.add_argument("--limit", type=int, default=50); q.set_defaults(fn=cmd_audit)
+    q = sub.add_parser("rotate-vnc-key", help="re-encrypt hidden VNC secrets under a new master key")
+    q.add_argument("--confirm", action="store_true", help="required: new key has been escrowed")
+    q.add_argument("--actor", default="platform")
+    q.set_defaults(fn=cmd_rotate_vnc_key)
     q = sub.add_parser("clock-reset", help="audited recovery from a wrong clock watermark (out of band)")
     q.add_argument("--confirm", action="store_true",
                    help="required: NTP has been verified on this host")

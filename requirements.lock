@@ -30,6 +30,7 @@ pluggy==1.7.0
 propcache==0.5.4
 pyghmi==1.6.19
 python-dateutil==4.0.0
+python-ipmi==0.6.1
 pycparser==3.12
 pydantic==2.14.3
 pydantic_core==2.50.4

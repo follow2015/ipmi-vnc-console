@@ -133,3 +133,32 @@ def test_real_decode_update_path_keeps_the_loop_alive(monkeypatch):
     assert update.epoch == 1
     gaps = [later - earlier for earlier, later in zip(ticks, ticks[1:])]
     assert gaps and max(gaps) < 0.10
+
+
+def test_aclose_waits_for_an_in_flight_decode_before_killing_the_child():
+    import threading
+
+    decoder = ManagedDecoder(require_hard_cpu_limit=False)
+    decoder.epoch = 1
+    decoder.needs_resync = False
+    decoder.proc = SimpleNamespace(is_alive=lambda: True)
+    started = threading.Event()
+    order = []
+
+    def blocking_decode(stream):
+        started.set()
+        time.sleep(0.08)
+        order.append("decoded")
+        return SimpleNamespace(epoch=1, payload=b"")
+
+    decoder.decode_update = blocking_decode
+    decoder._kill = lambda: order.append("killed")
+
+    async def run():
+        decode = asyncio.create_task(decoder.adecode_update(b"update"))
+        await asyncio.to_thread(started.wait, 1.0)
+        await decoder.aclose()
+        await decode
+
+    asyncio.run(run())
+    assert order == ["decoded", "killed"]

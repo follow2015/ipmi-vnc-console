@@ -23,7 +23,7 @@ from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
 from . import (bmc_probe, bmc_reset, connection, connection_config, governance,
-               public_ip, services, text_input, vendor_registry)
+               ipmi_probe, public_ip, services, text_input, vendor_registry)
 from .bus import AssemblyBus, BusError
 from .contracts import CONTRACT_RESPONSES, contract_components, response_schema
 
@@ -92,7 +92,7 @@ class Platform:
         self.cfg = cfg
         self.engine = make_engine(cfg.db_url)
         self.factory = session_factory(self.engine)
-        self.cipher = CredentialCipher(cfg.credential_key)
+        self.cipher = CredentialCipher(cfg.credential_key, previous_key=cfg.previous_credential_key)
         self.state = state if state is not None else create_state(cfg.redis_url)
         self.bus = AssemblyBus(self.state)
         self.owns_plane = plane is None
@@ -612,7 +612,8 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
 
     async def _measure_identity(auth: dict, *, address: str, credential_id: str,
                                 port: int, public_ips, trace: str,
-                                acquire_timeout: float = 2.0, on_step=None) -> dict:
+                                acquire_timeout: float = 2.0, on_step=None,
+                                detailed_errors: bool = False) -> dict:
         with transaction(platform.factory) as db:
             secret = services.read_credential(
                 db, platform.cipher, credential_id, tenant_id=auth["tenant_id"])
@@ -629,17 +630,39 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 port=port, allowed_networks=platform.cfg.bmc_allowed_networks,
                 require_networks=platform.cfg.is_prod, **probe_kwargs)
         except bmc_probe.ProbeError as exc:
-            safe_address = address.encode("unicode_escape").decode("ascii")[:256]
-            logger.warning("asset_probe_failed address=%s code=%s retryable=%s trace=%s",
-                           safe_address, exc.code, exc.retryable, trace)
-            with transaction(platform.factory) as db:
-                services.audit(
-                    db, auth["username"], "asset_probe_failed", tenant_id=auth["tenant_id"],
-                    detail={"address": address, "error": exc.code,
-                            "retryable": exc.retryable}, trace=trace)
-            raise services.PlatformError(
-                "asset_probe_failed", "BMC 探测失败，请核对地址、凭据与网络", 502,
-                retryable=exc.retryable) from None
+            fallback_done = False
+            if exc.code == "redfish_not_available":
+                try:
+                    if on_step:
+                        on_step("ipmi")
+                    measured = await asyncio.to_thread(
+                        ipmi_probe.probe_identity, address,
+                        secret["username"], secret["password"],
+                        allowed_networks=platform.cfg.bmc_allowed_networks,
+                        require_networks=platform.cfg.is_prod)
+                    fallback_done = True
+                    logger.info("ipmi_probe_fallback address=%s trace=%s", address, trace)
+                except ipmi_probe.IpmiProbeError as ipmi_exc:
+                    exc = bmc_probe.ProbeError(ipmi_exc.code,
+                                               retryable=ipmi_exc.retryable)
+            if not fallback_done:
+                safe_address = address.encode("unicode_escape").decode("ascii")[:256]
+                logger.warning("asset_probe_failed address=%s code=%s retryable=%s trace=%s",
+                               safe_address, exc.code, exc.retryable, trace)
+                with transaction(platform.factory) as db:
+                    services.audit(
+                        db, auth["username"], "asset_probe_failed",
+                        tenant_id=auth["tenant_id"],
+                        detail={"address": address, "error": exc.code,
+                                "retryable": exc.retryable}, trace=trace)
+            if not fallback_done and detailed_errors:
+                raise services.PlatformError(
+                    exc.code, f"BMC 探测失败：{exc.code}", 502,
+                    retryable=exc.retryable) from None
+            if not fallback_done:
+                raise services.PlatformError(
+                    "asset_probe_failed", "BMC 探测失败，请核对地址、凭据与网络", 502,
+                    retryable=exc.retryable) from None
         finally:
             semaphore.release()
         detection = vendor_registry.detect_from_redfish(measured["inventory"])
@@ -713,6 +736,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                             "result": result}
                 except services.PlatformError as exc:
                     if exc.retryable and attempt == 0:
+                        await asyncio.sleep(0.5)
                         continue
                     return {"asset_id": asset_id, "address": address, "ok": False,
                             "error": {"code": exc.code, "message": exc.message,
@@ -743,6 +767,11 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
             detection = result.get("detection") or {}
             profile = (db.get(VendorProfile, result["profile_id"])
                        if result.get("profile_id") else None)
+            capability = None
+            if profile is not None:
+                capability = db.scalar(select(Capability).where(
+                    Capability.profile_id == profile.id,
+                    Capability.status == "verified").limit(1))
             changed = (detection.get("vendor", "") != asset.vendor
                        or detection.get("model", "") != asset.model
                        or detection.get("firmware", "") != asset.firmware
@@ -758,7 +787,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 state="pending", vendor=detection.get("vendor", ""),
                 model=detection.get("model", ""), firmware=detection.get("firmware", ""),
                 profile_id=result.get("profile_id") or None,
-                capability_id=profile.default_capability_id if profile else None,
+                capability_id=capability.id if capability else None,
                 fingerprint=result.get("certificate_sha256", ""),
                 reason=result.get("reason", ""), created=now))
             services.audit(db, auth["username"], "probe_candidate_created",
@@ -796,9 +825,11 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
         except (TypeError, ValueError):
             raise services.PlatformError("invalid_request", "端口必须是整数", 400) from None
         with transaction(platform.factory) as db:
-            rows = db.execute(select(Asset.id, Asset.address, Asset.credential_id).where(
+            rows = db.execute(select(Asset.id, Asset.address, Asset.credential_id,
+                                     Asset.vendor, Asset.model, Asset.firmware,
+                                     Asset.profile_id).where(
                 Asset.id.in_(wanted), Asset.tenant_id == auth["tenant_id"])).all()
-        by_id = {row[0]: (row[1], row[2]) for row in rows}
+        by_id = {row[0]: tuple(row[1:]) for row in rows}
         trace = request.state.trace
         task_id = uuid.uuid4().hex
         task = {"task_id": task_id, "state": "running", "total": len(wanted),
@@ -826,7 +857,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                     task["completed"] += 1
                     await persist()
                     return
-                address, credential_id = by_id[aid]
+                address, credential_id, vendor, model, firmware, profile_id = by_id[aid]
 
                 def step(name):
                     item["step"] = name
@@ -837,7 +868,7 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                         result = await _measure_identity(
                             auth, address=address, credential_id=credential_id,
                             port=port, public_ips=[], trace=trace,
-                            acquire_timeout=10.0, on_step=step)
+                            acquire_timeout=10.0, on_step=step, detailed_errors=True)
                         item["step"] = "identify"
                         candidates = await asyncio.to_thread(
                             _write_probe_candidate, auth, aid, result, trace)
@@ -847,14 +878,34 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                         item["result"] = result
                         break
                     except services.PlatformError as exc:
+                        if exc.code in ("redfish_not_available", "ipmi_unavailable",
+                                        "ipmi_auth_failed"):
+                            item["step"] = "skipped"
+                            item["ok"] = True
+                            item["result"] = {
+                                "address": address, "certificate_sha256": "",
+                                "redfish_auth": "none",
+                                "detection": {"vendor": vendor or "",
+                                              "model": model or "",
+                                              "firmware": firmware or "",
+                                              "source": "stored", "raw": {}},
+                                "matched": False, "usable": False,
+                                "reason": "redfish_not_available",
+                                "profile_id": profile_id, "profile_code": "",
+                                "note": "该 BMC 未提供 Redfish，沿用已入库身份，无需变更",
+                            }
+                            item["candidate_created"] = False
+                            break
                         if exc.retryable and attempt == 0:
+                            await asyncio.sleep(0.5)
                             continue
                         item["step"] = "failed"
                         item["ok"] = False
                         item["error"] = {"code": exc.code, "message": exc.message,
                                          "retryable": bool(exc.retryable)}
                         break
-                    except Exception:
+                    except Exception as _exc:
+                        print("MEASURE_EXC", repr(_exc))
                         item["step"] = "failed"
                         item["ok"] = False
                         item["error"] = {"code": "probe_unexpected",
@@ -863,8 +914,14 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
                 task["completed"] += 1
                 await persist()
 
+            probe_gate = asyncio.Semaphore(2)
+
+            async def gated(item):
+                async with probe_gate:
+                    await one(item)
+
             try:
-                await asyncio.gather(*(one(item) for item in task["items"]))
+                await asyncio.gather(*(gated(item) for item in task["items"]))
                 task["state"] = "done"
             except Exception:
                 task["state"] = "failed"

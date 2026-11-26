@@ -118,6 +118,8 @@ def read_inventory(connect_ip: str, sni_name: str, port: int, timeout: float,
     except (RedfishError, OSError) as exc:
         if is_tls_mismatch(exc):
             raise ProbeError("tls_identity_mismatch", retryable=False) from None
+        if str(exc).startswith("http_404"):
+            raise ProbeError("redfish_not_available", retryable=False) from None
     client = Redfish(sni_name, port, None, timeout, fingerprint,
                      max_requests=20, total_timeout=_INVENTORY_BUDGET,
                      connect_ip=connect_ip, deadline=shared_deadline)
@@ -129,6 +131,8 @@ def read_inventory(connect_ip: str, sni_name: str, port: int, timeout: float,
         code = str(exc) if isinstance(exc, RedfishError) else ""
         if code.startswith("http_401") or code.startswith("http_403"):
             raise ProbeError("probe_auth_failed") from None
+        if code.startswith("http_404"):
+            raise ProbeError("redfish_not_available", retryable=False) from None
         if is_tls_mismatch(exc):
             raise ProbeError("tls_identity_mismatch", retryable=False) from None
         raise ProbeError("inventory_unavailable") from None

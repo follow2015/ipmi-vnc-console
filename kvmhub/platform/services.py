@@ -389,7 +389,7 @@ def save_vnc_secret(session: Session, cipher: CredentialCipher, *, asset_id: str
     stamp = time.time() if now is None else now
     asset.vnc_username_cipher = cipher.encrypt(username, aad=asset.id + ":vnc_username")
     asset.vnc_password_cipher = cipher.encrypt(password, aad=asset.id + ":vnc_password")
-    asset.vnc_key_version = 1
+    asset.vnc_key_version = cipher.version
     asset.vnc_secret_revision = (asset.vnc_secret_revision or 0) + 1
     asset.updated = stamp
     audit(session, actor, "vnc_secret_saved", asset_id=asset.id,
@@ -450,6 +450,42 @@ def read_vnc_secret(session: Session, cipher: CredentialCipher, asset_id: str,
         "username": cipher.decrypt(asset.vnc_username_cipher, aad=asset.id + ":vnc_username"),
         "password": cipher.decrypt(asset.vnc_password_cipher, aad=asset.id + ":vnc_password"),
     }
+
+
+def rotate_vnc_secret_key(session: Session, cipher: CredentialCipher,
+                          new_cipher: CredentialCipher, *, actor: str,
+                          now: float | None = None) -> dict:
+    if not cipher.available or not new_cipher.available:
+        raise PlatformError("credential_key_missing", "凭据主密钥未配置", 503)
+    stamp = time.time() if now is None else now
+    rows = session.scalars(select(Asset).where(
+        Asset.vnc_password_cipher.isnot(None))).all()
+    rotated = []
+    for row in rows:
+        if row.vnc_key_version == new_cipher.version:
+            continue
+        try:
+            username = cipher.decrypt(row.vnc_username_cipher, aad=row.id + ":vnc_username")
+            password = cipher.decrypt(row.vnc_password_cipher, aad=row.id + ":vnc_password")
+        except Exception:  # noqa: BLE001 - already written under the new key
+            continue
+        row.vnc_username_cipher = new_cipher.encrypt(username, aad=row.id + ":vnc_username")
+        row.vnc_password_cipher = new_cipher.encrypt(password, aad=row.id + ":vnc_password")
+        row.vnc_key_version = new_cipher.version
+        row.vnc_secret_revision = (row.vnc_secret_revision or 0) + 1
+        row.updated = stamp
+        audit(session, actor, "vnc_key_rotated", asset_id=row.id,
+              tenant_id=row.tenant_id, now=stamp,
+              detail={"key_version": new_cipher.version,
+                      "secret_revision": row.vnc_secret_revision})
+        rotated.append(row.id)
+    if rotated:
+        from . import connection_config
+
+        connection_config.record_change(session, asset_ids=rotated,
+                                        reason="vnc_key_rotated", actor=actor, now=stamp)
+    session.flush()
+    return {"rotated": len(rotated), "key_version": new_cipher.version}
 
 
 def select_sync_secret(session: Session, cipher: CredentialCipher, asset: Asset,

@@ -82,6 +82,7 @@ class Settings:
     authority_cert_cn: str = ""
     platform_cert_cn: str = ""
     managed_domains: str = ""
+    previous_credential_key: bytes | None = None
 
     @property
     def is_prod(self) -> bool:
@@ -169,6 +170,10 @@ def _decode_key(raw: str, name: str) -> bytes | None:
 def settings(env_path: str | os.PathLike[str] | None = None) -> Settings:
     load_env(env_path)
     key = _decode_key(os.getenv("KVMHUB_CREDENTIAL_KEY", ""), "KVMHUB_CREDENTIAL_KEY")
+    previous_key = _decode_key(
+        os.getenv("KVMHUB_CREDENTIAL_KEY_PREVIOUS", ""), "KVMHUB_CREDENTIAL_KEY_PREVIOUS")
+    if previous_key and key and previous_key == key:
+        raise ValueError("KVMHUB_CREDENTIAL_KEY_PREVIOUS must differ from the current key")
     data_plane_key = _decode_key(os.getenv("KVMHUB_DATA_PLANE_KEY", ""),
                                  "KVMHUB_DATA_PLANE_KEY")
     db_url = os.getenv("KVMHUB_DB_URL", "")
@@ -180,6 +185,7 @@ def settings(env_path: str | os.PathLike[str] | None = None) -> Settings:
         db_url=db_url,
         redis_url=os.getenv("KVMHUB_REDIS_URL", ""),
         credential_key=key,
+        previous_credential_key=previous_key,
         session_ttl=_int("KVMHUB_SESSION_TTL", 3600),
         lease_seconds=_int("KVMHUB_LEASE_SECONDS", 30),
         bootstrap_admin=os.getenv("KVMHUB_BOOTSTRAP_ADMIN"),

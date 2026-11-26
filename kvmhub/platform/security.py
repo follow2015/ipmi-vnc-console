@@ -7,6 +7,7 @@ import hmac
 import secrets
 
 import bcrypt
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 NONCE_BYTES = 12
@@ -46,10 +47,14 @@ def constant_time_equal(left: str, right: str) -> bool:
 
 class CredentialCipher:
 
-    def __init__(self, key: bytes | None):
+    def __init__(self, key: bytes | None, previous_key: bytes | None = None):
         if key is not None and len(key) != 32:
             raise ValueError("credential key must be 32 bytes")
+        if previous_key is not None and len(previous_key) != 32:
+            raise ValueError("previous credential key must be 32 bytes")
         self._aead = AESGCM(key) if key is not None else None
+        self._previous = AESGCM(previous_key) if previous_key is not None else None
+        self.version = 2 if previous_key is not None else 1
 
     @property
     def available(self) -> bool:
@@ -70,5 +75,12 @@ class CredentialCipher:
         if not isinstance(blob, (bytes, bytearray)) or len(blob) <= NONCE_BYTES + 16:
             raise ValueError("ciphertext is truncated")
         raw = bytes(blob)
-        return self._aead.decrypt(raw[:NONCE_BYTES], raw[NONCE_BYTES:],
-                                  aad.encode("utf-8")).decode("utf-8")
+        try:
+            plaintext = self._aead.decrypt(raw[:NONCE_BYTES], raw[NONCE_BYTES:],
+                                           aad.encode("utf-8"))
+        except InvalidTag:
+            if self._previous is None:
+                raise
+            plaintext = self._previous.decrypt(raw[:NONCE_BYTES], raw[NONCE_BYTES:],
+                                                aad.encode("utf-8"))
+        return plaintext.decode("utf-8")

@@ -927,3 +927,106 @@ def test_probe_task_result_survives_a_restart_of_the_live_task(rig, monkeypatch)
         assert restored["items"][0]["address"] == live["items"][0]["address"]
         rows = c.get("/api/v2/assets/probe/tasks", headers=headers(csrf)).json()
         assert any(row["task_id"] == task_id and row["ok"] >= 0 for row in rows)
+
+
+def test_a_bmc_without_redfish_closes_the_task_without_a_candidate(rig, monkeypatch):
+    from kvmhub.platform import bmc_probe as probe_module
+
+    from kvmhub.platform import ipmi_probe
+
+    def no_redfish(host, username, password, **kwargs):
+        raise probe_module.ProbeError("redfish_not_available", retryable=False)
+
+    def no_ipmi(host, username, password, **kwargs):
+        raise ipmi_probe.IpmiProbeError("ipmi_unavailable", retryable=False)
+
+    monkeypatch.setattr(probe_module, "probe", no_redfish)
+    monkeypatch.setattr(ipmi_probe, "probe_identity", no_ipmi)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        started = c.post("/api/v2/assets/probe/batch/async", json={
+            "asset_ids": [rig.ids["asset"]]}, headers=headers(csrf))
+        assert started.status_code == 200, started.text
+        task_id = started.json()["task_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            task = c.get(f"/api/v2/assets/probe/tasks/{task_id}",
+                         headers=headers(csrf)).json()
+            if task["state"] == "done":
+                break
+            time.sleep(0.02)
+        item = task["items"][0]
+        assert task["state"] == "done"
+        assert item["step"] == "skipped" and item["ok"] is True
+        assert item["candidate_created"] is False
+        assert item["result"]["detection"]["model"] == "X10DRT-PS"
+        assert c.get("/api/v2/assets/probe/candidates",
+                     headers=headers(csrf)).json() == []
+
+
+def test_redfish_not_available_falls_back_to_ipmi(rig, monkeypatch):
+    from kvmhub.platform import bmc_probe as probe_module
+    from kvmhub.platform import ipmi_probe
+
+    def no_redfish(host, username, password, **kwargs):
+        raise probe_module.ProbeError("redfish_not_available", retryable=False)
+
+    def ipmi_answer(host, username, password, **kwargs):
+        return {"fingerprint": "",
+                "inventory": {"resources": {"Managers": [{
+                    "Manufacturer": "Supermicro (Inspur OEM)",
+                    "Model": "X10DRT-PS", "FirmwareVersion": "8.33"}]}},
+                "redfish_auth": "ipmi_rmcpplus"}
+
+    monkeypatch.setattr(probe_module, "probe", no_redfish)
+    monkeypatch.setattr(ipmi_probe, "probe_identity", ipmi_answer)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        started = c.post("/api/v2/assets/probe/batch/async", json={
+            "asset_ids": [rig.ids["asset"]]}, headers=headers(csrf))
+        task_id = started.json()["task_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            task = c.get(f"/api/v2/assets/probe/tasks/{task_id}",
+                         headers=headers(csrf)).json()
+            if task["state"] == "done":
+                break
+            time.sleep(0.02)
+        item = task["items"][0]
+        assert item["ok"] is True and item["step"] == "done"
+        assert item["result"]["redfish_auth"] == "ipmi_rmcpplus"
+        assert item["result"]["detection"]["firmware"] == "8.33"
+
+
+def test_redfish_not_available_falls_back_to_ipmi(rig, monkeypatch):
+    from kvmhub.platform import bmc_probe as probe_module
+    from kvmhub.platform import ipmi_probe
+
+    def no_redfish(host, username, password, **kwargs):
+        raise probe_module.ProbeError("redfish_not_available", retryable=False)
+
+    def ipmi_answer(host, username, password, **kwargs):
+        return {"fingerprint": "",
+                "inventory": {"resources": {"Managers": [{
+                    "Manufacturer": "Supermicro (Inspur OEM)",
+                    "Model": "X10DRT-PS", "FirmwareVersion": "8.33"}]}},
+                "redfish_auth": "ipmi_rmcpplus"}
+
+    monkeypatch.setattr(probe_module, "probe", no_redfish)
+    monkeypatch.setattr(ipmi_probe, "probe_identity", ipmi_answer)
+    with TestClient(rig.app, base_url=ORIGIN) as c:
+        csrf = login(c)
+        started = c.post("/api/v2/assets/probe/batch/async", json={
+            "asset_ids": [rig.ids["asset"]]}, headers=headers(csrf))
+        task_id = started.json()["task_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            task = c.get(f"/api/v2/assets/probe/tasks/{task_id}",
+                         headers=headers(csrf)).json()
+            if task["state"] == "done":
+                break
+            time.sleep(0.02)
+        item = task["items"][0]
+        assert item["ok"] is True and item["step"] == "done"
+        assert item["result"]["redfish_auth"] == "ipmi_rmcpplus"
+        assert item["result"]["detection"]["firmware"] == "8.33"

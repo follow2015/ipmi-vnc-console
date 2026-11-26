@@ -130,3 +130,28 @@ def test_clear_vnc_secret_restores_bmc_fallback(ctx):
         assert services.has_vnc_secret(asset) is False
         secret, source = services.select_sync_secret(db, cipher, asset)
         assert source == "bmc" and secret["password"] == BMC_PASSWORD
+
+
+def test_rotation_keeps_old_rows_readable_and_is_idempotent(ctx):
+    _, factory, cipher = ctx
+    new_key = bytes((index + 1 for index in range(32)))
+    with transaction(factory) as db:
+        _, asset = _asset_with_bmc_credential(db, cipher, "192.0.2.41")
+        services.save_vnc_secret(db, cipher, asset_id=asset.id,
+                                 username="vnc", password="placeholder-vnc-password", actor="cli")
+        asset_id = asset.id
+
+    rotated_cipher = CredentialCipher(new_key, previous_key=KEY)
+    new_only = CredentialCipher(new_key)
+    with transaction(factory) as db:
+        with pytest.raises(Exception):
+            services.read_vnc_secret(db, new_only, asset_id)
+        assert services.read_vnc_secret(db, rotated_cipher, asset_id)["password"] == \
+            "placeholder-vnc-password"
+        result = services.rotate_vnc_secret_key(
+            db, rotated_cipher, rotated_cipher, actor="cli")
+        assert result["rotated"] == 1 and result["key_version"] == 2
+        assert services.read_vnc_secret(db, rotated_cipher, asset_id)["password"] == \
+            "placeholder-vnc-password"
+        assert services.rotate_vnc_secret_key(
+            db, rotated_cipher, rotated_cipher, actor="cli")["rotated"] == 0

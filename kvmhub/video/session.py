@@ -92,6 +92,21 @@ class VideoSession:
             stream.resized()
         return epoch
 
+    async def aclose(self):
+        self._reset_output()
+        for stream in self.streams.values():
+            if stream.inflight is not None:
+                stream.abort(stream.inflight)
+        self.streams.clear()
+        if self.framebuffer is not None:
+            self.decoder.ledger.release(self.framebuffer.width * self.framebuffer.height * 5)
+        self.framebuffer = None
+        aclose = getattr(self.decoder, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        else:
+            self.decoder.close()
+
     def close(self):
         self._reset_output()
         for stream in self.streams.values():

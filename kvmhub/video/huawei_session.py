@@ -71,7 +71,7 @@ class HuaweiV1RfbSession:
             await self.video.decoder.astart()
             self._control.put_nowait(self.handshake.start())
         except BaseException:
-            self.video.close()
+            await self.video.aclose()
             raise
 
     async def send_str(self, data):
@@ -263,7 +263,7 @@ class HuaweiV1RfbSession:
                 self.release_failed = True
                 self.error = self.error or 'video_input_release_failed'
         self._keys.clear()
-        self.video.close()
+        await self.video.aclose()
         self._messages = self._batch = None
 
     def as_dict(self):

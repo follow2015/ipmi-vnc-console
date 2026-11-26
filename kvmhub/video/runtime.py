@@ -455,6 +455,13 @@ class ManagedDecoder:
         else:
             proc.join()
 
+    async def aclose(self):
+        async with self._async_lock():
+            self._kill()
+            self.needs_resync = True
+            self.epoch = 0
+            self.permit_pending = False
+
     def close(self):
         self._kill()
         self.needs_resync = True

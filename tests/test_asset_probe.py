@@ -274,3 +274,28 @@ def test_probe_rejects_non_redfish_port():
     with pytest.raises(bmc_probe.ProbeError) as exc:
         bmc_probe.probe("192.0.2.234", "root", "synthetic-password", port=22)
     assert exc.value.code == "invalid_probe_port"
+
+
+def test_a_bmc_without_redfish_is_not_a_transient_probe_failure(monkeypatch):
+    from demos.redfish_probe import RedfishError
+
+    from kvmhub.platform import bmc_probe
+
+    class NoRedfish:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def json(self, path):
+            raise RedfishError("http_404")
+
+        def login(self, username, password):
+            raise RedfishError("http_404")
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(bmc_probe, "Redfish", NoRedfish)
+    with pytest.raises(bmc_probe.ProbeError) as exc:
+        bmc_probe.read_inventory("192.0.2.50", "bmc.example", 443, 8, "ab" * 32, "u", "p")
+    assert exc.value.code == "redfish_not_available"
+    assert exc.value.retryable is False
