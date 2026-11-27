@@ -8,6 +8,7 @@ import base64
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shlex
 import string
@@ -16,11 +17,13 @@ import time
 import uuid
 from collections import Counter
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select  # noqa: E402
+from sqlalchemy.exc import ArgumentError  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 from kvmhub.platform.config import settings  # noqa: E402
 from kvmhub.platform.db import (bootstrap_admin, bootstrap_platform_admin,  # noqa: E402
@@ -37,6 +40,25 @@ from kvmhub.platform import (brand_onboarding, clockguard, connection,  # noqa: 
 from kvmhub.platform.bus import AssemblyBus  # noqa: E402
 from kvmhub.platform.redis_state import SESSION_PREFIX, create_state  # noqa: E402
 from kvmhub.store import TENANT_GRANT, Store  # noqa: E402
+
+
+_SECRET_QUERY_KEYS = {"password", "pass", "passwd", "pwd", "token", "secret", "api_key", "apikey"}
+
+
+def _redact_store(store: str) -> str:
+    try:
+        shown = make_url(store).render_as_string(hide_password=True)
+    except ArgumentError:
+        shown = re.sub(r"(://[^/:@]+):[^@]*@", r"\1:***@", store)
+    parts = urlsplit(shown)
+    if parts.query:
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        if any(key.lower() in _SECRET_QUERY_KEYS for key, _ in pairs):
+            pairs = [(key, "***" if key.lower() in _SECRET_QUERY_KEYS else value)
+                     for key, value in pairs]
+            shown = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                urlencode(pairs, safe="*"), parts.fragment))
+    return shown
 
 
 def _context(args):
@@ -101,7 +123,7 @@ def cmd_init_db(args):
         if cfg.bootstrap_admin and cfg.bootstrap_password:
             created = bootstrap_admin(db, cfg.bootstrap_admin, cfg.bootstrap_password)
         profiles = vendor_registry.seed_builtin_profiles(db)
-    print(json.dumps({"db": cfg.db_url.split("?")[0], "roles": roles,
+    print(json.dumps({"db": _redact_store(cfg.db_url), "roles": roles,
                       "admin_created": created.username if created else None,
                       "profiles_seeded": profiles,
                       "profiles_status": "draft (approval required)"}, ensure_ascii=False))
@@ -667,7 +689,32 @@ def cmd_clock_reset(args):
     print(json.dumps(result, ensure_ascii=False, indent=1))
 
 
+def cmd_clock_status(args):
+    _, engine, factory, _ = _context(args)
+    from kvmhub.platform.api import Platform
+    platform = Platform.__new__(Platform)
+    platform.factory = factory
+    platform.engine = engine
+    try:
+        print(json.dumps(platform.clock_status(), ensure_ascii=False, indent=1))
+    finally:
+        engine.dispose()
+
+
 def cmd_rotate_vnc_key(args):
+    if getattr(args, "check", False):
+        from sqlalchemy import func, select
+        from kvmhub.platform.models import Asset
+        _, engine, factory, _ = _context(args)
+        with transaction(factory) as db:
+            rows = db.execute(select(Asset.vnc_key_id, func.count())
+                              .where(Asset.vnc_password_cipher.isnot(None))
+                              .group_by(Asset.vnc_key_id)).all()
+        engine.dispose()
+        print(json.dumps({"rows_by_key_id": {key or "legacy": count
+                                             for key, count in rows}},
+                         ensure_ascii=False, indent=1))
+        return
     if not args.confirm:
         raise SystemExit("rotate-vnc-key requires --confirm")
     raw = os.environ.get("KVMHUB_NEW_CREDENTIAL_KEY", "")
@@ -684,6 +731,9 @@ def cmd_rotate_vnc_key(args):
     with transaction(factory) as db:
         result = services.rotate_vnc_secret_key(db, cipher, new_cipher, actor=args.actor)
     engine.dispose()
+    if result.get("failed"):
+        print(json.dumps(result, ensure_ascii=False, indent=1))
+        raise SystemExit(3)
     result["next"] = ("deploy the new key as KVMHUB_CREDENTIAL_KEY and the old one as "
                       "KVMHUB_CREDENTIAL_KEY_PREVIOUS, then restart; remove the previous "
                       "key only after no rows report the old version")
@@ -750,7 +800,7 @@ def cmd_sync_data_plane(args):
                            tenant_id=asset.tenant_id,
                            detail={"capability_entry": entry["id"], "users": users,
                                    "secret_source": secret_source}, now=stamp)
-    summary = {"dry_run": bool(args.dry_run), "store": str(args.store),
+    summary = {"dry_run": bool(args.dry_run), "store": _redact_store(str(args.store)),
                "synced": [{"asset": p["asset_id"], "capability": p["entry"]["id"],
                            "users": len(p["users"]), "target": p["target"]} for p in plan],
                "skipped": skipped}
@@ -764,6 +814,10 @@ def cmd_sync_data_plane(args):
             cid = item["entry"]["id"]
             if store.db.execute("SELECT 1 FROM adapter_capability WHERE id=?", (cid,)).fetchone() is None:
                 store.register_capability(item["entry"], args.actor)
+            store.retarget_capability(
+                cid, adapter=item["entry"]["adapter"],
+                access_params=item["entry"].get("access_params") or {},
+                actor=args.actor)
             row = store.capability(cid)
             if row["status"] != "verified":
                 store.approve_capability(
@@ -1075,9 +1129,13 @@ def parser():
     q = sub.add_parser("users"); q.add_argument("--tenant", help="filter by tenant code"); q.set_defaults(fn=cmd_users)
     q = sub.add_parser("audit"); q.add_argument("--limit", type=int, default=50); q.set_defaults(fn=cmd_audit)
     q = sub.add_parser("rotate-vnc-key", help="re-encrypt hidden VNC secrets under a new master key")
+    q.add_argument("--check", action="store_true",
+                   help="list row counts per key id without changing anything")
     q.add_argument("--confirm", action="store_true", help="required: new key has been escrowed")
     q.add_argument("--actor", default="platform")
     q.set_defaults(fn=cmd_rotate_vnc_key)
+    q = sub.add_parser("clock-status", help="read-only clock watermark and forward-jump counter")
+    q.set_defaults(fn=cmd_clock_status)
     q = sub.add_parser("clock-reset", help="audited recovery from a wrong clock watermark (out of band)")
     q.add_argument("--confirm", action="store_true",
                    help="required: NTP has been verified on this host")

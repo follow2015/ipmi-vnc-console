@@ -361,3 +361,9 @@ core/websock.js
  * there is new data available. Several rQ* methods are available to
  * read binary data off of the receive queue.
  */
+
+AST2100 decoder (kvmhub-bridge/ast2100-decoder.js in source.json)
+(c) Copyright 2015-2017 Kevin Kelley <kelleyk@kelleyk.net>. Clean-room
+implementation, MPL-2.0 (LICENSE.MPL-2.0), from
+https://github.com/kelleyk/noVNC/tree/bmc-support/core/ast2100 at commit
+eb386b7672b1cef4ca02c9da769d5d08beefd0ab; concatenated verbatim as one module.

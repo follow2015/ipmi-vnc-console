@@ -59,6 +59,7 @@ def path_segment_is_safe(path: str) -> bool:
     return "//" not in stripped
 
 PASSTHROUGH_ADAPTER_ID = "supermicro-x10-passthrough"
+RFB_RELAY_ADAPTER_ID = "rfb-relay"
 IDRAC_VNC_ADAPTER_ID = "dell-idrac-vnc-tcp"
 HUAWEI_IBMC_VNC_ADAPTER_ID = "huawei-ibmc-vnc-tls"
 HUAWEI_IBMC_KVM_GATEWAY_ID = "huawei-ibmc-kvm-gateway"
@@ -99,7 +100,7 @@ def parse_controlled_networks(raw) -> tuple:
     return tuple(ipaddress.ip_network(item, strict=False) for item in items)
 
 
-def require_controlled_host(host: str, networks, *, adapter_id: str = IDRAC_VNC_ADAPTER_ID) -> None:
+def require_controlled_host(host: str, networks, *, adapter_id: str = RFB_RELAY_ADAPTER_ID) -> None:
     import ipaddress
     parsed = parse_controlled_networks(networks)
     if not parsed:
@@ -148,6 +149,8 @@ ERROR_STATUS = {
     "invalid_ticket": 401, "ticket_expired": 401, "invalid_request": 400,
     "csrf_rejected": 403, "route_denied": 403, "worker_request_rejected": 403, "permission_denied": 403,
     "adapter_not_verified": 403, "asset_busy": 409, "ticket_consumed_or_expired": 409,
+    "access_params_missing": 409, "access_params_invalid": 502,
+    "ast2100_stream_unsupported": 502, "ast2100_stream_desync": 502,
     "bmc_network_not_allowed": 403,
     "cleanup_not_pending": 409, "console_already_connected": 409,
     "session_revoked": 410, "request_too_large": 413, "invalid_report": 400,
@@ -194,6 +197,10 @@ USER_MESSAGES = {
     "session_not_found": "找不到该会话，可能已被清理。",
     "permission_denied": "没有该资产的访问权限。",
     "adapter_not_verified": "该资产的适配器未通过核验、已过期或未获批准。",
+    "access_params_missing": "该品牌档案缺少接入参数（VNC 端口），请联系管理员补齐后再连接。",
+    "access_params_invalid": "该品牌档案的接入参数不合法，连接已被拒绝。",
+    "ast2100_stream_unsupported": "该设备发来了已测协议范围之外的消息，为避免画面错乱，会话已结束。",
+    "ast2100_stream_desync": "该设备的视频流结构异常（与已测线格式不一致），会话已结束。",
     "bmc_network_not_allowed": "该 BMC 不在允许的管理网段内，明文 VNC 控制台已被拒绝。",
     "authentication_required": "会话已失效，请重新登录。",
     "projector_certificate_missing": "投影服务证书缺失，连接被拒绝。",
@@ -269,6 +276,8 @@ END_REASON_MESSAGES = {
     "exchange_failed": "与 Manager 的票据交换失败，会话未能建立。",
     "client_message_denied": "浏览器发来了白名单之外的消息，为安全起见结束了会话。",
     "client_message_malformed": "浏览器发来的消息格式非法，会话已结束。",
+    "ast2100_stream_unsupported": "设备发来了已测协议范围之外的消息，为避免画面错乱，会话已结束。",
+    "ast2100_stream_desync": "设备视频流结构异常（与已测线格式不一致），会话已结束。",
     "input_overflow": "按键输入过快，整形队列已满；为避免卡键，会话已明确结束。",
     "manual_release": "管理员核对上游已清理后人工放行。",
     "deadline": "到达硬性截止时间，平台结束了会话。",

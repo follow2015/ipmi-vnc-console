@@ -5,6 +5,8 @@ import re
 from urllib.parse import urlsplit
 
 from ..ast2100_protocol import RFB_VERSION, client_protocol_version
+from ..ast2100_wire import Ast2100StreamError, Ast2100Wire, standard_server_init
+from ..client_assets import fetch_asset as fetch_local_asset
 from ..driver_specs import DRIVERS
 from ..common import PASSTHROUGH_ADAPTER_ID, Problem
 from ..input_shaping import InputShapingConfig
@@ -32,6 +34,8 @@ CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
+FIXED_CLIENT_VERSION = b"RFB 003.008\n"
+
 
 def content_type_for(path: str) -> str:
     for suffix, value in CONTENT_TYPES.items():
@@ -44,6 +48,7 @@ class PassthroughAdapter:
     adapter_id = PASSTHROUGH_ADAPTER_ID
     connection_limit = DRIVERS[adapter_id].connection_limit
     supports_upstream_recovery = DRIVERS[adapter_id].supports_upstream_recovery
+    asset_pattern = ASSET_PATH
 
     def __init__(self, info):
         target = urlsplit(info["target"])
@@ -102,6 +107,8 @@ class PassthroughAdapter:
         if self.upstream is None or not self.upstream.server_init_raw:
             raise Problem("upstream_handshake_failed", 502)
         negotiated = getattr(self.upstream, "protocol_version", None) or RFB_VERSION.strip()
+        if getattr(self, "client_v2", False):
+            return await self._connect_fixed_client(negotiated)
         version = client_protocol_version(negotiated)
         allowed, sizes = self.protocol.message_profile(negotiated)
         session = RfbPassthroughSession(
@@ -116,12 +123,35 @@ class PassthroughAdapter:
         self.session = session
         return session
 
+    async def _connect_fixed_client(self, negotiated: str):
+        try:
+            wire = Ast2100Wire(negotiated)
+            server_init = standard_server_init(self.upstream.server_init_raw)
+        except Ast2100StreamError as exc:
+            if exc.code == "ast2100_stream_unsupported":
+                raise Problem("adapter_not_verified", 403) from None
+            raise Problem(exc.code, 502) from None
+        session = RfbPassthroughSession(
+            self.upstream,
+            BrowserHandshake(server_init, version=FIXED_CLIENT_VERSION,
+                             security_type=BrowserHandshake.SECURITY_TYPE_NONE),
+            recovery=self.recovery,
+            before_connect=self.recovery_before_connect,
+            require_before_connect=self.recovery_requires_permit,
+            input_shaping=self.input_shaping,
+            wire=wire,
+            vendor_server_init=self.upstream.server_init_raw)
+        await session.start()
+        self.session = session
+        return session
+
     async def fetch_asset(self, path: str) -> tuple[str, bytes]:
+        upstream = getattr(self, "upstream", None)
+        if upstream is None or getattr(self, "client_v2", False):
+            return await fetch_local_asset(path)
         if not self.asset_pattern.fullmatch(path):
             raise Problem("route_denied", 404)
-        if self.upstream is None:
-            raise Problem("upstream_unavailable", 502)
-        _upstream_type, body = await self.upstream.fetch_asset(path)
+        _upstream_type, body = await upstream.fetch_asset(path)
         return content_type_for(path), body
 
     async def close(self):

@@ -11,8 +11,8 @@ from kvmhub import client_assets
 from kvmhub.adapter_contract import ENABLED_ADAPTER_IDS
 from kvmhub.common import Problem
 from kvmhub.driver_factory import FACTORIES, make_adapter
-from kvmhub.driver_specs import (CONSOLE_DRIVERS, DRIVERS, REAL_ADAPTER_IDS,
-                                  DriverSpec, freeze_specs)
+from kvmhub.driver_specs import (CONSOLE_DRIVERS, DRIVERS, LEGACY_RELAY_PROFILES,
+                                  REAL_ADAPTER_IDS, DriverSpec, freeze_specs)
 from kvmhub.platform.brand_onboarding import CONSOLE_IMPLS
 from kvmhub.worker import input_protocol_for_adapter
 
@@ -46,8 +46,7 @@ def test_all_descriptions_have_explicit_factories_and_input_contract(driver_id):
 @pytest.mark.parametrize('driver_id,expected', (
     ('mock-v1', ('insyde18', 4, 10.0, False, False)),
     ('supermicro-x10-passthrough', ('insyde18', 1, 10.0, True, False)),
-    ('dell-idrac-vnc-tcp', ('standard8', 1, 28.0, False, True)),
-    ('huawei-ibmc-vnc-tls', ('standard8', 1, 28.0, False, True)),
+    ('rfb-relay', ('standard8', 1, 28.0, False, True)),
     ('huawei-ibmc-kvm-gateway', ('standard8', 1, 35.0, False, True)),
     ('aten-java-rfb-tcp', ('insyde18', 1, 26.0, False, True)),
 ))
@@ -55,6 +54,16 @@ def test_r_refactor_preserves_previous_driver_behavior(driver_id, expected):
     spec = DRIVERS[driver_id]
     assert (spec.input_protocol, spec.connection_limit, spec.login_budget,
             spec.supports_upstream_recovery, spec.controlled_network) == expected
+
+
+def test_relay_template_keeps_the_measured_brand_presets():
+    dell = LEGACY_RELAY_PROFILES['dell-idrac-vnc-tcp']
+    huawei = LEGACY_RELAY_PROFILES['huawei-ibmc-vnc-tls']
+    assert (dell['port'], dell['tls'], dell['pin_source'], dell['encodings']) == (
+        5901, 'none', '', (0, 1))
+    assert (huawei['port'], huawei['tls'], huawei['pin_source'], huawei['encodings']) == (
+        5900, 'pinned', 'asset_then_env', None)
+    assert DRIVERS['rfb-relay'].port == 0
 
 
 def test_registry_is_immutable_and_rejects_duplicate_ids_or_impls():
@@ -69,7 +78,8 @@ def test_registry_is_immutable_and_rejects_duplicate_ids_or_impls():
     second = DriverSpec('b', 'same', 'standard8', True, 'local_novnc')
     with pytest.raises(ValueError, match='duplicate'):
         freeze_specs([first, second])
-    assert CONSOLE_IMPLS == CONSOLE_DRIVERS.keys()
+    assert set(CONSOLE_DRIVERS) <= CONSOLE_IMPLS
+    assert set(LEGACY_RELAY_PROFILES) <= CONSOLE_IMPLS
     with pytest.raises(Problem) as exc:
         make_adapter({'adapter': 'unknown'})
     assert exc.value.code == 'adapter_not_verified'
@@ -111,7 +121,7 @@ async def test_each_local_bundle_driver_has_the_same_bounded_resource_contract(d
         assert exc.value.code == 'route_denied'
 
 
-@pytest.mark.parametrize('driver_id', ('dell-idrac-vnc-tcp', 'huawei-ibmc-vnc-tls'))
+@pytest.mark.parametrize('driver_id', ('rfb-relay',))
 async def test_tcp_family_handshake_and_cleanup_contract(driver_id):
     from kvmhub.rfb_server import build_server_init_32bpp
     adapter = FACTORIES[driver_id].__new__(FACTORIES[driver_id])

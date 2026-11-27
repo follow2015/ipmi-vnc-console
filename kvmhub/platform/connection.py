@@ -8,7 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import capability as poc_capability
-from ..driver_specs import CONSOLE_DRIVERS
+from ..driver_specs import (CONSOLE_DRIVERS, RFB_RELAY_ADAPTER_ID,
+                            parse_access_params, relay_preset, resolve_adapter)
 from ..video import client_v2
 from . import governance, public_ip, services, vendor_registry
 from .models import (DEFAULT_TENANT_ID, PROFILE_APPROVED,
@@ -34,10 +35,20 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
     if profile.status != PROFILE_APPROVED:
         raise ConnectionRefused(governance.PROFILE_NOT_APPROVED,
                                 f"品牌档案 {profile.code} 未审批，不能生成连接配置")
-    impl = str(profile.console_impl or "passthrough").strip()
+    raw_impl = str(profile.console_impl or "passthrough").strip()
+    impl = resolve_adapter(raw_impl)
     if impl not in CONSOLE_DRIVERS:
         raise ConnectionRefused("adapter_unavailable",
                                 f"档案声明的适配器 {profile.console_impl} 尚未接入数据面")
+    try:
+        supplied = parse_access_params(parse_json(profile.access_params, {}))
+    except ValueError as exc:
+        raise ConnectionRefused("capability_field_invalid", str(exc)) from exc
+    access_params = {**relay_preset(raw_impl), **supplied}
+    if impl == RFB_RELAY_ADAPTER_ID and not access_params.get("port"):
+        raise ConnectionRefused(
+            "access_params_missing",
+            f"品牌档案 {profile.code} 未声明 VNC 端口；请在档案的 access_params 中补 port")
 
     found = detection or {}
     raw = found.get("raw") or {}
@@ -73,7 +84,8 @@ def capability_entry(profile: VendorProfile, *, detection: dict | None = None,
         "protocol_versions": versions,
         "input_shaping": shaping,
         "logout_path": logout_path or "",
-        "console_impl": profile.console_impl,
+        "console_impl": raw_impl,
+        "access_params": access_params,
         "licence": profile.licence,
         "concurrency_limit": int(profile.concurrency_limit or 1),
         "evidence": profile.evidence,
@@ -225,7 +237,8 @@ def assembly(session: Session, *, asset_id: str, user_id: str, actor: str,
         "client_contract": client_v2.protocol_contract() if g0["ready"] else "",
         "client_bundle": capability.bundle_revision
         if g0["ready"] and capability.bundle_revision else "",
-        "data_plane": {"adapter": entry["adapter"], "capability_entry": entry},
+        "data_plane": {"adapter": entry["adapter"], "capability_entry": entry,
+                       "access_params": entry.get("access_params") or {}},
         "g0": g0,
         "checks": checks,
         "note": "凭据仅按 id 引用；票据由 /api/v2/consoles/open 签发，装配包由 Worker 一次性取用。",

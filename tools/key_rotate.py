@@ -63,6 +63,7 @@ def rotate(db, old: CredentialCipher, new: CredentialCipher, *, write: bool,
             if isinstance(row, Credential):
                 row.rotated_at = stamp
             else:
+                row.vnc_key_id = new.key_id
                 row.updated = stamp
         services.audit(db, actor, "credential_key_rotated",
                        detail={"rows": len(prepared), **counts, "from_versions": versions,

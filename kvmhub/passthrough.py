@@ -21,6 +21,7 @@ from .ast2100_protocol import (
     SECURITY_TYPE_INSYDE,
     framebuffer_update_request,
 )
+from .ast2100_wire import Ast2100StreamError, Ast2100Wire
 from .common import Problem
 from .input_shaping import InputOverflow, InputShaper, InputShapingConfig
 from .insyde_messages import is_key_release
@@ -250,9 +251,15 @@ class RfbPassthroughSession:
                  before_connect=None,
                  require_before_connect: bool = False,
                  input_shaping: InputShapingConfig | None = None,
-                 client_encodings: tuple[int, ...] | None = None) -> None:
+                 client_encodings: tuple[int, ...] | None = None,
+                 wire: Ast2100Wire | None = None,
+                 vendor_server_init: bytes = b"") -> None:
         self.upstream = upstream
         self.handshake = handshake
+        self.wire = wire
+        self.vendor_server_init = bytes(vendor_server_init)
+        self._opened = False
+        self.stream_error: dict[str, int | str] | None = None
         self._client_encodings = client_encodings
         self.recovery: RecoveryState | None = (
             RecoveryState(recovery, before_connect=before_connect,
@@ -319,6 +326,11 @@ class RfbPassthroughSession:
             return
         if out:
             await self._emit(out)
+        if self.handshake.completed and not self._opened:
+            self._opened = True
+            opening = self.wire.client.opening if self.wire is not None else b""
+            if opening:
+                await self.upstream.send_raw(opening)
         if trailing and not await self._forward(trailing):
             return
         if self.handshake.completed:
@@ -333,20 +345,25 @@ class RfbPassthroughSession:
             await self.close(code=1008)
             return False
         for message in messages:
-            try:
-                outgoing = ([message] if self._shaper is None
-                            else self._shaper.feed(message))
-            except InputOverflow as exc:
-                self.error = exc.code
-                await self.close(code=1008)
-                return False
-            for payload in outgoing:
+            if self.wire is None:
+                payloads = [message]
+            else:
+                payloads = self.wire.client.translate(message)
+            for payload in payloads:
                 try:
-                    await self._send_client(payload)
-                except Problem:
-                    if self.recovery is None or self.recovery.state != "recovering":
-                        raise
-                    self._hold_during_recovery(payload)
+                    outgoing = ([payload] if self._shaper is None
+                                else self._shaper.feed(payload))
+                except InputOverflow as exc:
+                    self.error = exc.code
+                    await self.close(code=1008)
+                    return False
+                for item in outgoing:
+                    try:
+                        await self._send_client(item)
+                    except Problem:
+                        if self.recovery is None or self.recovery.state != "recovering":
+                            raise
+                        self._hold_during_recovery(item)
         if self._shaper is not None:
             self._schedule_shaper_flush()
         return True
@@ -473,7 +490,7 @@ class RfbPassthroughSession:
     async def _relay_once(self) -> str | None:
         self._exception_type = None
         try:
-            await self.upstream.relay(self._emit)
+            await self.upstream.relay(self._emit_frame)
         except asyncio.CancelledError:
             raise
         except Problem as exc:
@@ -489,7 +506,8 @@ class RfbPassthroughSession:
         assert state is not None
         async with self._client_send_lock:
             state.begin()
-        expected = self.handshake._server_init[:20]
+        expected = ((self.vendor_server_init or self.handshake._server_init)[:20]
+                    if self.wire is not None else self.handshake._server_init[:20])
         started = time.monotonic()
         await self.upstream.drop_websocket()
         if state.require_before_connect and state.before_connect is None:
@@ -529,14 +547,17 @@ class RfbPassthroughSession:
                 await self._replay_recovery_input()
                 return False
             try:
+                width = int.from_bytes(expected[:2], "big")
+                height = int.from_bytes(expected[2:4], "big")
                 async with self._client_send_lock:
-                    settings = b"".join(self._client_settings.values())
-                    if CLIENT_MSG_SET_ENCODINGS not in self._client_settings:
-                        settings += set_encodings()
-                    width = int.from_bytes(expected[:2], "big")
-                    height = int.from_bytes(expected[2:4], "big")
-                    await self.upstream.send_raw(
-                        settings + framebuffer_update_request(False, 0, 0, width, height))
+                    if self.wire is not None:
+                        await self.upstream.send_raw(self.wire.recover(width, height))
+                    else:
+                        settings = b"".join(self._client_settings.values())
+                        if CLIENT_MSG_SET_ENCODINGS not in self._client_settings:
+                            settings += set_encodings()
+                        await self.upstream.send_raw(
+                            settings + framebuffer_update_request(False, 0, 0, width, height))
                 await self.upstream.wait_first_frame(timeout=state.policy.frame_timeout)
             except Problem as exc:
                 state.fail(exc.code)
@@ -550,6 +571,19 @@ class RfbPassthroughSession:
             return True
         state.give_up(state.last_error or error)
         return False
+
+    async def _emit_frame(self, data: bytes) -> None:
+        if self.wire is None:
+            await self._emit(data)
+            return
+        try:
+            translated = self.wire.server.feed(data)
+        except Ast2100StreamError as exc:
+            self.error = exc.code
+            self.stream_error = dict(exc.shape)
+            raise Problem(exc.code, 502) from None
+        if translated:
+            await self._emit(translated)
 
     async def _emit(self, data: bytes) -> None:
         if self._closed:
@@ -612,6 +646,15 @@ class RfbPassthroughSession:
                 "geometry_after": self.geometry_after,
                 "client_message_types": {str(kind): count
                                          for kind, count in self._framer.client_types.items()}}
+        if self.wire is not None:
+            data["server_message_types"] = {str(kind): count for kind, count
+                                            in self.wire.server.message_types.items()}
+            data["server_encodings"] = {str(kind): count for kind, count
+                                        in self.wire.server.encodings.items()}
+            data["frames"] = self.wire.server.frames
+            data["dropped_keys"] = self.wire.client.dropped_keys
+            if self.stream_error:
+                data["stream_error"] = self.stream_error
         if self.recovery is not None:
             data.update(self.recovery.counters())
         if (isinstance(self.denied, dict)

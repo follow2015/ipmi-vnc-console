@@ -15,11 +15,11 @@ from . import services
 from .data_plane import _template_regex
 from ..capability import parse_logout_path
 from ..rfb_protocol import PROTOCOLS
-from ..driver_specs import CONSOLE_DRIVERS
+from ..driver_specs import CONSOLE_IMPL_NAMES, RFB_RELAY_ADAPTER_ID, parse_access_params, resolve_adapter
 from .models import PROFILE_DRAFT, VendorProfile, json_field
 
 MESSAGE_PROFILES = frozenset({"standard", "insyde", "smc"})
-CONSOLE_IMPLS = frozenset(CONSOLE_DRIVERS)
+CONSOLE_IMPLS = CONSOLE_IMPL_NAMES
 RFB_GREETING = re.compile(r"^RFB \d{3}\.\d{3}$")
 CODE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 
@@ -28,6 +28,7 @@ _SPEC_FIELDS = frozenset({
     "firmware_max", "rfb_version", "message_profile", "asset_paths",
     "login_path", "logout_path", "console_impl", "licence",
     "concurrency_limit", "input_shaping", "protocol", "priority",
+    "access_params",
 })
 
 
@@ -94,6 +95,13 @@ def validate_spec(spec: dict, *, evidence: str) -> dict:
     console_impl = _text(spec, "console_impl") or "passthrough"
     if console_impl not in CONSOLE_IMPLS:
         raise SpecError("unsupported console_impl: " + console_impl)
+    try:
+        access_params = parse_access_params(spec.get("access_params") or {})
+    except ValueError as exc:
+        raise SpecError(f"access_params invalid: {exc}") from exc
+    if (console_impl == RFB_RELAY_ADAPTER_ID
+            and not access_params.get("port")):
+        raise SpecError("console_impl rfb-relay requires access_params.port")
     message_profile = _text(spec, "message_profile") or "standard"
     if message_profile not in MESSAGE_PROFILES:
         raise SpecError("unsupported message_profile: " + message_profile)
@@ -153,6 +161,7 @@ def validate_spec(spec: dict, *, evidence: str) -> dict:
         "logout_path": logout_path,
         "console_impl": console_impl,
         "protocol": protocol,
+        "access_params": access_params,
         "licence": _text(spec, "licence"),
         "concurrency_limit": _int(spec, "concurrency_limit", 1, minimum=1),
         "input_shaping": shaping,
@@ -172,6 +181,7 @@ def profile_matches_spec(profile: VendorProfile, spec: dict, *, evidence: str) -
         json.loads(profile.vendor_aliases or "[]") == fields["vendor_aliases"],
         json.loads(profile.asset_paths or "[]") == fields["asset_paths"],
         json.loads(profile.input_shaping or "{}") == fields["input_shaping"],
+        json.loads(getattr(profile, "access_params", "") or "{}") == fields["access_params"],
     ))
 
 
@@ -193,6 +203,7 @@ def create_draft_profile(session: Session, *, spec: dict, evidence: str,
         asset_paths=json_field(fields["asset_paths"]),
         login_path=fields["login_path"], logout_path=fields["logout_path"],
         console_impl=fields["console_impl"], protocol=fields["protocol"],
+        access_params=json_field(fields["access_params"]),
         licence=fields["licence"],
         concurrency_limit=fields["concurrency_limit"],
         input_shaping=json_field(fields["input_shaping"]),

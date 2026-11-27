@@ -11384,6 +11384,2874 @@ function createSoftKey({ body, tabs, status, getClient }) {
 		}
 	};
 }
+// console-v2/ast2100-decoder.js
+var Util = Object.freeze({
+	Debug() {},
+	Info() {},
+	Warn() {},
+	Error() {}
+});
+var ZIGZAG_ORDER = [
+	0,
+	1,
+	8,
+	16,
+	9,
+	2,
+	3,
+	10,
+	17,
+	24,
+	32,
+	25,
+	18,
+	11,
+	4,
+	5,
+	12,
+	19,
+	26,
+	33,
+	40,
+	48,
+	41,
+	34,
+	27,
+	20,
+	13,
+	6,
+	7,
+	14,
+	21,
+	28,
+	35,
+	42,
+	49,
+	56,
+	57,
+	50,
+	43,
+	36,
+	29,
+	22,
+	15,
+	23,
+	30,
+	37,
+	44,
+	51,
+	58,
+	59,
+	52,
+	45,
+	38,
+	31,
+	39,
+	46,
+	53,
+	60,
+	61,
+	54,
+	47,
+	55,
+	62,
+	63
+];
+var BITS_DC_LUMA = [
+	0,
+	0,
+	1,
+	5,
+	1,
+	1,
+	1,
+	1,
+	1,
+	1,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0
+];
+var HUFFVAL_DC_LUMA = [
+	0,
+	1,
+	2,
+	3,
+	4,
+	5,
+	6,
+	7,
+	8,
+	9,
+	10,
+	11
+];
+var BITS_DC_CHROMA = [
+	0,
+	0,
+	3,
+	1,
+	1,
+	1,
+	1,
+	1,
+	1,
+	1,
+	1,
+	1,
+	0,
+	0,
+	0,
+	0,
+	0
+];
+var HUFFVAL_DC_CHROMA = [
+	0,
+	1,
+	2,
+	3,
+	4,
+	5,
+	6,
+	7,
+	8,
+	9,
+	10,
+	11
+];
+var BITS_AC_LUMA = [
+	0,
+	0,
+	2,
+	1,
+	3,
+	3,
+	2,
+	4,
+	3,
+	5,
+	5,
+	4,
+	4,
+	0,
+	0,
+	1,
+	125
+];
+var HUFFVAL_AC_LUMA = [
+	1,
+	2,
+	3,
+	0,
+	4,
+	17,
+	5,
+	18,
+	33,
+	49,
+	65,
+	6,
+	19,
+	81,
+	97,
+	7,
+	34,
+	113,
+	20,
+	50,
+	129,
+	145,
+	161,
+	8,
+	35,
+	66,
+	177,
+	193,
+	21,
+	82,
+	209,
+	240,
+	36,
+	51,
+	98,
+	114,
+	130,
+	9,
+	10,
+	22,
+	23,
+	24,
+	25,
+	26,
+	37,
+	38,
+	39,
+	40,
+	41,
+	42,
+	52,
+	53,
+	54,
+	55,
+	56,
+	57,
+	58,
+	67,
+	68,
+	69,
+	70,
+	71,
+	72,
+	73,
+	74,
+	83,
+	84,
+	85,
+	86,
+	87,
+	88,
+	89,
+	90,
+	99,
+	100,
+	101,
+	102,
+	103,
+	104,
+	105,
+	106,
+	115,
+	116,
+	117,
+	118,
+	119,
+	120,
+	121,
+	122,
+	131,
+	132,
+	133,
+	134,
+	135,
+	136,
+	137,
+	138,
+	146,
+	147,
+	148,
+	149,
+	150,
+	151,
+	152,
+	153,
+	154,
+	162,
+	163,
+	164,
+	165,
+	166,
+	167,
+	168,
+	169,
+	170,
+	178,
+	179,
+	180,
+	181,
+	182,
+	183,
+	184,
+	185,
+	186,
+	194,
+	195,
+	196,
+	197,
+	198,
+	199,
+	200,
+	201,
+	202,
+	210,
+	211,
+	212,
+	213,
+	214,
+	215,
+	216,
+	217,
+	218,
+	225,
+	226,
+	227,
+	228,
+	229,
+	230,
+	231,
+	232,
+	233,
+	234,
+	241,
+	242,
+	243,
+	244,
+	245,
+	246,
+	247,
+	248,
+	249,
+	250
+];
+var BITS_AC_CHROMA = [
+	0,
+	0,
+	2,
+	1,
+	2,
+	4,
+	4,
+	3,
+	4,
+	7,
+	5,
+	4,
+	4,
+	0,
+	1,
+	2,
+	119
+];
+var HUFFVAL_AC_CHROMA = [
+	0,
+	1,
+	2,
+	3,
+	17,
+	4,
+	5,
+	33,
+	49,
+	6,
+	18,
+	65,
+	81,
+	7,
+	97,
+	113,
+	19,
+	34,
+	50,
+	129,
+	8,
+	20,
+	66,
+	145,
+	161,
+	177,
+	193,
+	9,
+	35,
+	51,
+	82,
+	240,
+	21,
+	98,
+	114,
+	209,
+	10,
+	22,
+	36,
+	52,
+	225,
+	37,
+	241,
+	23,
+	24,
+	25,
+	26,
+	38,
+	39,
+	40,
+	41,
+	42,
+	53,
+	54,
+	55,
+	56,
+	57,
+	58,
+	67,
+	68,
+	69,
+	70,
+	71,
+	72,
+	73,
+	74,
+	83,
+	84,
+	85,
+	86,
+	87,
+	88,
+	89,
+	90,
+	99,
+	100,
+	101,
+	102,
+	103,
+	104,
+	105,
+	106,
+	115,
+	116,
+	117,
+	118,
+	119,
+	120,
+	121,
+	122,
+	130,
+	131,
+	132,
+	133,
+	134,
+	135,
+	136,
+	137,
+	138,
+	146,
+	147,
+	148,
+	149,
+	150,
+	151,
+	152,
+	153,
+	154,
+	162,
+	163,
+	164,
+	165,
+	166,
+	167,
+	168,
+	169,
+	170,
+	178,
+	179,
+	180,
+	181,
+	182,
+	183,
+	184,
+	185,
+	186,
+	194,
+	195,
+	196,
+	197,
+	198,
+	199,
+	200,
+	201,
+	202,
+	210,
+	211,
+	212,
+	213,
+	214,
+	215,
+	216,
+	217,
+	218,
+	226,
+	227,
+	228,
+	229,
+	230,
+	231,
+	232,
+	233,
+	234,
+	242,
+	243,
+	244,
+	245,
+	246,
+	247,
+	248,
+	249,
+	250
+];
+var ATEN_QT_LUMA = [
+	[
+		20,
+		13,
+		12,
+		20,
+		30,
+		50,
+		63,
+		76,
+		15,
+		15,
+		17,
+		23,
+		32,
+		72,
+		75,
+		68,
+		17,
+		16,
+		20,
+		30,
+		50,
+		71,
+		86,
+		70,
+		17,
+		21,
+		27,
+		36,
+		63,
+		108,
+		100,
+		77,
+		22,
+		27,
+		46,
+		70,
+		85,
+		136,
+		128,
+		96,
+		30,
+		43,
+		68,
+		80,
+		101,
+		130,
+		141,
+		115,
+		61,
+		80,
+		97,
+		108,
+		128,
+		151,
+		150,
+		126,
+		90,
+		115,
+		118,
+		122,
+		140,
+		125,
+		128,
+		123
+	],
+	[
+		17,
+		12,
+		10,
+		17,
+		26,
+		43,
+		55,
+		66,
+		13,
+		13,
+		15,
+		20,
+		28,
+		63,
+		65,
+		60,
+		15,
+		14,
+		17,
+		26,
+		43,
+		62,
+		75,
+		61,
+		15,
+		18,
+		24,
+		31,
+		55,
+		95,
+		87,
+		67,
+		19,
+		24,
+		40,
+		61,
+		74,
+		119,
+		112,
+		84,
+		26,
+		38,
+		60,
+		70,
+		88,
+		113,
+		123,
+		100,
+		53,
+		70,
+		85,
+		95,
+		112,
+		132,
+		131,
+		110,
+		78,
+		100,
+		103,
+		107,
+		122,
+		109,
+		112,
+		108
+	],
+	[
+		14,
+		9,
+		9,
+		14,
+		21,
+		36,
+		46,
+		55,
+		10,
+		10,
+		12,
+		17,
+		23,
+		52,
+		54,
+		49,
+		12,
+		11,
+		14,
+		21,
+		36,
+		51,
+		62,
+		50,
+		12,
+		15,
+		19,
+		26,
+		46,
+		78,
+		72,
+		56,
+		16,
+		19,
+		33,
+		50,
+		61,
+		98,
+		93,
+		69,
+		21,
+		31,
+		49,
+		58,
+		73,
+		94,
+		102,
+		83,
+		44,
+		58,
+		70,
+		78,
+		93,
+		109,
+		108,
+		91,
+		65,
+		83,
+		86,
+		88,
+		101,
+		90,
+		93,
+		89
+	],
+	[
+		11,
+		7,
+		7,
+		11,
+		17,
+		28,
+		36,
+		43,
+		8,
+		8,
+		10,
+		13,
+		18,
+		41,
+		43,
+		39,
+		10,
+		9,
+		11,
+		17,
+		28,
+		40,
+		49,
+		40,
+		10,
+		12,
+		15,
+		20,
+		36,
+		62,
+		57,
+		44,
+		12,
+		15,
+		26,
+		40,
+		48,
+		78,
+		74,
+		55,
+		17,
+		25,
+		39,
+		46,
+		58,
+		74,
+		81,
+		66,
+		35,
+		46,
+		56,
+		62,
+		74,
+		86,
+		86,
+		72,
+		51,
+		66,
+		68,
+		70,
+		80,
+		71,
+		74,
+		71
+	],
+	[
+		9,
+		6,
+		5,
+		9,
+		13,
+		22,
+		28,
+		34,
+		6,
+		6,
+		7,
+		10,
+		14,
+		32,
+		33,
+		30,
+		7,
+		7,
+		9,
+		13,
+		22,
+		32,
+		38,
+		31,
+		7,
+		9,
+		12,
+		16,
+		28,
+		48,
+		45,
+		34,
+		10,
+		12,
+		20,
+		31,
+		38,
+		61,
+		57,
+		43,
+		13,
+		19,
+		30,
+		36,
+		45,
+		58,
+		63,
+		51,
+		27,
+		36,
+		43,
+		48,
+		57,
+		68,
+		67,
+		56,
+		40,
+		51,
+		53,
+		55,
+		63,
+		56,
+		57,
+		55
+	],
+	[
+		6,
+		4,
+		3,
+		6,
+		9,
+		15,
+		19,
+		22,
+		4,
+		4,
+		5,
+		7,
+		9,
+		21,
+		22,
+		20,
+		5,
+		4,
+		6,
+		9,
+		15,
+		21,
+		25,
+		21,
+		5,
+		6,
+		8,
+		10,
+		19,
+		32,
+		30,
+		23,
+		6,
+		8,
+		13,
+		21,
+		25,
+		40,
+		38,
+		28,
+		9,
+		13,
+		20,
+		24,
+		30,
+		39,
+		42,
+		34,
+		18,
+		24,
+		29,
+		32,
+		38,
+		45,
+		45,
+		37,
+		27,
+		34,
+		35,
+		36,
+		42,
+		37,
+		38,
+		37
+	],
+	[
+		3,
+		2,
+		1,
+		3,
+		4,
+		7,
+		9,
+		11,
+		2,
+		2,
+		2,
+		3,
+		4,
+		10,
+		11,
+		10,
+		2,
+		2,
+		3,
+		4,
+		7,
+		10,
+		12,
+		10,
+		2,
+		3,
+		4,
+		5,
+		9,
+		16,
+		15,
+		11,
+		3,
+		4,
+		6,
+		10,
+		12,
+		20,
+		19,
+		14,
+		4,
+		6,
+		10,
+		12,
+		15,
+		19,
+		21,
+		17,
+		9,
+		12,
+		14,
+		16,
+		19,
+		22,
+		22,
+		18,
+		13,
+		17,
+		17,
+		18,
+		21,
+		18,
+		19,
+		18
+	],
+	[
+		2,
+		1,
+		1,
+		2,
+		3,
+		5,
+		6,
+		7,
+		1,
+		1,
+		1,
+		2,
+		3,
+		7,
+		7,
+		6,
+		1,
+		1,
+		2,
+		3,
+		5,
+		7,
+		8,
+		7,
+		1,
+		2,
+		2,
+		3,
+		6,
+		10,
+		10,
+		7,
+		2,
+		2,
+		4,
+		7,
+		8,
+		13,
+		12,
+		9,
+		3,
+		4,
+		6,
+		8,
+		10,
+		13,
+		14,
+		11,
+		6,
+		8,
+		9,
+		10,
+		12,
+		15,
+		15,
+		12,
+		9,
+		11,
+		11,
+		12,
+		14,
+		12,
+		12,
+		12
+	],
+	[
+		2,
+		1,
+		1,
+		2,
+		3,
+		5,
+		6,
+		7,
+		1,
+		1,
+		1,
+		2,
+		3,
+		7,
+		7,
+		6,
+		1,
+		1,
+		2,
+		3,
+		5,
+		7,
+		8,
+		7,
+		1,
+		2,
+		2,
+		3,
+		6,
+		10,
+		10,
+		7,
+		2,
+		2,
+		4,
+		7,
+		8,
+		13,
+		12,
+		9,
+		3,
+		4,
+		6,
+		8,
+		10,
+		13,
+		14,
+		11,
+		6,
+		8,
+		9,
+		10,
+		12,
+		15,
+		15,
+		12,
+		9,
+		11,
+		11,
+		12,
+		14,
+		12,
+		12,
+		12
+	],
+	[
+		1,
+		1,
+		1,
+		1,
+		2,
+		3,
+		4,
+		5,
+		1,
+		1,
+		1,
+		1,
+		2,
+		5,
+		5,
+		5,
+		1,
+		1,
+		1,
+		2,
+		3,
+		5,
+		6,
+		5,
+		1,
+		1,
+		2,
+		2,
+		4,
+		8,
+		7,
+		5,
+		1,
+		2,
+		3,
+		5,
+		6,
+		10,
+		9,
+		7,
+		2,
+		3,
+		5,
+		6,
+		7,
+		9,
+		10,
+		8,
+		4,
+		6,
+		7,
+		8,
+		9,
+		11,
+		11,
+		9,
+		6,
+		8,
+		8,
+		9,
+		10,
+		9,
+		9,
+		9
+	],
+	[
+		1,
+		1,
+		1,
+		1,
+		1,
+		2,
+		3,
+		3,
+		1,
+		1,
+		1,
+		1,
+		1,
+		3,
+		3,
+		3,
+		1,
+		1,
+		1,
+		1,
+		2,
+		3,
+		4,
+		3,
+		1,
+		1,
+		1,
+		1,
+		3,
+		5,
+		5,
+		3,
+		1,
+		1,
+		2,
+		3,
+		4,
+		6,
+		6,
+		4,
+		1,
+		2,
+		3,
+		4,
+		5,
+		6,
+		7,
+		5,
+		3,
+		4,
+		4,
+		5,
+		6,
+		7,
+		7,
+		6,
+		4,
+		5,
+		5,
+		6,
+		7,
+		6,
+		6,
+		6
+	],
+	[
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		2,
+		1,
+		1,
+		1,
+		1,
+		1,
+		1,
+		2,
+		2,
+		1,
+		1,
+		1,
+		1,
+		1,
+		2,
+		3,
+		3,
+		2,
+		1,
+		1,
+		1,
+		2,
+		2,
+		3,
+		3,
+		2,
+		1,
+		2,
+		2,
+		2,
+		3,
+		3,
+		3,
+		3,
+		2,
+		2,
+		2,
+		3,
+		3,
+		3,
+		3,
+		3
+	]
+];
+var ATEN_QT_CHROMA = [
+	[
+		31,
+		33,
+		45,
+		88,
+		185,
+		185,
+		185,
+		185,
+		33,
+		39,
+		48,
+		123,
+		185,
+		185,
+		185,
+		185,
+		45,
+		48,
+		105,
+		185,
+		185,
+		185,
+		185,
+		185,
+		88,
+		123,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185,
+		185
+	],
+	[
+		27,
+		29,
+		39,
+		76,
+		160,
+		160,
+		160,
+		160,
+		29,
+		34,
+		42,
+		107,
+		160,
+		160,
+		160,
+		160,
+		39,
+		42,
+		91,
+		160,
+		160,
+		160,
+		160,
+		160,
+		76,
+		107,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160,
+		160
+	],
+	[
+		22,
+		24,
+		32,
+		63,
+		133,
+		133,
+		133,
+		133,
+		24,
+		28,
+		34,
+		88,
+		133,
+		133,
+		133,
+		133,
+		32,
+		34,
+		75,
+		133,
+		133,
+		133,
+		133,
+		133,
+		63,
+		88,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133,
+		133
+	],
+	[
+		18,
+		19,
+		26,
+		51,
+		108,
+		108,
+		108,
+		108,
+		19,
+		22,
+		28,
+		72,
+		108,
+		108,
+		108,
+		108,
+		26,
+		28,
+		61,
+		108,
+		108,
+		108,
+		108,
+		108,
+		51,
+		72,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108,
+		108
+	],
+	[
+		13,
+		14,
+		19,
+		38,
+		80,
+		80,
+		80,
+		80,
+		14,
+		17,
+		21,
+		53,
+		80,
+		80,
+		80,
+		80,
+		19,
+		21,
+		45,
+		80,
+		80,
+		80,
+		80,
+		80,
+		38,
+		53,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80,
+		80
+	],
+	[
+		9,
+		10,
+		13,
+		26,
+		55,
+		55,
+		55,
+		55,
+		10,
+		11,
+		14,
+		37,
+		55,
+		55,
+		55,
+		55,
+		13,
+		14,
+		31,
+		55,
+		55,
+		55,
+		55,
+		55,
+		26,
+		37,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55,
+		55
+	],
+	[
+		4,
+		5,
+		6,
+		13,
+		27,
+		27,
+		27,
+		27,
+		5,
+		5,
+		7,
+		18,
+		27,
+		27,
+		27,
+		27,
+		6,
+		7,
+		15,
+		27,
+		27,
+		27,
+		27,
+		27,
+		13,
+		18,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27,
+		27
+	],
+	[
+		3,
+		3,
+		4,
+		8,
+		18,
+		18,
+		18,
+		18,
+		3,
+		3,
+		4,
+		12,
+		18,
+		18,
+		18,
+		18,
+		4,
+		4,
+		10,
+		18,
+		18,
+		18,
+		18,
+		18,
+		8,
+		12,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18,
+		18
+	],
+	[
+		2,
+		2,
+		3,
+		7,
+		15,
+		15,
+		15,
+		15,
+		2,
+		3,
+		4,
+		10,
+		15,
+		15,
+		15,
+		15,
+		3,
+		4,
+		8,
+		15,
+		15,
+		15,
+		15,
+		15,
+		7,
+		10,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15,
+		15
+	],
+	[
+		2,
+		2,
+		3,
+		5,
+		12,
+		12,
+		12,
+		12,
+		2,
+		2,
+		3,
+		8,
+		12,
+		12,
+		12,
+		12,
+		3,
+		3,
+		7,
+		12,
+		12,
+		12,
+		12,
+		12,
+		5,
+		8,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12,
+		12
+	],
+	[
+		1,
+		1,
+		2,
+		4,
+		9,
+		9,
+		9,
+		9,
+		1,
+		1,
+		2,
+		6,
+		9,
+		9,
+		9,
+		9,
+		2,
+		2,
+		5,
+		9,
+		9,
+		9,
+		9,
+		9,
+		4,
+		6,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9,
+		9
+	],
+	[
+		1,
+		1,
+		1,
+		2,
+		6,
+		6,
+		6,
+		6,
+		1,
+		1,
+		1,
+		4,
+		6,
+		6,
+		6,
+		6,
+		1,
+		1,
+		3,
+		6,
+		6,
+		6,
+		6,
+		6,
+		2,
+		4,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6,
+		6
+	]
+];
+var AAN_IDCT_SCALING_FACTORS = [
+	1,
+	1.387039845,
+	1.306562965,
+	1.175875602,
+	1,
+	.785694958,
+	.5411961,
+	.275899379
+];
+var YUVTORGB_CR_G_TABLE = /* @__PURE__ */ new Int32Array(256);
+var YUVTORGB_CR_R_TABLE = /* @__PURE__ */ new Int32Array(256);
+var YUVTORGB_CB_G_TABLE = /* @__PURE__ */ new Int32Array(256);
+var YUVTORGB_CB_B_TABLE = /* @__PURE__ */ new Int32Array(256);
+var YUVTORGB_Y_TABLE = /* @__PURE__ */ new Int32Array(256);
+for (var i = 0; i < 256; ++i) {
+	YUVTORGB_CR_G_TABLE[i] = 6848512 - i * 53248 >> 16;
+	YUVTORGB_CR_R_TABLE[i] = 4281597952 + i * 104704 >> 16;
+	YUVTORGB_CB_G_TABLE[i] = 3309568 - i * 25600 >> 16;
+	YUVTORGB_CB_B_TABLE[i] = 4278091776 + i * 132096 >> 16;
+	YUVTORGB_Y_TABLE[i] = 4293779520 + i * 76284 >> 16;
+}
+var TABLE_CLASS_DC = 0;
+var TABLE_CLASS_AC = 1;
+var DCTSIZE = 8;
+var DCTSIZE2 = DCTSIZE * DCTSIZE;
+var fmt_u8 = function(x) {
+	var pad = "00";
+	var s = x.toString(16);
+	return pad.substring(0, pad.length - s.length) + s;
+};
+var fmt_u16 = function(x) {
+	var pad = "0000";
+	var s = x.toString(16);
+	return pad.substring(0, pad.length - s.length) + s;
+};
+var fmt_u32 = function(x) {
+	return fmt_u16(x >>> 16) + fmt_u16(x & 65535);
+};
+var inRangeIncl = function(x, a, b) {
+	return x >= a && x <= b;
+};
+var swap32 = function(val) {
+	return (val & 255) << 24 | (val & 65280) << 8 | val >> 8 & 65280 | val >> 24 & 255;
+};
+var isEmpty = function(obj) {
+	for (var prop in obj) if (obj.hasOwnProperty(prop)) return false;
+	return true;
+};
+var clamp = function(x) {
+	x = ~~x;
+	if (x <= 0) return 0;
+	if (x >= 255) return 255;
+	return x;
+};
+var BitStream;
+var JpegHuffmanTable;
+(function() {
+	"use strict";
+	BitStream = function(defaults) {
+		this._interpretMarkers = false;
+		this._eoi = false;
+		this._data = defaults.data;
+		if (this._data === void 0) throw "BitStream constructor requires argument \"data\"!";
+		this._nextDword = 0;
+		this._reservoir = 0;
+		this._bitsInReservoir = 0;
+		this._refill();
+		this._readbuf = this._reservoir;
+		this._reservoir = 0;
+		this._bitsInReservoir = 0;
+		this._refill();
+	};
+	BitStream.prototype = {
+		getPos: function() {
+			return this._nextDword * 32 - (32 + this._bitsInReservoir);
+		},
+		skip: function(bits) {
+			while (bits > 0) {
+				var n = Math.min(32, bits);
+				this.read(n);
+				bits -= n;
+			}
+		},
+		read: function(bits) {
+			if (bits >= 32) throw "Number of bits must be less than 32.";
+			var that = this;
+			var moveFromReservoir = function(n) {
+				that._readbuf = that._readbuf << n | that._reservoir >>> 32 - n;
+				that._reservoir <<= n;
+				that._bitsInReservoir -= n;
+			};
+			var retval = this._readbuf >>> 32 - bits;
+			if (bits > this._bitsInReservoir) {
+				bits -= this._bitsInReservoir;
+				moveFromReservoir(this._bitsInReservoir);
+				this._refill();
+			}
+			moveFromReservoir(bits);
+			return retval;
+		},
+		_refill: function() {
+			if (this._bitsInReservoir != 0) throw "Oops: in _refill(),  bitsInReservoir=" + this._bitsInReservoir;
+			for (var i = 0; i < 4; ++i) {
+				var x = this._data[4 * this._nextDword + i];
+				if (x === void 0) throw "BitStream overran available data!";
+				this._reservoir = this._reservoir << 8 | x;
+				this._bitsInReservoir += 8;
+			}
+			this._nextDword += 1;
+			this._reservoir = swap32(this._reservoir);
+		},
+		peek: function(bits) {
+			if (bits >= 32) throw "Number of bits must be less than 32.";
+			return this._readbuf >>> 32 - bits;
+		},
+		showDebug: function() {
+			console.log("stream readbuf=" + fmt_u32(this._readbuf) + " reservoir=" + fmt_u32(this._reservoir) + " bitsLeft=" + this._bitsInReservoir + "d nextDword=" + fmt_u16(this._nextDword));
+		},
+		checkInvariants: function() {
+			var err = null;
+			if (this._bitsInReservoir < 0 || this._bitsInReservoir > 32) err = "Oops: BitStream invariant violated:  bitsInReservoir=" + this._bitsInReservoir;
+			if (err) {
+				console.log(err);
+				this.showDebug();
+				throw err;
+			}
+		}
+	};
+	JpegHuffmanTable = function(defaults) {
+		if (!defaults) defaults = {};
+		if (!defaults.bits || !defaults.huffval) throw "Arguments bits, huffval are required.";
+		this._huffsize = /* @__PURE__ */ new Uint8Array(65536);
+		this._huffval_lookup = /* @__PURE__ */ new Uint8Array(65536);
+		this._bits = /* @__PURE__ */ new Uint8Array(17);
+		this._buildTables(defaults.bits, defaults.huffval);
+	};
+	JpegHuffmanTable.prototype = {
+		_buildTables: function(bits, huffval) {
+			for (var i = 0; i < 17; ++i) {
+				this._bits[i] = bits[i];
+				if (1 << i <= bits[i]) throw "Oops: bad BITS.";
+			}
+			var next_codeword = 0;
+			var codeword_idx = 0;
+			for (var code_len = 1; code_len < 17; ++code_len) for (var i = 0; i < this._bits[code_len]; ++i) {
+				for (var j = 0; j < 1 << 16 - code_len; ++j) {
+					this._huffsize[next_codeword + j] = code_len;
+					this._huffval_lookup[next_codeword + j] = huffval[codeword_idx];
+				}
+				next_codeword += 1 << 16 - code_len;
+				codeword_idx += 1;
+			}
+			if (codeword_idx != huffval.length) throw "Oops: all codewords should be used!";
+		},
+		readCode: function(stream) {
+			var fixedlenCode = stream.peek(16);
+			var codeLen = this._huffsize[fixedlenCode];
+			stream.skip(codeLen);
+			return this._huffval_lookup[fixedlenCode];
+		}
+	};
+})();
+var AST2100IDCT;
+var FIX_1_082392200 = 277;
+var FIX_1_414213562 = 362;
+var FIX_1_847759065 = 473;
+var FIX_2_613125930 = 669;
+var CONST_BITS = 8;
+var PASS1_BITS = 0;
+var range_limit = function(x) {
+	x += 128;
+	return Math.max(0, Math.min(255, x));
+};
+var fixed_dequant = function(scaled_quant_table, buf, i) {
+	return fixed_mul(scaled_quant_table[i], buf[i]);
+};
+var descale = function(x, n) {
+	return x >> n;
+};
+var idescale = descale;
+var END_PASS1_DESCALE_BITS = CONST_BITS;
+var fixed_mul = function(a, b) {
+	return descale(a * b, CONST_BITS);
+};
+(function() {
+	"use strict";
+	AST2100IDCT = {
+		idct_fixed_aan: function(scaled_quant_table, buf, dstBuf) {
+			var workspace = /* @__PURE__ */ new Int32Array(64);
+			for (var x = 0; x < 8; ++x) AST2100IDCT._aan_idct_col(scaled_quant_table, buf, workspace, x);
+			for (var y = 0; y < 8; ++y) AST2100IDCT._aan_idct_row(scaled_quant_table, dstBuf, workspace, y);
+			return dstBuf;
+		},
+		_aan_idct_col: function(scaled_quant_table, buf, workspace, x) {
+			var dequant = function(idx) {
+				return fixed_dequant(scaled_quant_table, buf, idx);
+			};
+			var mul = fixed_mul;
+			var y;
+			var all_ac_zero = true;
+			for (y = 1; y < 8; ++y) if (buf[8 * y + x] != 0) {
+				all_ac_zero = false;
+				break;
+			}
+			if (all_ac_zero) {
+				buf[0 + x];
+				scaled_quant_table[0 + x];
+				var dcval = idescale(dequant(0 + x), END_PASS1_DESCALE_BITS);
+				for (y = 0; y < 8; ++y) workspace[8 * y + x] = dcval;
+				return;
+			}
+			var tmp0 = dequant(0 + x);
+			var tmp1 = dequant(16 + x);
+			var tmp2 = dequant(32 + x);
+			var tmp3 = dequant(48 + x);
+			var tmp10 = tmp0 + tmp2;
+			var tmp11 = tmp0 - tmp2;
+			var tmp13 = tmp1 + tmp3;
+			var tmp12 = mul(tmp1 - tmp3, FIX_1_414213562) - tmp13;
+			tmp0 = tmp10 + tmp13;
+			tmp3 = tmp10 - tmp13;
+			tmp1 = tmp11 + tmp12;
+			tmp2 = tmp11 - tmp12;
+			var tmp4 = dequant(8 + x);
+			var tmp5 = dequant(24 + x);
+			var tmp6 = dequant(40 + x);
+			var tmp7 = dequant(56 + x);
+			var z13 = tmp6 + tmp5;
+			var z10 = tmp6 - tmp5;
+			var z11 = tmp4 + tmp7;
+			var z12 = tmp4 - tmp7;
+			tmp7 = z11 + z13;
+			tmp11 = mul(z11 - z13, FIX_1_414213562);
+			var z5 = mul(z10 + z12, FIX_1_847759065);
+			tmp10 = mul(FIX_1_082392200, z12) - z5;
+			tmp12 = mul(-FIX_2_613125930, z10) + z5;
+			tmp6 = tmp12 - tmp7;
+			tmp5 = tmp11 - tmp6;
+			tmp4 = tmp10 + tmp5;
+			workspace[x + 0] = idescale(tmp0 + tmp7, END_PASS1_DESCALE_BITS);
+			workspace[x + 56] = idescale(tmp0 - tmp7, END_PASS1_DESCALE_BITS);
+			workspace[x + 8] = idescale(tmp1 + tmp6, END_PASS1_DESCALE_BITS);
+			workspace[x + 48] = idescale(tmp1 - tmp6, END_PASS1_DESCALE_BITS);
+			workspace[x + 16] = idescale(tmp2 + tmp5, END_PASS1_DESCALE_BITS);
+			workspace[x + 40] = idescale(tmp2 - tmp5, END_PASS1_DESCALE_BITS);
+			workspace[x + 32] = idescale(tmp3 + tmp4, END_PASS1_DESCALE_BITS);
+			workspace[x + 24] = idescale(tmp3 - tmp4, END_PASS1_DESCALE_BITS);
+		},
+		_aan_idct_row: function(scaled_quant_table, buf, workspace, y) {
+			var wsptr = function(x) {
+				return workspace[8 * y + x];
+			};
+			var mul = fixed_mul;
+			var tmp10 = wsptr(0) + wsptr(4);
+			var tmp11 = wsptr(0) - wsptr(4);
+			var tmp13 = wsptr(2) + wsptr(6);
+			var tmp12 = mul(wsptr(2) - wsptr(6), FIX_1_414213562) - tmp13;
+			var tmp0 = tmp10 + tmp13;
+			var tmp3 = tmp10 - tmp13;
+			var tmp1 = tmp11 + tmp12;
+			var tmp2 = tmp11 - tmp12;
+			var z13 = wsptr(5) + wsptr(3);
+			var z10 = wsptr(5) - wsptr(3);
+			var z11 = wsptr(1) + wsptr(7);
+			var z12 = wsptr(1) - wsptr(7);
+			var tmp7 = z11 + z13;
+			tmp11 = mul(z11 - z13, FIX_1_414213562);
+			var z5 = mul(z10 + z12, FIX_1_847759065);
+			tmp10 = mul(FIX_1_082392200, z12) - z5;
+			tmp12 = mul(-FIX_2_613125930, z10) + z5;
+			var tmp6 = tmp12 - tmp7;
+			var tmp5 = tmp11 - tmp6;
+			var tmp4 = tmp10 + tmp5;
+			var set_out = function(x, val) {
+				val = idescale(val, PASS1_BITS + 3);
+				val = range_limit(val);
+				buf[y * 8 + x] = val;
+			};
+			set_out(0, tmp0 + tmp7);
+			set_out(7, tmp0 - tmp7);
+			set_out(1, tmp1 + tmp6);
+			set_out(6, tmp0 - tmp6);
+			set_out(2, tmp2 + tmp5);
+			set_out(5, tmp2 - tmp5);
+			set_out(4, tmp3 + tmp4);
+			set_out(3, tmp3 - tmp4);
+		}
+	};
+})();
+var verboseMcuCount = false;
+var traceUpdates = false;
+var verboseStats = false;
+var verboseVideoSettings = false;
+var Ast2100Decoder;
+(function() {
+	"use strict";
+	Ast2100Decoder = function(defaults) {
+		this._blitCallback = defaults.blitCallback;
+		this._videoSettingsChangedCallback = defaults.videoSettingsChangedCallback;
+		this._frame_width = defaults.width;
+		this._frame_height = defaults.height;
+		if (!this._frame_width || !this._frame_height) throw "Missing required parameter: width, height";
+		this.subsamplingMode = -1;
+		this.quantTables = [/* @__PURE__ */ new Int32Array(64), /* @__PURE__ */ new Int32Array(64)];
+		this._loadedQuantTables = [-1, -1];
+		this.huffTables = [[new JpegHuffmanTable({
+			bits: BITS_DC_LUMA,
+			huffval: HUFFVAL_DC_LUMA
+		}), new JpegHuffmanTable({
+			bits: BITS_DC_CHROMA,
+			huffval: HUFFVAL_DC_CHROMA
+		})], [new JpegHuffmanTable({
+			bits: BITS_AC_LUMA,
+			huffval: HUFFVAL_AC_LUMA
+		}), new JpegHuffmanTable({
+			bits: BITS_AC_CHROMA,
+			huffval: HUFFVAL_AC_CHROMA
+		})]];
+		this._scan_components = [
+			{
+				huffTableSelectorDC: 0,
+				huffTableSelectorAC: 0
+			},
+			{
+				huffTableSelectorDC: 1,
+				huffTableSelectorAC: 1
+			},
+			{
+				huffTableSelectorDC: 1,
+				huffTableSelectorAC: 1
+			}
+		];
+		this._scan_prev_dc = [
+			0,
+			0,
+			0
+		];
+		this._mcuPosX = 0;
+		this._mcuPosY = 0;
+		this._initializeVq();
+		this._tmpBufY = [
+			new Int16Array(DCTSIZE2),
+			new Int16Array(DCTSIZE2),
+			new Int16Array(DCTSIZE2),
+			new Int16Array(DCTSIZE2)
+		];
+		this._tmpBufCb = new Int16Array(DCTSIZE2);
+		this._tmpBufCr = new Int16Array(DCTSIZE2);
+		this._componentBufY = [
+			new Uint8Array(DCTSIZE2),
+			new Uint8Array(DCTSIZE2),
+			new Uint8Array(DCTSIZE2),
+			new Uint8Array(DCTSIZE2)
+		];
+		this._componentBufCb = new Uint8Array(DCTSIZE2);
+		this._componentBufCr = new Uint8Array(DCTSIZE2);
+		this._outputBuf = new Uint8Array(DCTSIZE2 * 4);
+	};
+	Ast2100Decoder.prototype = {
+		_idct: function(quant_table, data_unit, dstBuf) {
+			if (!quant_table) throw "Required argument missing: quant_table";
+			if (!data_unit) throw "Required argument missing: data_unit";
+			if (!dstBuf) throw "Required argument missing: dstBuf";
+			return AST2100IDCT.idct_fixed_aan(quant_table, data_unit, dstBuf);
+		},
+		_getMcuSize: function() {
+			return {
+				444: 8,
+				422: 16
+			}[this.subsamplingMode];
+		},
+		_loadQuantTable: function(slot, srcTable) {
+			for (var y = 0; y < 8; ++y) for (var x = 0; x < 8; ++x) this.quantTables[slot][y * 8 + x] = ~~(srcTable[y * 8 + x] * AAN_IDCT_SCALING_FACTORS[x] * AAN_IDCT_SCALING_FACTORS[y] * 65536);
+		},
+		_initializeVq: function() {
+			this._vqCodewordLookup = [
+				0,
+				1,
+				2,
+				3
+			];
+			this._vqCodebook = [
+				[
+					0,
+					128,
+					128
+				],
+				[
+					255,
+					128,
+					128
+				],
+				[
+					128,
+					128,
+					128
+				],
+				[
+					192,
+					128,
+					128
+				]
+			];
+		},
+		_advancePosition: function() {
+			var mcuSize = this._getMcuSize();
+			var widthInMcus = ~~(this._frame_width / mcuSize);
+			if (this._frame_width % mcuSize != 0) widthInMcus += 1;
+			var heightInMcus = ~~(this._frame_height / mcuSize);
+			if (this._frame_height % mcuSize != 0) heightInMcus += 1;
+			this._mcuPosX += 1;
+			if (this._mcuPosX >= widthInMcus) {
+				this._mcuPosX = 0;
+				this._mcuPosY += 1;
+			}
+			if (this._mcuPosY >= heightInMcus) this._mcuPosY = 0;
+		},
+		setSize: function(width, height) {
+			if (this._frame_width != width || this._frame_height != height) Util.Debug("Ast2100Decoder: frame height changed to " + width + "x" + height);
+			this._frame_width = width;
+			this._frame_height = height;
+		},
+		getVideoSettings: function() {
+			return {
+				quantTableSelectorLuma: this._loadedQuantTables[0],
+				quantTableSelectorChroma: this._loadedQuantTables[1],
+				subsamplingMode: this.subsamplingMode
+			};
+		},
+		decode: function(data) {
+			var mcuIdx = 0;
+			if (verboseStats) var blockTypeCounter = [
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				0
+			];
+			this._scan_prev_dc = [
+				0,
+				0,
+				0
+			];
+			this._mcuPosX = 0;
+			this._mcuPosY = 0;
+			var quantTableSelectorLuma = data[0];
+			var quantTableSelectorChroma = data[1];
+			var subsamplingMode = data[2] << 8 | data[3];
+			var changedSettings = false;
+			if (this.subsamplingMode != subsamplingMode) {
+				if (verboseVideoSettings) console.log("decode(): new subsampling mode: " + subsamplingMode);
+				this.subsamplingMode = subsamplingMode;
+				changedSettings = true;
+			}
+			this._stream = new BitStream({ data });
+			this._stream.skip(16);
+			this._stream.skip(16);
+			if (quantTableSelectorLuma != this._loadedQuantTables[0]) {
+				if (!inRangeIncl(quantTableSelectorLuma, 0, 11)) throw "Out-of-range selector for luma quant table: " + quantTableSelectorLuma.toString(16);
+				if (verboseVideoSettings) console.log("decode(): loading new luma quant table: " + fmt_u8(quantTableSelectorLuma));
+				this._loadQuantTable(0, ATEN_QT_LUMA[quantTableSelectorLuma]);
+				this._loadedQuantTables[0] = quantTableSelectorLuma;
+				changedSettings = true;
+			}
+			if (quantTableSelectorChroma != this._loadedQuantTables[1]) {
+				if (!inRangeIncl(quantTableSelectorChroma, 0, 11)) throw "Out-of-range selector for chroma quant table: " + quantTableSelectorChroma.toString(16);
+				if (verboseVideoSettings) console.log("decode(): loading new chroma quant table: " + fmt_u8(quantTableSelectorChroma));
+				this._loadQuantTable(1, ATEN_QT_CHROMA[quantTableSelectorChroma]);
+				this._loadedQuantTables[1] = quantTableSelectorChroma;
+				changedSettings = true;
+			}
+			if (this.subsamplingMode != 422 && this.subsamplingMode != 444) throw "Unexpected value for subsamplingMode: 0x" + fmt_u16(this.subsamplingMode);
+			if (changedSettings && this._videoSettingsChangedCallback) this._videoSettingsChangedCallback(this.getVideoSettings());
+			this._stream = new BitStream({ data });
+			this._stream.skip(16);
+			this._stream.skip(16);
+			while (true) {
+				var controlFlag = this._stream.read(4);
+				if (verboseStats) ++blockTypeCounter[controlFlag];
+				if (verboseMcuCount) {
+					console.log("MCU #" + mcuIdx + "- Control flag: " + controlFlag.toString(16));
+					console.log("  stream pos = " + this._stream.getPos());
+				}
+				if (controlFlag == 0 || controlFlag == 4 || controlFlag == 8 || controlFlag == 12) {
+					if (controlFlag == 8 || controlFlag == 12) {
+						this._mcuPosX = this._stream.read(8);
+						this._mcuPosY = this._stream.read(8);
+						if (traceUpdates) console.log("decode(): read new MCU pos: (0x" + fmt_u8(this._mcuPosX) + ",0x" + fmt_u8(this._mcuPosY) + ")");
+					}
+					if (controlFlag == 4 || controlFlag == 12) throw "Unexpected control flag: alternate quant table";
+					this._parseMcu();
+				} else if (inRangeIncl(controlFlag, 5, 7) || inRangeIncl(controlFlag, 13, 15)) {
+					if (controlFlag >= 13) {
+						this._mcuPosX = this._stream.read(8);
+						this._mcuPosY = this._stream.read(8);
+						if (traceUpdates) console.log("decode(): read new MCU pos: (0x" + fmt_u8(this._mcuPosX) + ",0x" + fmt_u8(this._mcuPosY) + ")");
+					}
+					var codewordSize = (controlFlag & 7) - 5;
+					this._parseVqBlock(codewordSize);
+				} else if (controlFlag == 9) break;
+				else throw "Unexpected control flag: unknown value 0x" + fmt_u8(controlFlag);
+				++mcuIdx;
+			}
+			if (traceUpdates) console.log("decode(): finished after " + mcuIdx + " blocks");
+			if (verboseStats) {
+				var counts = {};
+				for (var i = 0; i < 16; ++i) if (i != 9 && blockTypeCounter[i] > 0) counts[i] = blockTypeCounter[i];
+				if (!isEmpty(counts)) console.log(counts);
+			}
+		},
+		_parseVqBlock: function(codewordSize) {
+			if (this._getMcuSize() != 8) throw "Unexpected MCU size for VQ block!";
+			if (!inRangeIncl(codewordSize, 0, 2)) throw "Out-of-range codewordSize!";
+			var i;
+			var y_buf = this._componentBufY[0];
+			var cb_buf = this._componentBufCb;
+			var cr_buf = this._componentBufCr;
+			var that = this;
+			var setColor = function(j, codeword) {
+				var color = that._vqCodebook[that._vqCodewordLookup[codeword]];
+				y_buf[j] = color[0];
+				cb_buf[j] = color[1];
+				cr_buf[j] = color[2];
+			};
+			for (i = 0; i < 1 << codewordSize; ++i) {
+				var hasNewColor = this._stream.read(1);
+				var codebookSlotIdx = this._stream.read(2);
+				if (hasNewColor) {
+					var color = [
+						this._stream.read(8),
+						this._stream.read(8),
+						this._stream.read(8)
+					];
+					this._vqCodebook[codebookSlotIdx] = color;
+				}
+				this._vqCodewordLookup[i] = codebookSlotIdx;
+			}
+			if (codewordSize == 0) for (i = 0; i < 64; ++i) setColor(i, 0);
+			else for (i = 0; i < 64; ++i) setColor(i, this._stream.read(codewordSize));
+			for (var j = 0; j < 64; ++j) this._ycbcrToRgb(this._outputBuf, j, this._componentBufY[0][j], this._componentBufCb[j], this._componentBufCr[j]);
+			this._blitCallback(8 * this._mcuPosX, 8 * this._mcuPosY, 8, 8, this._outputBuf);
+			this._advancePosition();
+		},
+		_parseMcu: function() {
+			var qtLuma = this.quantTables[0];
+			var qtChroma = this.quantTables[1];
+			this._parseDataUnit(0, this._tmpBufY[0]);
+			this._idct(qtLuma, this._tmpBufY[0], this._componentBufY[0]);
+			if (this.subsamplingMode != 444) {
+				this._parseDataUnit(0, this._tmpBufY[1]);
+				this._idct(qtLuma, this._tmpBufY[1], this._componentBufY[1]);
+				this._parseDataUnit(0, this._tmpBufY[2]);
+				this._idct(qtLuma, this._tmpBufY[2], this._componentBufY[2]);
+				this._parseDataUnit(0, this._tmpBufY[3]);
+				this._idct(qtLuma, this._tmpBufY[3], this._componentBufY[3]);
+			}
+			this._parseDataUnit(1, this._tmpBufCb);
+			this._idct(qtChroma, this._tmpBufCb, this._componentBufCb);
+			this._parseDataUnit(2, this._tmpBufCr);
+			this._idct(qtChroma, this._tmpBufCr, this._componentBufCr);
+			if (this.subsamplingMode != 444) for (var dy = 0; dy < 2; ++dy) for (var dx = 0; dx < 2; ++dx) {
+				var componentBufY = this._componentBufY[dx * 2 + dy];
+				for (var y = 0; y < 8; ++y) for (var x = 0; x < 8; ++x) {
+					var hy = ~~((8 * dx + y) / 2);
+					var hx = ~~((8 * dy + x) / 2);
+					this._ycbcrToRgb(this._outputBuf, y * 8 + x, componentBufY[y * 8 + x], this._componentBufCb[hy * 8 + hx], this._componentBufCr[hy * 8 + hx]);
+				}
+				this._blitCallback(16 * this._mcuPosX + 8 * dy, 16 * this._mcuPosY + 8 * dx, 8, 8, this._outputBuf);
+			}
+			else {
+				for (var j = 0; j < 64; ++j) this._ycbcrToRgb(this._outputBuf, j, this._componentBufY[0][j], this._componentBufCb[j], this._componentBufCr[j]);
+				this._blitCallback(8 * this._mcuPosX, 8 * this._mcuPosY, 8, 8, this._outputBuf);
+			}
+			this._advancePosition();
+		},
+		_parseDataUnit: function(componentIdx, buf) {
+			var scanComponent = this._scan_components[componentIdx];
+			var dc_hufftable = this.huffTables[TABLE_CLASS_DC][scanComponent.huffTableSelectorDC];
+			var ac_hufftable = this.huffTables[TABLE_CLASS_AC][scanComponent.huffTableSelectorAC];
+			var setValue = function(i, val) {
+				buf[ZIGZAG_ORDER[i]] = val;
+			};
+			var dc_delta = this._readEncodedValueDC(dc_hufftable);
+			this._scan_prev_dc[componentIdx] += dc_delta;
+			buf[0] = this._scan_prev_dc[componentIdx];
+			for (var i = 1; i < 64;) {
+				var x = ac_hufftable.readCode(this._stream);
+				var runlen = x >>> 4;
+				var size = x & 15;
+				if (size == 0) {
+					if (runlen == 0) {
+						while (i < 64) {
+							setValue(i, 0);
+							++i;
+						}
+						break;
+					} else if (runlen == 15) {
+						for (var j = 0; j < 16; ++j) setValue(i + j, 0);
+						i += 16;
+						continue;
+					}
+				}
+				for (var j = 0; j < runlen; ++j) setValue(i + j, 0);
+				i += runlen;
+				setValue(i, this._readEncodedValueAC(size));
+				i += 1;
+			}
+			return buf;
+		},
+		_readEncodedValueDC: function(huffTable) {
+			var category = huffTable.readCode(this._stream);
+			return this._readEncodedValueAC(category);
+		},
+		_readEncodedValueAC: function(category) {
+			if (category == 0) return 0;
+			var value;
+			if (this._stream.read(1) == 0) value = -(1 << category) + 1;
+			else value = 1 << category - 1;
+			if (category > 1) {
+				var more_bits = this._stream.read(category - 1);
+				value += more_bits;
+			}
+			return value;
+		},
+		_ycbcrToRgb: function(outputBuf, outputOffset, y, cb, cr) {
+			outputOffset *= 4;
+			outputBuf[outputOffset + 0] = clamp(YUVTORGB_Y_TABLE[y] + YUVTORGB_CR_R_TABLE[cr]);
+			outputBuf[outputOffset + 1] = clamp(YUVTORGB_Y_TABLE[y] + YUVTORGB_CR_G_TABLE[cr] + YUVTORGB_CB_G_TABLE[cb]);
+			outputBuf[outputOffset + 2] = clamp(YUVTORGB_Y_TABLE[y] + YUVTORGB_CB_B_TABLE[cb]);
+			outputBuf[outputOffset + 3] = 255;
+		}
+	};
+})();
+// console-v2/ast2100.js
+var AST2100_CURSOR_TAG = -1095980099;
+var MAX_SIDE = 4096;
+var Ast2100Console = class {
+	constructor() {
+		this.width = 0;
+		this.height = 0;
+		this.shadow = null;
+		this.cursor = null;
+		this.decoder = null;
+		this.target = null;
+		this.decodeFailures = 0;
+		this.scratch = null;
+	}
+	frame(display, width, height, data, signal) {
+		if (!(width > 0 && height > 0 && width <= MAX_SIDE && height <= MAX_SIDE)) return;
+		if (width !== this.width || height !== this.height || this.shadow === null) {
+			this.width = width;
+			this.height = height;
+			this.shadow = new Uint8ClampedArray(width * height * 4);
+			this.cursor = null;
+			if (this.decoder !== null) this.decoder.setSize(width, height);
+		}
+		if (!signal) {
+			this.shadow.fill(0);
+			this.cursor = null;
+			display.fillRect(0, 0, width, height, "#000");
+			return;
+		}
+		if (this.decoder === null) this.decoder = new Ast2100Decoder({
+			width,
+			height,
+			blitCallback: (x, y, w, h, block) => this.blit(this.target, x, y, w, h, block),
+			videoSettingsChangedCallback() {}
+		});
+		this.target = display;
+		try {
+			this.decoder.decode(data);
+		} catch (err) {
+			if (this.decodeFailures++ < 5) console.warn("AST2100: frame decode failed", err);
+		}
+	}
+	cursorAt(display, x, y, width, height, rgba) {
+		if (!(width > 0 && height > 0 && rgba.length >= width * height * 4)) return;
+		this.cursor = {
+			x,
+			y,
+			width,
+			height,
+			rgba
+		};
+		if (this.shadow === null) return;
+		const x0 = Math.max(x, 0), y0 = Math.max(y, 0);
+		const x1 = Math.min(x + width, this.width), y1 = Math.min(y + height, this.height);
+		if (x0 >= x1 || y0 >= y1) return;
+		this.composite(x0, y0, x1 - x0, y1 - y0);
+		this.paint(display, x0, y0, x1 - x0, y1 - y0);
+	}
+	blit(display, x, y, width, height, block) {
+		const fw = this.width, fh = this.height;
+		if (x < 0 || y < 0 || x >= fw || y >= fh) return;
+		const x1 = Math.min(x + width, fw), y1 = Math.min(y + height, fh);
+		const shadow = this.shadow;
+		const span = (x1 - x) * 4;
+		for (let row = y; row < y1; row++) {
+			const from = (row - y) * width * 4;
+			shadow.set(block.subarray(from, from + span), (row * fw + x) * 4);
+		}
+		this.composite(x, y, x1 - x, y1 - y);
+		this.paint(display, x, y, x1 - x, y1 - y);
+	}
+	paint(display, x, y, width, height) {
+		const span = width * 4;
+		if (this.scratch === null || this.scratch.length < span * height) this.scratch = new Uint8ClampedArray(span * height);
+		const shadow = this.shadow;
+		for (let row = 0; row < height; row++) {
+			const from = ((y + row) * this.width + x) * 4;
+			this.scratch.set(shadow.subarray(from, from + span), row * span);
+		}
+		display.blitImage(x, y, width, height, this.scratch, 0, false);
+	}
+	composite(x, y, width, height) {
+		const c = this.cursor;
+		if (c === null) return;
+		const x0 = Math.max(x, c.x), x1 = Math.min(x + width, c.x + c.width);
+		const y0 = Math.max(y, c.y), y1 = Math.min(y + height, c.y + c.height);
+		const shadow = this.shadow;
+		for (let row = y0; row < y1; row++) for (let col = x0; col < x1; col++) {
+			const ci = ((row - c.y) * c.width + (col - c.x)) * 4;
+			if (c.rgba[ci + 3] === 0) continue;
+			const si = (row * this.width + col) * 4;
+			shadow[si] = c.rgba[ci];
+			shadow[si + 1] = c.rgba[ci + 1];
+			shadow[si + 2] = c.rgba[ci + 2];
+			shadow[si + 3] = 255;
+		}
+	}
+};
+var Ast2100RectDecoder = class {
+	constructor(state) {
+		this.state = state;
+		this.header = null;
+	}
+	decodeRect(x, y, width, height, sock, display, depth) {
+		if (this.header === null) {
+			if (sock.rQwait("AST2100", 8)) return false;
+			sock.rQshift32();
+			this.header = { length: sock.rQshift32() };
+		}
+		const length = this.header.length;
+		if (sock.rQwait("AST2100", length)) return false;
+		this.header = null;
+		const data = sock.rQshiftBytes(length);
+		this.state.frame(display, width, height, data, length > 0);
+		return true;
+	}
+};
+var Ast2100CursorDecoder = class {
+	constructor(state) {
+		this.state = state;
+	}
+	decodeRect(x, y, width, height, sock, display, depth) {
+		const bytes = 4 + width * height * 4;
+		if (sock.rQwait("AST2100 cursor", bytes)) return false;
+		const cx = sock.rQshift16();
+		const cy = sock.rQshift16();
+		this.state.cursorAt(display, cx, cy, width, height, sock.rQshiftBytes(width * height * 4));
+		return true;
+	}
+};
 // console-v2/entry.js
 var status = document.getElementById("v2-status");
 var target = document.getElementById("v2-screen");
@@ -11408,6 +14276,9 @@ function connect() {
 		wsProtocols: ["binary"]
 	});
 	rfb = current;
+	const ast2100 = new Ast2100Console();
+	current._decoders[87] = new Ast2100RectDecoder(ast2100);
+	current._decoders[AST2100_CURSOR_TAG] = new Ast2100CursorDecoder(ast2100);
 	current.scaleViewport = document.getElementById("v2-fit").checked;
 	current.resizeSession = false;
 	current.addEventListener("connect", () => {

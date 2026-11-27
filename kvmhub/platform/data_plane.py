@@ -6,7 +6,8 @@ import re
 from .. import capability as poc_capability
 from ..common import Problem
 from ..rfb_protocol import PROTOCOLS
-from ..driver_specs import DRIVERS, REAL_ADAPTER_IDS
+from ..driver_specs import (DRIVERS, REAL_ADAPTER_IDS, parse_access_params,
+                            resolve_adapter)
 
 DEFAULT_ASSET_PATHS = (
     "/novnc/include/*.js",
@@ -100,10 +101,18 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
     entry = data_plane.get("capability_entry") or {}
     plan = assembly.get("plan") or {}
     allowed_adapters = REAL_ADAPTER_IDS
-    if data_plane.get("adapter") not in (None, *allowed_adapters):
+    declared_adapter = data_plane.get("adapter")
+    entry_adapter = entry.get("adapter")
+    if declared_adapter not in (None, *allowed_adapters) \
+            and resolve_adapter(declared_adapter) not in allowed_adapters:
         raise Problem("invalid_target_policy", 502)
-    if entry.get("adapter") and entry["adapter"] not in allowed_adapters:
+    if entry_adapter and resolve_adapter(entry_adapter) not in allowed_adapters:
         raise Problem("invalid_target_policy", 502)
+
+    try:
+        access_params = parse_access_params(data_plane.get("access_params"))
+    except ValueError as exc:
+        raise Problem("invalid_target_policy", 502) from exc
 
     declared = poc_capability.parse_protocol_versions(entry.get("protocol_versions"))
     if declared is None:
@@ -112,7 +121,7 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
     if rfb_version and rfb_version not in declared:
         raise Problem("invalid_target_policy", 502)
     message_profile = str(plan.get("message_profile") or "").strip()
-    adapter = data_plane.get("adapter") or entry.get("adapter") or ""
+    adapter = resolve_adapter(declared_adapter or entry_adapter or "")
     if ((DRIVERS.get(adapter) is None or DRIVERS[adapter].vendor_layout_check)
             and rfb_version and message_profile):
         expected = MESSAGE_PROFILE_BY_VERSION.get(rfb_version)
@@ -144,6 +153,7 @@ def assembled_info(info: dict, assembly: dict | None) -> dict:
         "message_profile": message_profile,
         "rfb_version": rfb_version,
         "protocol": protocol,
+        "access_params": access_params or info.get("access_params") or {},
         "assembly_id": assembly.get("assembly_id"),
         "assembly_profile": (assembly.get("profile") or {}).get("code"),
         "display_address": assembly.get("display_address"),

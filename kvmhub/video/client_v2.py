@@ -6,7 +6,7 @@ from pathlib import Path
 from ..common import Problem
 
 ROOT = Path(__file__).resolve().parents[1] / 'static' / 'novnc-v2'
-MANIFEST_SHA256 = '295e9241bfffb2e7f8ac40807ee34dcc7625209f21d2b3f8f06dff609ad4d1fe'
+MANIFEST_SHA256 = '3c54df1294cde5c7007613f3faab5894073ff221361bb38013b3ca023425e768'
 CLIENT_VERSION = '1.7.0'
 PROTOCOL_CONTRACT = 'console-rfb/1'
 

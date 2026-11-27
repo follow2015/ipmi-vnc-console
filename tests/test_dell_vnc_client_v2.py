@@ -2,9 +2,11 @@
 import pytest
 
 from kvmhub import worker
+from kvmhub.adapters.aten_java import AtenJavaAdapter
 from kvmhub.adapters.idrac_vnc import IdracVncAdapter
 from kvmhub.adapters.passthrough import PassthroughAdapter
-from kvmhub.common import IDRAC_VNC_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID, Problem
+from kvmhub.common import (
+    ATEN_JAVA_ADAPTER_ID, IDRAC_VNC_ADAPTER_ID, PASSTHROUGH_ADAPTER_ID, Problem)
 from kvmhub.platform.data_plane import assembled_info
 from kvmhub.video import client_v2
 
@@ -53,11 +55,28 @@ def test_dell_vnc_keeps_the_legacy_client_without_an_approved_identity():
     assert adapter.client_v2 is False
 
 
-def test_supermicro_passthrough_never_gets_the_standard_client():
+def test_supermicro_passthrough_gets_the_fixed_client_through_the_gateway():
     adapter = object.__new__(PassthroughAdapter)
     adapter.adapter_id = PASSTHROUGH_ADAPTER_ID
+    assert worker.apply_client_bundle(adapter, _info()) is True
+    assert adapter.client_v2 is True
+    assert worker.input_protocol_for_adapter(adapter) == 'standard8'
+
+
+def test_supermicro_keeps_the_firmware_client_without_an_approved_contract():
+    adapter = object.__new__(PassthroughAdapter)
+    adapter.adapter_id = PASSTHROUGH_ADAPTER_ID
+    assert worker.apply_client_bundle(adapter, _info(contract='')) is False
+    assert adapter.client_v2 is False
+    assert worker.input_protocol_for_adapter(adapter) == 'insyde18'
+
+
+def test_aten_java_console_never_gets_the_fixed_client():
+    adapter = object.__new__(AtenJavaAdapter)
+    adapter.adapter_id = ATEN_JAVA_ADAPTER_ID
     assert worker.apply_client_bundle(adapter, _info()) is False
     assert adapter.client_v2 is False
+    assert worker.input_protocol_for_adapter(adapter) == 'insyde18'
 
 
 def test_assembled_info_carries_the_client_identity_without_a_transcode_recipe():

@@ -6,7 +6,7 @@ import json
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -15,10 +15,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, update
 
 from ..common import Problem, user_message
+from . import clockguard
 from .config import Settings, settings as load_settings
 from .db import init_schema, make_engine, seed_roles, session_factory, transaction
-from .models import (Asset, Capability, Credential, ProbeCandidate, ProbeTask,
-                     ROLE_ADMIN, Tenant, User, VendorProfile, parse_json)
+from .models import (Asset, Capability, ClockWatermark, Credential, ProbeCandidate,
+                     ProbeTask, ROLE_ADMIN, Tenant, User, VendorProfile, parse_json)
 from .redis_state import SESSION_PREFIX, State, create_state
 from .security import (CredentialCipher, constant_time_equal, new_session_token,
                        token_digest)
@@ -87,6 +88,25 @@ def _build_plane(cfg: Settings, state: State):
                             if item.strip()))
 
 
+CLOCK_HEARTBEAT_SECONDS = 60.0
+
+
+async def _clock_heartbeat(platform: "Platform") -> None:
+    while True:
+        await asyncio.sleep(CLOCK_HEARTBEAT_SECONDS)
+        try:
+            await asyncio.to_thread(_clock_heartbeat_once, platform.factory)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failed heartbeat must not stop the loop
+            logging.getLogger(__name__).exception("clock heartbeat failed")
+
+
+def _clock_heartbeat_once(factory) -> None:
+    with transaction(factory) as db:
+        services.observe_clock(db, actor="clock-heartbeat", reason="heartbeat")
+
+
 class Platform:
     def __init__(self, cfg: Settings, *, state: State | None = None, plane=None):
         self.cfg = cfg
@@ -125,6 +145,18 @@ class Platform:
         except Exception:
             pass
         return checks
+
+    def clock_status(self) -> dict:
+        with transaction(self.factory) as db:
+            row = db.get(ClockWatermark, clockguard.WATERMARK_ID)
+            if row is None:
+                return {"high_water": 0.0, "suspicious_forward": 0,
+                        "regressions": 0, "monotonic_anchor": 0.0}
+            return {"high_water": float(row.high_water or 0.0),
+                    "observed": float(row.observed or 0.0),
+                    "suspicious_forward": int(row.suspicious_forward or 0),
+                    "regressions": int(row.regressions or 0),
+                    "monotonic_anchor": float(row.monotonic_anchor or 0.0)}
 
     async def close(self) -> None:
         if self.owns_plane and self.plane is not None:
@@ -194,8 +226,14 @@ def create_app(cfg: Settings | None = None, *, state: State | None = None,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        await platform.close()
+        heartbeat = asyncio.create_task(_clock_heartbeat(platform))
+        try:
+            yield
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+            await platform.close()
 
     app = FastAPI(title="KVM Hub 控制面", version="2.0.0", lifespan=lifespan)
     app.state.platform = platform

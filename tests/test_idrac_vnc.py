@@ -6,8 +6,9 @@ import struct
 
 import pytest
 
-from kvmhub.adapters.idrac_vnc import IdracVncAdapter
-from kvmhub.common import (IDRAC_VNC_ADAPTER_ID, Problem,
+from kvmhub.adapters.idrac_vnc import IDRAC_ACCESS_PARAMS, IdracVncAdapter
+from kvmhub.adapters.rfb_relay import RfbRelayAdapter
+from kvmhub.common import (IDRAC_VNC_ADAPTER_ID, RFB_RELAY_ADAPTER_ID, Problem,
                            require_controlled_host)
 from kvmhub.platform.data_plane import assembled_info
 from kvmhub.rfb_tcp_upstream import (RfbTcpConfig, RfbTcpUpstream,
@@ -170,8 +171,8 @@ def test_idrac_pins_raw_first_before_the_browser_list_reaches_the_bmc():
         await session.close()
         return up.sent
 
-    assert IdracVncAdapter.client_encodings == (0, 1)
-    pinned = asyncio.run(scenario(IdracVncAdapter.client_encodings))
+    assert IDRAC_ACCESS_PARAMS["encodings"] == (0, 1)
+    pinned = asyncio.run(scenario(IDRAC_ACCESS_PARAMS["encodings"]))
     assert pinned == [set_encodings((0, 1))]
     assert asyncio.run(scenario(None)) == [
         set_encodings([1, 50, 7, -260, 16, 21, 5, 2, 6, 0, -223, -308])]
@@ -472,7 +473,8 @@ def test_controlled_network_gate_requires_explicit_cidr():
 def test_adapter_and_worker_require_controlled_network(monkeypatch):
     monkeypatch.setenv("KVMHUB_BMC_ALLOWED_NETWORKS", "192.0.2.0/24")
     adapter = make_adapter(dict(INFO))
-    assert isinstance(adapter, IdracVncAdapter)
+    assert type(adapter) is RfbRelayAdapter
+    assert adapter.adapter_id == RFB_RELAY_ADAPTER_ID
     assert adapter.host == "192.0.2.84"
     assert adapter.port == 5901
     with pytest.raises(Problem):

@@ -20,7 +20,7 @@ PLUGINS = MappingProxyType({
                    '53339f690eb35cc622547fb0462dbefd9702791fc39948b73ec5ff41c8cf8d54'),
         PluginSpec('standard-rfb-v1', '1.0.0', 'kvmhub.transcode.standard_rfb',
                    f'{_ROOT}/standard_rfb.py',
-                   '9e040a9948ebe8f4d5dd813513bfc3c655b1c7f22f488fd918d0274cc118454e'),
+                   '2858e83868b180f55e28e34686b6d803ecf05019249053b366d6f70a2b55c1a0'),
         PluginSpec('ast2100-x10', '0.0.0', 'kvmhub.transcode.ast2100',
                    f'{_ROOT}/ast2100.py',
                    'ba4e5330a78ad9f52568f49e2ce56e2b256d876defb571618f47f7751b2d3b0f',

@@ -14,7 +14,7 @@ from cryptography.x509.oid import NameOID
 
 from kvmhub.adapters.huawei_ibmc_vnc import (HUAWEI_VNC_PORT, PIN_ENV,
                                              HuaweiIbmcVncAdapter)
-from kvmhub.common import HUAWEI_IBMC_VNC_ADAPTER_ID, Problem
+from kvmhub.common import HUAWEI_IBMC_VNC_ADAPTER_ID, RFB_RELAY_ADAPTER_ID, Problem
 from kvmhub.rfb_tcp_upstream import (RfbTcpConfig, RfbTcpUpstream,
                                      StandardRfbBrowserHandshake,
                                      vnc_auth_response)
@@ -155,7 +155,7 @@ def test_adapter_requires_pin_and_controlled_network(monkeypatch):
     monkeypatch.setenv(PIN_ENV, pin)
     monkeypatch.setenv("KVMHUB_BMC_ALLOWED_NETWORKS", "192.0.2.0/24")
     adapter = make_adapter(dict(INFO))
-    assert isinstance(adapter, HuaweiIbmcVncAdapter)
+    assert adapter.adapter_id == RFB_RELAY_ADAPTER_ID
     assert adapter.host == "192.0.2.234"
     assert adapter.port == HUAWEI_VNC_PORT
     assert adapter.pin == pin

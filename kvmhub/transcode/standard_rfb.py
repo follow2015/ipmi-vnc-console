@@ -1,8 +1,15 @@
 """Standard RFB family plugin: server frames -> bounded framebuffer ops.
 
 Only the encodings the platform's northbound encoder can re-emit are accepted:
-Raw, CopyRect and Tight fill/basic-filter-0. Anything else rejects the whole
-update; a standard RFB source is never forwarded verbatim by this platform.
+Raw, CopyRect and one Tight subset — fill (subencoding 8) and basic copy-filter
+on the independent zlib stream 0 (subencoding 0). Anything else rejects the
+whole update.
+
+Tight's control byte is *not* a bit flag: the high nibble is the subencoding and
+the low nibble says which zlib streams to reset. JPEG (9) and PNG (10) reuse the
+0x80 bit, so testing ``control & 0x80`` for "fill" would read a JPEG header as a
+colour. The parser below therefore switches on the nibble and rejects
+palette/gradient filters, streams 1-3, continued streams and JPEG/PNG by name.
 """
 import struct
 import zlib
@@ -17,6 +24,11 @@ _TYPE_CUT = 3
 _ENC_RAW = 0
 _ENC_COPY = 1
 _ENC_TIGHT = 7
+_TIGHT_FILL = 8
+_TIGHT_JPEG = 9
+_TIGHT_PNG = 10
+#: Tight sends uncompressed pixels without a length prefix below this size.
+_TIGHT_RAW_BELOW = 12
 _MAX_BUFFER = 2 * MAX_UPDATE_BYTES
 _RECT = struct.Struct('>HHHHI')
 _PIXEL = struct.Struct('>BBBBHHHBBBxxx')
@@ -40,17 +52,6 @@ def _pixel_format(header: bytes) -> None:
         raise ValueError('transcode_family_pixel_format_unsupported')
 
 
-def _tight_payload_length(control: int, rect: Rect) -> int | None:
-    if control & 0x80:  # fill: control + three colour bytes
-        return 3
-    if control & 0x40:  # JPEG subencoding: not re-emittable without re-encode
-        raise ValueError('transcode_family_encoding_unsupported')
-    filter_id = control & 0x0F
-    if filter_id == 0:  # Copy: compress length + RGB bytes
-        return None  # payload is self-delimiting via compact length
-    raise ValueError('transcode_family_encoding_unsupported')
-
-
 def _compact_length(buf: bytearray, offset: int) -> tuple[int, int]:
     size = shift = 0
     for index in range(3):
@@ -69,6 +70,9 @@ class StandardRfbFamily(FamilyDecoder):
         self.width = self.height = 0
         self.buf = bytearray()
         self.seq = 0
+        #: True once a basic rect has been decoded. A later basic rect without
+        #: the reset bit continues a zlib stream whose state is not kept here.
+        self._tight_stream = False
 
     def init(self, width, height, header=b''):
         geometry(width, height)
@@ -76,6 +80,7 @@ class StandardRfbFamily(FamilyDecoder):
         self.width, self.height = width, height
         self.buf.clear()
         self.seq = 0
+        self._tight_stream = False
         return 1
 
     def feed(self, stream):
@@ -96,6 +101,64 @@ class StandardRfbFamily(FamilyDecoder):
             raise
         self.seq += 1
         return Decoded(Update(1, self.seq, tuple(operations)))
+
+    def _tight_rect(self, buf, cursor, rect):
+        """Parse one Tight rect; None means the message is still incomplete.
+
+        Accepted: fill, and basic copy-filter on a freshly reset stream 0.
+        Rejected by name: JPEG, PNG, palette/gradient filters, streams 1-3 and
+        continued streams. The northbound encoder cannot re-emit them, and
+        guessing would corrupt pixels instead of failing the frame.
+        """
+        if cursor >= len(buf):
+            return None
+        control = buf[cursor]
+        cursor += 1
+        subencoding = control >> 4
+        if subencoding == _TIGHT_FILL:
+            if cursor + 3 > len(buf):
+                return None
+            return Fill(rect, bgrx(bytes(buf[cursor:cursor + 3]))), cursor + 3
+        if subencoding in (_TIGHT_JPEG, _TIGHT_PNG) or subencoding & 0x8:
+            raise ValueError('transcode_family_encoding_unsupported')
+        # Basic: bits 0-1 pick the zlib stream, bit 2 announces a filter byte.
+        if subencoding & 0x3:
+            raise ValueError('transcode_family_encoding_unsupported')
+        if subencoding & 0x4:
+            if cursor >= len(buf):
+                return None
+            filter_id = buf[cursor]
+            cursor += 1
+            if filter_id != 0:
+                raise ValueError('transcode_family_encoding_unsupported')
+        if not (control & 0x01) and self._tight_stream:
+            raise ValueError('transcode_family_encoding_unsupported')
+        size = rect.w * rect.h * 3
+        if size < _TIGHT_RAW_BELOW:
+            if cursor + size > len(buf):
+                return None
+            rgb = bytes(buf[cursor:cursor + size])
+            cursor += size
+        else:
+            length, cursor = _compact_length(buf, cursor)
+            if length > MAX_UPDATE_BYTES:
+                raise ValueError('transcode_family_input_budget')
+            if cursor + length > len(buf):
+                return None
+            # Tight streams are flushed with Z_SYNC_FLUSH, so they are not
+            # self-terminating; zlib.decompress() would reject every real
+            # source. Decompress with an explicit output bound instead.
+            inflater = zlib.decompressobj()
+            rgb = inflater.decompress(bytes(buf[cursor:cursor + length]), size)
+            cursor += length
+            if inflater.unconsumed_tail:
+                raise ValueError('transcode_family_raw_invalid')
+        if len(rgb) != size:
+            raise ValueError('transcode_family_raw_invalid')
+        pixels = bytearray(rect.w * rect.h * 4)
+        pixels[0::4], pixels[1::4], pixels[2::4] = rgb[2::3], rgb[1::3], rgb[0::3]
+        self._tight_stream = True
+        return Raw(rect, bytes(pixels)), cursor
 
     def _consume(self, operations) -> bool:
         """Consume one complete server message; False means need more bytes."""
@@ -151,28 +214,11 @@ class StandardRfbFamily(FamilyDecoder):
                 staged.append(Copy(rect, sx, sy))
                 cursor += 4
             elif encoding == _ENC_TIGHT:
-                if cursor + 1 > len(buf):
+                parsed = self._tight_rect(buf, cursor, rect)
+                if parsed is None:
                     return False
-                control = buf[cursor]
-                cursor += 1
-                if control & 0x80:
-                    if cursor + 3 > len(buf):
-                        return False
-                    staged.append(Fill(rect, bgrx(bytes(buf[cursor:cursor + 3]))))
-                    cursor += 3
-                else:
-                    length, cursor = _compact_length(buf, cursor)
-                    if length > MAX_UPDATE_BYTES or cursor + length > len(buf):
-                        if length > MAX_UPDATE_BYTES:
-                            raise ValueError('transcode_family_input_budget')
-                        return False
-                    rgb = zlib.decompress(bytes(buf[cursor:cursor + length]))
-                    if len(rgb) != w * h * 3:
-                        raise ValueError('transcode_family_raw_invalid')
-                    pixels = bytearray(w * h * 4)
-                    pixels[0::4], pixels[1::4], pixels[2::4] = rgb[2::3], rgb[1::3], rgb[0::3]
-                    staged.append(Raw(rect, bytes(pixels)))
-                    cursor += length
+                operation, cursor = parsed
+                staged.append(operation)
             else:
                 raise ValueError('transcode_family_encoding_unsupported')
             total += 4 * w * h

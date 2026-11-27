@@ -98,7 +98,7 @@ class Role(Base):
     code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
 
 
 class Permission(Base):
@@ -130,7 +130,7 @@ class Tenant(Base):
     mode: Mapped[str] = mapped_column(String(32), default=TENANT_MODE_MANAGER,
                                       nullable=False, server_default=TENANT_MODE_MANAGER)
     quotas_json: Mapped[str] = mapped_column(Text, default="{}")
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
 
     def public(self) -> dict:
         return {"id": self.id, "code": self.code, "name": self.name,
@@ -147,9 +147,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
-    locked_until: Mapped[float] = mapped_column(Float, default=0.0)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    last_login: Mapped[float | None] = mapped_column(Float, nullable=True)
+    locked_until: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    last_login: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
     __table_args__ = (UniqueConstraint("tenant_id", "username", name="uq_kvm_user_tenant_username"),)
 
     def public(self) -> dict:
@@ -182,13 +182,14 @@ class VendorProfile(Base):
     status: Mapped[str] = mapped_column(String(32), default=PROFILE_DRAFT)
     evidence: Mapped[str] = mapped_column(Text, default="")
     approver: Mapped[str] = mapped_column(String(128), default="")
-    approved_at: Mapped[float] = mapped_column(Float, default=0.0)
-    review_due: Mapped[float] = mapped_column(Float, default=0.0)
+    approved_at: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    review_due: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     revision: Mapped[int] = mapped_column(Integer, default=0)
     recipe_id: Mapped[str] = mapped_column(String(96), default="", nullable=False)
     recipe_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     config_schema_version: Mapped[str] = mapped_column(String(32), default="v1", nullable=False)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    access_params: Mapped[str | None] = mapped_column(Text, default="{}", nullable=True)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
 
     def public(self) -> dict:
         return {"id": self.id, "tenant_id": self.tenant_id, "code": self.code,
@@ -201,6 +202,7 @@ class VendorProfile(Base):
                 "login_path": self.login_path, "logout_path": self.logout_path,
                 "console_impl": self.console_impl, "licence": self.licence,
                 "protocol": getattr(self, "protocol", "") or "",
+                "access_params": parse_json(self.access_params, {}),
                 "concurrency_limit": self.concurrency_limit,
                 "input_shaping": parse_json(self.input_shaping, {}),
                 "priority": self.priority, "status": self.status,
@@ -222,7 +224,7 @@ class Capability(Base):
     adapter: Mapped[str] = mapped_column(String(128), nullable=False)
     profile_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("kvm_vendor_profile.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="draft")
-    expires: Mapped[float] = mapped_column(Float, default=0.0)
+    expires: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     evidence: Mapped[str] = mapped_column(Text, default="")
     approver: Mapped[str] = mapped_column(String(128), default="")
     console_impl: Mapped[str] = mapped_column(String(128), default="")
@@ -231,13 +233,13 @@ class Capability(Base):
     firmware_min: Mapped[str] = mapped_column(String(64), default="")
     firmware_max: Mapped[str] = mapped_column(String(64), default="")
     protocol_versions: Mapped[str] = mapped_column(Text, default="[]")
-    approved_at: Mapped[float] = mapped_column(Float, default=0.0)
-    effective_from: Mapped[float] = mapped_column(Float, default=0.0)
-    review_due: Mapped[float] = mapped_column(Float, default=0.0)
+    approved_at: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    effective_from: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    review_due: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     status_reason: Mapped[str] = mapped_column(Text, default="")
     revision: Mapped[int] = mapped_column(Integer, default=0)
     bundle_revision: Mapped[str] = mapped_column(String(128), default="", nullable=False)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
 
 
 class Credential(Base):
@@ -250,8 +252,8 @@ class Credential(Base):
     key_version: Mapped[int] = mapped_column(Integer, default=1)
     revision: Mapped[int] = mapped_column(Integer, default=1)
     created_by: Mapped[str] = mapped_column(String(128), default="")
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    rotated_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    rotated_at: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
 
     def public(self) -> dict:
         return {"id": self.id, "label": self.label, "key_version": self.key_version,
@@ -277,9 +279,10 @@ class Asset(Base):
     vnc_username_cipher: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     vnc_password_cipher: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     vnc_key_version: Mapped[int] = mapped_column(Integer, default=1)
+    vnc_key_id: Mapped[str] = mapped_column(String(16), default="", server_default="")
     vnc_secret_revision: Mapped[int] = mapped_column(Integer, default=1)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    updated: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    updated: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     __table_args__ = (Index("ix_kvm_asset_tenant_address", "tenant_id", "address"),)
 
     def public(self, *, public_ip: str | None = None,
@@ -334,9 +337,9 @@ class AccessGrant(Base):
     tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_user.id"), primary_key=True)
     asset_id: Mapped[str] = mapped_column(String(36), ForeignKey("kvm_asset.id"), primary_key=True)
-    expires: Mapped[float] = mapped_column(Float, nullable=False)
+    expires: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     granted_by: Mapped[str] = mapped_column(String(128), default="")
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
 
 
 class AssetGroup(Base):
@@ -344,8 +347,8 @@ class AssetGroup(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    updated: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    updated: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
 
     def public(self) -> dict:
         return {"id": self.id, "tenant_id": self.tenant_id, "name": self.name,
@@ -374,7 +377,7 @@ class GrantSource(Base):
 class AuditLog(Base):
     __tablename__ = "kvm_audit_log"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[float] = mapped_column(Float, nullable=False)
+    ts: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     trace_id: Mapped[str] = mapped_column(String(64), default="")
     actor: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -411,10 +414,10 @@ class ServiceToken(Base):
     prefix: Mapped[str] = mapped_column(String(16), nullable=False)
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     allowlist_json: Mapped[str] = mapped_column(Text, default="[]")
-    expires: Mapped[float | None] = mapped_column(Float, nullable=True)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    revoked: Mapped[float | None] = mapped_column(Float, nullable=True)
-    last_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expires: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    revoked: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
+    last_used: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
     created_by: Mapped[str] = mapped_column(String(128), default="")
     __table_args__ = (UniqueConstraint("tenant_id", "label", name="uq_kvm_service_token_label"),)
 
@@ -483,9 +486,9 @@ class DeviceAdmission(Base):
     domain_id: Mapped[str] = mapped_column(String(64), default="")
     approver: Mapped[str] = mapped_column(String(128), default="")
     evidence: Mapped[str] = mapped_column(Text, default="")
-    review_due: Mapped[float] = mapped_column(Float, default=0.0)
-    expires: Mapped[float] = mapped_column(Float, default=0.0)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    review_due: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    expires: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     __table_args__ = (
         UniqueConstraint("asset_id", "revision", name="uq_kvm_device_admission_revision"),
     )
@@ -505,7 +508,7 @@ class AssetConnection(Base):
     secret_revision: Mapped[int] = mapped_column(Integer, default=0)
     schema: Mapped[str] = mapped_column(String(32), default="v2")
     digest: Mapped[str] = mapped_column(String(128), default="")
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     __table_args__ = (
         UniqueConstraint("asset_id", "revision", name="uq_kvm_asset_connection_revision"),
     )
@@ -517,10 +520,10 @@ class PlaneOutbox(Base):
     asset_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     lease_owner: Mapped[str] = mapped_column(String(128), default="")
-    lease_until: Mapped[float] = mapped_column(Float, default=0.0)
-    next_attempt: Mapped[float] = mapped_column(Float, default=0.0)
+    lease_until: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
+    next_attempt: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
 
 
@@ -537,7 +540,7 @@ class PlaneProjection(Base):
     policy_fingerprint: Mapped[str] = mapped_column(String(128), default="")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     error: Mapped[str] = mapped_column(Text, default="")
-    ack_at: Mapped[float] = mapped_column(Float, default=0.0)
+    ack_at: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     __table_args__ = (
         UniqueConstraint("asset_id", "domain_id", name="uq_kvm_plane_projection_target"),
     )
@@ -557,8 +560,12 @@ class ExecutionDomain(Base):
 class ClockWatermark(Base):
     __tablename__ = "kvm_clock_watermark"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    high_water: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    observed: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    high_water: Mapped[float] = mapped_column(Float(precision=53), nullable=False, default=0.0)
+    observed: Mapped[float] = mapped_column(Float(precision=53), nullable=False, default=0.0)
+    monotonic_anchor: Mapped[float] = mapped_column(Float(precision=53), nullable=False,
+                                                   default=0.0, server_default="0")
+    suspicious_forward: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                                    server_default="0")
     regressions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
@@ -575,8 +582,8 @@ class ProbeCandidate(Base):
     capability_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     fingerprint: Mapped[str] = mapped_column(String(128), default="")
     reason: Mapped[str] = mapped_column(Text, default="")
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    resolved: Mapped[float] = mapped_column(Float, default=0.0)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    resolved: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     resolved_by: Mapped[str] = mapped_column(String(128), default="")
 
 
@@ -587,6 +594,6 @@ class ProbeTask(Base):
     state: Mapped[str] = mapped_column(String(16), default="running")
     total: Mapped[int] = mapped_column(Integer, default=0)
     completed: Mapped[int] = mapped_column(Integer, default=0)
-    created: Mapped[float] = mapped_column(Float, nullable=False)
-    updated: Mapped[float] = mapped_column(Float, default=0.0)
+    created: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
+    updated: Mapped[float] = mapped_column(Float(precision=53), default=0.0)
     items_json: Mapped[str] = mapped_column(Text, default="[]")

@@ -11,6 +11,7 @@ NON_RETRYABLE = frozenset({
     "upstream_invalid_response",
     "client_message_denied",
     "client_message_malformed",
+    "ast2100_stream_unsupported", "ast2100_stream_desync",
     "connection_limit",
     "subprotocol_required",
     "session_revoked", "device_not_admitted", "operation_permit_invalid",

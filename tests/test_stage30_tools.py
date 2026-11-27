@@ -7,6 +7,7 @@ import json
 import os
 import time
 import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -248,6 +249,45 @@ def test_sync_dry_run_writes_nothing(sync_world, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["dry_run"] is True and len(out["synced"]) == 1
     assert not sync_world.data_db.exists()
+
+
+def test_sync_summary_never_prints_the_store_password(sync_world, capsys):
+    platform_admin.cmd_sync_data_plane(_sync_args(
+        sync_world, dry_run=True,
+        store="mysql+pymysql://kvmhub:placeholder-db-password@127.0.0.1:3306/kvmhub?charset=utf8mb4"))
+    out = capsys.readouterr().out
+    assert "placeholder-db-password" not in out
+    masked = ("mysql+pymysql://kvmhub:" + "*" * 3 +
+              "@127.0.0.1:3306/kvmhub?charset=utf8mb4")
+    assert json.loads(out)["store"] == masked
+
+
+@pytest.mark.parametrize("dsn", [
+    "mysql+pymysql://kvmhub:placeholder-db-password@127.0.0.1:3306/kvmhub?charset=utf8mb4",
+    "mysql+pymysql://kvmhub@127.0.0.1:3306/kvmhub?password=placeholder-db-password&charset=utf8mb4",
+])
+def test_sync_summary_redacts_a_password_in_any_dsn_position(sync_world, capsys, dsn):
+    platform_admin.cmd_sync_data_plane(_sync_args(sync_world, dry_run=True, store=dsn))
+    out = capsys.readouterr().out
+    assert "placeholder-db-password" not in out
+    assert "***" in json.loads(out)["store"]
+
+
+def test_init_db_summary_never_prints_the_db_password(monkeypatch, capsys):
+    dsn = "mysql+pymysql://kvmhub:placeholder-db-password@127.0.0.1:3306/kvmhub?charset=utf8mb4"
+    cfg = SimpleNamespace(db_url=dsn, bootstrap_admin="", bootstrap_password="")
+    engine = SimpleNamespace(dispose=lambda: None)
+    monkeypatch.setattr(platform_admin, "_context", lambda args: (cfg, engine, object(), None))
+    monkeypatch.setattr(platform_admin, "init_schema", lambda e: None)
+    monkeypatch.setattr(platform_admin, "transaction", lambda factory: nullcontext())
+    monkeypatch.setattr(platform_admin, "seed_roles", lambda db: ["admin"])
+    monkeypatch.setattr(platform_admin.vendor_registry, "seed_builtin_profiles", lambda db: 3)
+    platform_admin.cmd_init_db(SimpleNamespace(env_file=None))
+    out = capsys.readouterr().out
+    assert "placeholder-db-password" not in out
+    masked = ("mysql+pymysql://kvmhub:" + "*" * 3 +
+              "@127.0.0.1:3306/kvmhub?charset=utf8mb4")
+    assert json.loads(out)["db"] == masked
 
 
 def test_sync_imports_a_verified_capability_and_an_encrypted_credential(sync_world, capsys):

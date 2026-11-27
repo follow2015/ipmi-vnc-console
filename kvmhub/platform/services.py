@@ -28,7 +28,8 @@ from .models import (AccessGrant, Asset, AssetGroup, AssetGroupMember, AuditLog,
                      Tenant, User, UserRole, VendorProfile, json_field, parse_json,
                      roles_for_tenant_mode)
 from .security import (CredentialCipher, hash_password, verify_password)
-from ..common import user_message
+from ..common import HUAWEI_IBMC_KVM_GATEWAY_ID, user_message
+from ..driver_specs import relay_preset, resolve_adapter
 from ..sql_backend import open_store, parse_store_dsn
 
 logger = logging.getLogger(__name__)
@@ -70,8 +71,9 @@ def audit(session: Session, actor: str, action: str, *, asset_id: str | None = N
 
 def observe_clock(session: Session, *, now: float | None = None,
                   actor: str = "platform", reason: str = "",
-                  trace: str = "") -> dict:
+                  trace: str = "", monotonic: float | None = None) -> dict:
     stamp = time.time() if now is None else now
+    mono = time.monotonic() if (now is None and monotonic is None) else monotonic
     row = session.get(ClockWatermark, clockguard.WATERMARK_ID)
     if row is None:
         verb = ("INSERT IGNORE" if session.get_bind().dialect.name == "mysql"
@@ -80,8 +82,15 @@ def observe_clock(session: Session, *, now: float | None = None,
             text(f"{verb} INTO kvm_clock_watermark (id,high_water,observed,regressions) "
                  "VALUES (:id,:stamp,:stamp,0)"),
             {"id": clockguard.WATERMARK_ID, "stamp": stamp})
+        session.expire_all()
         row = session.get(ClockWatermark, clockguard.WATERMARK_ID)
-    verdict = clockguard.evaluate(float(row.high_water or 0.0), stamp)
+        if row is None:
+            raise PlatformError("clock_watermark_missing", "时钟水位记录缺失", 503)
+        if mono is not None:
+            row.monotonic_anchor = mono
+    anchor = float(row.monotonic_anchor or 0.0) if mono is not None and row.monotonic_anchor else None
+    verdict = clockguard.evaluate(float(row.high_water or 0.0), stamp,
+                                  monotonic=mono, monotonic_anchor=anchor)
     if verdict["regressed"]:
         behind = verdict["behind"]
         session.rollback()
@@ -107,18 +116,28 @@ def observe_clock(session: Session, *, now: float | None = None,
             f"{user_message('clock_regression')} 实测回退约 {behind:.0f} 秒", 409)
     if verdict["suspicious_forward"]:
         logger.warning(
-            "control-plane clock jumped forward by %.0f s (floor %.0f, now %.0f); "
-            "watermark unchanged, verify NTP or run clock-reset --confirm",
-            verdict["forward"], verdict["high_water"], stamp)
+            "control-plane clock jumped forward by %.0f s (floor %.0f, now %.0f, "
+            "monotonic delta %s); watermark unchanged, verify NTP or run "
+            "clock-reset --confirm",
+            verdict["forward"], verdict["high_water"], stamp,
+            verdict["monotonic_elapsed"])
+        row.suspicious_forward = int(row.suspicious_forward or 0) + 1
         row.observed = stamp
+        if mono is not None:
+            row.monotonic_anchor = mono
         return {"high_water": float(row.high_water), "behind": 0.0,
                 "regressed": False, "suspicious_forward": True,
-                "forward": verdict["forward"]}
-    row.high_water = clockguard.advance(row.high_water, stamp)
+                "forward": verdict["forward"],
+                "suspicious_forward_count": int(row.suspicious_forward)}
+    row.high_water = clockguard.advance(row.high_water, stamp,
+                                        suspicious=verdict["suspicious_forward"])
     row.observed = stamp
+    if mono is not None:
+        row.monotonic_anchor = mono
     return {"high_water": float(row.high_water), "behind": verdict["behind"],
             "regressed": False, "suspicious_forward": False,
-            "forward": verdict["forward"]}
+            "forward": verdict["forward"],
+            "monotonic_elapsed": verdict["monotonic_elapsed"]}
 
 
 def reset_clock_watermark(session: Session, *, now: float | None = None,
@@ -390,6 +409,7 @@ def save_vnc_secret(session: Session, cipher: CredentialCipher, *, asset_id: str
     asset.vnc_username_cipher = cipher.encrypt(username, aad=asset.id + ":vnc_username")
     asset.vnc_password_cipher = cipher.encrypt(password, aad=asset.id + ":vnc_password")
     asset.vnc_key_version = cipher.version
+    asset.vnc_key_id = cipher.key_id
     asset.vnc_secret_revision = (asset.vnc_secret_revision or 0) + 1
     asset.updated = stamp
     audit(session, actor, "vnc_secret_saved", asset_id=asset.id,
@@ -418,6 +438,7 @@ def clear_vnc_secret(session: Session, *, asset_id: str, actor: str,
     asset.vnc_username_cipher = None
     asset.vnc_password_cipher = None
     asset.vnc_key_version = 1
+    asset.vnc_key_id = ""
     asset.vnc_secret_revision = (asset.vnc_secret_revision or 0) + 1
     asset.updated = stamp
     audit(session, actor, "vnc_secret_cleared", asset_id=asset.id,
@@ -461,22 +482,44 @@ def rotate_vnc_secret_key(session: Session, cipher: CredentialCipher,
     rows = session.scalars(select(Asset).where(
         Asset.vnc_password_cipher.isnot(None))).all()
     rotated = []
+    failed = []
+    skipped = []
     for row in rows:
-        if row.vnc_key_version == new_cipher.version:
+        if row.vnc_key_id and row.vnc_key_id == new_cipher.key_id:
+            skipped.append(row.id)
             continue
         try:
-            username = cipher.decrypt(row.vnc_username_cipher, aad=row.id + ":vnc_username")
-            password = cipher.decrypt(row.vnc_password_cipher, aad=row.id + ":vnc_password")
-        except Exception:  # noqa: BLE001 - already written under the new key
+            username = new_cipher.decrypt_current(
+                row.vnc_username_cipher, aad=row.id + ":vnc_username")
+            password = new_cipher.decrypt_current(
+                row.vnc_password_cipher, aad=row.id + ":vnc_password")
+        except Exception:  # noqa: BLE001 - not yet on the new key
+            try:
+                username = cipher.decrypt(
+                    row.vnc_username_cipher, aad=row.id + ":vnc_username")
+                password = cipher.decrypt(
+                    row.vnc_password_cipher, aad=row.id + ":vnc_password")
+            except Exception:  # noqa: BLE001 - report, never silently skip
+                failed.append(row.id)
+                continue
+            reencrypt = True
+        else:
+            reencrypt = False
+        if not reencrypt:
+            row.vnc_key_id = new_cipher.key_id
+            row.vnc_key_version = new_cipher.version
+            skipped.append(row.id)
             continue
         row.vnc_username_cipher = new_cipher.encrypt(username, aad=row.id + ":vnc_username")
         row.vnc_password_cipher = new_cipher.encrypt(password, aad=row.id + ":vnc_password")
         row.vnc_key_version = new_cipher.version
+        row.vnc_key_id = new_cipher.key_id
         row.vnc_secret_revision = (row.vnc_secret_revision or 0) + 1
         row.updated = stamp
         audit(session, actor, "vnc_key_rotated", asset_id=row.id,
               tenant_id=row.tenant_id, now=stamp,
-              detail={"key_version": new_cipher.version,
+              detail={"key_id": new_cipher.key_id,
+                      "key_version": new_cipher.version,
                       "secret_revision": row.vnc_secret_revision})
         rotated.append(row.id)
     if rotated:
@@ -485,7 +528,10 @@ def rotate_vnc_secret_key(session: Session, cipher: CredentialCipher,
         connection_config.record_change(session, asset_ids=rotated,
                                         reason="vnc_key_rotated", actor=actor, now=stamp)
     session.flush()
-    return {"rotated": len(rotated), "key_version": new_cipher.version}
+    if failed:
+        logger.error("vnc key rotation failed for %d row(s): %s", len(failed), failed)
+    return {"rotated": len(rotated), "skipped": len(skipped), "failed": failed,
+            "key_id": new_cipher.key_id, "key_version": new_cipher.version}
 
 
 def select_sync_secret(session: Session, cipher: CredentialCipher, asset: Asset,
@@ -595,9 +641,16 @@ def upsert_asset(session: Session, *, name: str, address: str, vendor: str = "",
     return existing
 
 
-_ENV_PIN_ADAPTERS = frozenset()
+_NON_RELAY_ASSET_PIN = frozenset({HUAWEI_IBMC_KVM_GATEWAY_ID})
 
-_ASSET_PIN_ADAPTERS = frozenset({"huawei-ibmc-vnc-tls", "huawei-ibmc-kvm-gateway"})
+
+def _pin_modes(row: VendorProfile) -> tuple[bool, bool]:
+    params = {**relay_preset(row.console_impl),
+              **parse_json(getattr(row, "access_params", "") or "{}", {})}
+    pinned = (params.get("tls") or "none") == "pinned"
+    asset_pin = ((pinned and params.get("pin_source") == "asset_then_env")
+                 or row.console_impl in _NON_RELAY_ASSET_PIN)
+    return (pinned and not params.get("pin_source")), asset_pin
 
 
 def _blocked_brand(row: VendorProfile, reason: str, *, stamp: float,
@@ -657,7 +710,7 @@ def asset_onboarding(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID,
         cap_views = [{"id": c.id, "model": c.model, "firmware": c.firmware,
                       "adapter": c.adapter, "status": c.status, "expires": c.expires}
                      for c in usable]
-        env_pin = row.console_impl in _ENV_PIN_ADAPTERS
+        env_pin, asset_pin = _pin_modes(row)
         brands.append({
             "profile_id": row.id,
             "code": row.code,
@@ -673,7 +726,7 @@ def asset_onboarding(session: Session, *, tenant_id: str = DEFAULT_TENANT_ID,
                 if env_pin else
                 ("请填写本机 iBMC 证书 SHA-256 指纹（探测可自动带出）；"
                  "同型号不同证书的设备各填各的。留空则回退平台统一 pin，两者都无时拒绝连接。"
-                 if row.console_impl in _ASSET_PIN_ADAPTERS else
+                 if asset_pin else
                  "如该 BMC 使用自签证书，请填写证书 SHA-256 指纹；留空则不校验证书。")),
             "default_capability_id": cap_views[0]["id"] if cap_views else None,
             "capabilities": cap_views,

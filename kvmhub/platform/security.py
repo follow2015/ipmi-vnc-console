@@ -18,6 +18,12 @@ def _prehash(password: str) -> bytes:
     return base64.b64encode(hashlib.sha256(password.encode("utf-8")).digest())
 
 
+def _key_id(key: bytes | None) -> str:
+    if key is None:
+        return ""
+    return hashlib.sha256(key).hexdigest()[:16]
+
+
 def hash_password(password: str) -> str:
     if not isinstance(password, str) or len(password) < 8:
         raise ValueError("password must have at least 8 characters")
@@ -55,6 +61,8 @@ class CredentialCipher:
         self._aead = AESGCM(key) if key is not None else None
         self._previous = AESGCM(previous_key) if previous_key is not None else None
         self.version = 2 if previous_key is not None else 1
+        self.key_id = _key_id(key)
+        self.previous_key_id = _key_id(previous_key)
 
     @property
     def available(self) -> bool:
@@ -68,6 +76,13 @@ class CredentialCipher:
         nonce = secrets.token_bytes(NONCE_BYTES)
         return nonce + self._aead.encrypt(nonce, plaintext.encode("utf-8"),
                                           aad.encode("utf-8"))
+
+    def decrypt_current(self, blob: bytes, *, aad: str) -> str:
+        if self._aead is None:
+            raise RuntimeError("credential master key is not configured")
+        raw = bytes(blob)
+        return self._aead.decrypt(raw[:NONCE_BYTES], raw[NONCE_BYTES:],
+                                  aad.encode("utf-8")).decode("utf-8")
 
     def decrypt(self, blob: bytes, *, aad: str) -> str:
         if self._aead is None:

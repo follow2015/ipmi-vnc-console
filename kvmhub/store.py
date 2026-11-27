@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import capability
 from .operation_permit import CLOCK_SKEW, verify_operation_permit
-from .driver_specs import DRIVERS, REAL_ADAPTER_IDS
+from .driver_specs import DRIVERS, REAL_ADAPTER_IDS, resolve_adapter
 from .common import (PASSTHROUGH_ADAPTER_ID, Problem,
                      bmc_allowed_networks_from_env, parse_controlled_networks)
 from .sql_backend import (INTEGRITY_ERRORS, mysql_capability_ddl, open_store,
@@ -163,6 +163,7 @@ CAPABILITY_COLUMNS = {
     "revision": "INTEGER NOT NULL DEFAULT 0",
     "protocol_versions": "TEXT NOT NULL DEFAULT '[]'",
     "input_shaping": "TEXT NOT NULL DEFAULT '{}'",
+    "access_params": "TEXT NOT NULL DEFAULT '{}'",
     "logout_path": "TEXT NOT NULL DEFAULT ''",
 }
 
@@ -279,6 +280,29 @@ class Store:
             raise Problem("capability_not_found", 404)
         return dict(row)
 
+    def retarget_capability(self, cid, *, adapter: str, access_params: dict,
+                            actor: str = "platform-sync") -> bool:
+        from .driver_specs import parse_access_params
+        try:
+            payload = json.dumps(parse_access_params(access_params or {}))
+        except ValueError:
+            raise Problem("capability_incomplete", 400) from None
+        with self.tx():
+            current = self.db.execute(
+                "SELECT adapter, access_params FROM adapter_capability WHERE id=?",
+                (cid,)).fetchone()
+            if current is None:
+                return False
+            stored = current["access_params"] if "access_params" in current.keys() else None
+            if current["adapter"] == adapter and (stored or "{}") == payload:
+                return False
+            self.db.execute(
+                "UPDATE adapter_capability SET adapter=?, access_params=? WHERE id=?",
+                (adapter, payload, cid))
+            self.event(actor, "data_plane_capability_retargeted",
+                       detail={"capability": cid, "adapter": adapter})
+        return True
+
     def register_capability(self, entry: dict, actor: str, rationale: str = "") -> dict:
         with self.tx():
             self._register(entry, actor, rationale)
@@ -310,6 +334,12 @@ class Store:
         except ValueError:
             raise Problem("capability_incomplete", 400) from None
         values["logout_path"] = logout_path or ""
+        from .driver_specs import parse_access_params
+        try:
+            params = parse_access_params(entry.get("access_params") or {})
+        except ValueError:
+            raise Problem("capability_incomplete", 400) from None
+        values["access_params"] = json.dumps(params)
         if not cid or not all((values["vendor"], values["model"], values["adapter"])):
             raise Problem("capability_incomplete", 400)
         if not capability.window_parses(values):
@@ -319,12 +349,13 @@ class Store:
         self.db.execute(
             "INSERT INTO adapter_capability(id,vendor,model,firmware,adapter,status,expires,evidence,"
             "approver,console_impl,licence,concurrency_limit,models,firmware_min,firmware_max,"
-            "protocol_versions,input_shaping,logout_path,approved_at,effective_from,review_due,"
-            "status_reason,revision) "
-            "VALUES(?,?,?,?,?,'draft',0,'','','','',1,?,?,?,?,?,?,0,0,0,'',0)",
+            "protocol_versions,input_shaping,logout_path,access_params,approved_at,effective_from,"
+            "review_due,status_reason,revision) "
+            "VALUES(?,?,?,?,?,'draft',0,'','','','',1,?,?,?,?,?,?,?,0,0,0,'',0)",
             (values["id"], values["vendor"], values["model"], values["firmware"], values["adapter"],
              values["models"], values["firmware_min"], values["firmware_max"],
-             values["protocol_versions"], values["input_shaping"], values["logout_path"]))
+             values["protocol_versions"], values["input_shaping"], values["logout_path"],
+             values["access_params"]))
         self.event(actor, "capability_registered",
                    detail={"capability": cid, "adapter": values["adapter"], "rationale": rationale})
 
@@ -514,8 +545,13 @@ class Store:
             logout_path = capability.parse_logout_path(cap["logout_path"]) if cap else None
         except (ValueError, KeyError):
             logout_path = None
-        allowed = asset | {"adapter": cap["adapter"] if cap else "",
+        try:
+            access_params = json.loads(cap["access_params"] or "{}") if cap is not None else {}
+        except (KeyError, ValueError, TypeError):
+            access_params = {}
+        allowed = asset | {"adapter": resolve_adapter(cap["adapter"]) if cap else "",
                            "cap_expires": cap["expires"] if cap else 0.0,
+                           "access_params": access_params,
                            "protocol_versions": declared or (),
                            "logout_path": logout_path,
                            "input_shaping": shaping}
@@ -807,13 +843,14 @@ class Store:
         return asset
 
     def _adapter_allowed(self, row) -> bool:
-        if row["adapter"] == "mock-v1":
+        name = resolve_adapter(row["adapter"])
+        if name == "mock-v1":
             return True
-        if row["adapter"] not in REAL_ADAPTER_IDS:
+        if name not in REAL_ADAPTER_IDS:
             return False
         if row["target"] not in self.passthrough_targets:
             return False
-        if DRIVERS[row["adapter"]].controlled_network:
+        if DRIVERS[name].controlled_network:
             import ipaddress
             from urllib.parse import urlsplit
             host = urlsplit(str(row["target"])).hostname

@@ -53,7 +53,9 @@ def test_alembic_head_creates_admission_tables(tmp_path):
         conn.exec_driver_sql("ALTER TABLE kvm_vendor_profile DROP COLUMN recipe_id")
         conn.exec_driver_sql("ALTER TABLE kvm_vendor_profile DROP COLUMN recipe_revision")
         conn.exec_driver_sql("ALTER TABLE kvm_vendor_profile DROP COLUMN config_schema_version")
+        conn.exec_driver_sql("ALTER TABLE kvm_vendor_profile DROP COLUMN access_params")
         conn.exec_driver_sql("ALTER TABLE kvm_capability DROP COLUMN bundle_revision")
+        conn.exec_driver_sql("ALTER TABLE kvm_asset DROP COLUMN vnc_key_id")
     engine.dispose()
     assert _alembic(db_path, "stamp", "0012_asset_vnc_secret").returncode == 0
 
@@ -66,7 +68,7 @@ def test_alembic_head_creates_admission_tables(tmp_path):
         assert ADMISSION_TABLES <= tables
         assert "kvm_asset" in tables
         assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-            "0019_probe_task")
+            "0022_key_clock_anchor")
 
     down = _alembic(db_path, "downgrade", "0012_asset_vnc_secret")
     assert down.returncode == 0, down.stdout + down.stderr

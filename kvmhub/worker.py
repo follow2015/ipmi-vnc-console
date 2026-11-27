@@ -74,12 +74,15 @@ def cookie_max_age(hard_until: float, now: float) -> int:
 
 def input_protocol_for_adapter(adapter) -> str:
     spec = spec_for_adapter(adapter)
+    if getattr(adapter, "client_v2", False):
+        return "standard8"
     return spec.input_protocol if spec else "insyde18"
 
 
 def apply_client_bundle(adapter, info: dict) -> bool:
     spec = spec_for_adapter(adapter)
-    if spec is None or spec.input_protocol != 'standard8' or spec.client_bundle != 'local_novnc':
+    if (spec is None or spec.client_bundle != 'local_novnc'
+            or not (spec.input_protocol == 'standard8' or spec.translated_client)):
         adapter.client_v2 = False
         return False
     if hasattr(adapter, 'client_v2'):
